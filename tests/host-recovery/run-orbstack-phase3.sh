@@ -6,9 +6,10 @@ umask 077
 #
 # Host mode is read-only with respect to macOS networking. It snapshots the
 # live route/DNS/PF/sing-box identity, clones only a stopped dedicated isolated
-# OrbStack base, streams one pinned source archive into the clone, runs the
-# destructive phase entirely in guest-local storage, destroys the clone, then
-# proves the stable host snapshot is unchanged.
+# OrbStack base, streams one pinned source archive plus one lock-bound Cargo
+# vendor bundle into the clone, runs the destructive phase entirely in
+# guest-local storage, destroys the clone, then proves the stable host snapshot
+# is unchanged.
 #
 # Guest scenarios run in fresh private network+mount+PID namespaces. `/run` is
 # a namespace-private tmpfs, so DNS exchange never targets the clone's real
@@ -34,12 +35,18 @@ readonly ORB_COMMAND_TIMEOUT_SECONDS=120
 readonly ORB_BUILD_TIMEOUT_SECONDS=1800
 readonly ORB_GUEST_TIMEOUT_SECONDS=2400
 readonly SOURCE_TRANSFER_TIMEOUT_SECONDS=300
+readonly VENDOR_CREATE_TIMEOUT_SECONDS=1800
+readonly VENDOR_TRANSFER_TIMEOUT_SECONDS=900
+readonly VENDOR_EXTRACT_TIMEOUT_SECONDS=900
 readonly EVIDENCE_TRANSFER_TIMEOUT_SECONDS=300
 readonly FILE_CLEANUP_TIMEOUT_SECONDS=180
 readonly CLONE_QUIESCENCE_SAMPLES=60
 readonly CLONE_QUIESCENCE_REQUIRED_STABLE=4
 readonly MAX_SOURCE_ARCHIVE_BYTES=$((64 * 1024 * 1024))
 readonly MAX_SOURCE_EXPANDED_BYTES=$((128 * 1024 * 1024))
+readonly MAX_VENDOR_ARCHIVE_BYTES=$((256 * 1024 * 1024))
+readonly MAX_VENDOR_EXPANDED_BYTES=$((768 * 1024 * 1024))
+readonly MAX_VENDOR_MEMBERS=50000
 readonly MAX_EVIDENCE_ARCHIVE_BYTES=$((64 * 1024 * 1024))
 readonly MAX_EVIDENCE_BYTES=$((64 * 1024 * 1024))
 readonly MAX_ARCHIVE_MEMBERS=20000
@@ -78,10 +85,13 @@ forwarding, zero HTTP/HTTPS forwarding ports, and no mounts/port forwards. The
 source is never started or modified; a uniquely named clone is deleted after the
 lab.
 
-The repository must be clean pushed main. A commit-bearing git archive is
-streamed by bounded stdin into guest-local storage. No shared checkout, orb -p,
-orb -w, host target path, /mnt/mac, SSH agent, or working mac command channel is
-accepted. Sealed guest evidence returns through a bounded validated stdout tar.
+The repository must be clean pushed main. A commit-bearing git archive and a
+Cargo.lock-bound, checksummed `cargo vendor --offline --locked
+--versioned-dirs` bundle are streamed by bounded stdin into guest-local
+storage. The guest uses a fresh private CARGO_HOME and `cargo --frozen`. No
+shared checkout, orb -p, orb -w, host target path, /mnt/mac, SSH agent, or
+working mac command channel is accepted. Sealed guest evidence returns through
+a bounded validated stdout tar.
 
 Safety boundary: one shared lock serializes all Shadowpipe OrbStack lifecycle
 runners, but an unrelated same-host operator must not create, rename, start,
@@ -1081,6 +1091,679 @@ metadata_field() {
     "${metadata}"
 }
 
+validate_host_cargo_boundary() {
+  local cargo_home="$1" output="$2"
+  /usr/bin/python3 -I -S - "${cargo_home}" "${output}" <<'PY'
+import os
+import stat
+import sys
+
+cargo_home = os.path.realpath(sys.argv[1])
+output = sys.argv[2]
+dangerous_exact = {
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTDOC",
+    "RUSTDOCFLAGS",
+    "RUSTFLAGS",
+}
+ambient = sorted(
+    key for key in os.environ
+    if key.startswith("CARGO_") or key in dangerous_exact
+)
+if ambient:
+    raise SystemExit("ambient Cargo or Rust override variables are not allowed")
+info = os.lstat(cargo_home)
+if (
+    not stat.S_ISDIR(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != os.getuid()
+    or stat.S_IMODE(info.st_mode) & 0o022
+):
+    raise SystemExit("default Cargo cache is not a private same-user directory")
+for path in (
+    os.path.join(cargo_home, "config"),
+    os.path.join(cargo_home, "config.toml"),
+    "/.cargo/config",
+    "/.cargo/config.toml",
+):
+    if os.path.lexists(path):
+        raise SystemExit("ambient Cargo configuration file is not allowed")
+proxy_names = (
+    "ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+    "all_proxy", "https_proxy", "http_proxy", "no_proxy",
+)
+proxy_count = sum(name in os.environ for name in proxy_names)
+descriptor = os.open(
+    output,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as stream:
+    stream.write("cargo_environment_overrides=absent\n")
+    stream.write("cargo_config_files=absent\n")
+    stream.write("cargo_home_cache=trusted_same_user_input\n")
+    stream.write("cargo_vendor_network=offline\n")
+    stream.write("cargo_proxy_environment=sanitized\n")
+    stream.write(f"ambient_proxy_variable_count={proxy_count}\n")
+PY
+}
+
+extract_host_source_for_vendor() {
+  local archive="$1" destination="$2" expected_size="$3" expected_hash="$4"
+  local output="$5"
+  /usr/bin/python3 -I -S - \
+    "${archive}" "${destination}" "${expected_size}" "${expected_hash}" \
+    "${MAX_SOURCE_EXPANDED_BYTES}" "${MAX_ARCHIVE_MEMBERS}" "${output}" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+import tarfile
+
+(archive, destination, size_text, expected_hash, expanded_text,
+ members_text, output) = sys.argv[1:]
+destination = os.path.realpath(destination)
+expected_size = int(size_text, 10)
+expanded_max = int(expanded_text, 10)
+members_max = int(members_text, 10)
+if os.path.lexists(destination):
+    raise SystemExit("private vendor source destination already exists")
+archive_info = os.lstat(archive)
+if (
+    not stat.S_ISREG(archive_info.st_mode)
+    or stat.S_ISLNK(archive_info.st_mode)
+    or archive_info.st_nlink != 1
+    or archive_info.st_size != expected_size
+):
+    raise SystemExit("source archive changed before private extraction")
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+before_hash = file_hash(archive)
+if before_hash != expected_hash:
+    raise SystemExit("source archive digest changed before vendor extraction")
+parent = os.path.dirname(destination)
+parent_info = os.lstat(parent)
+if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
+    raise SystemExit("private vendor stage parent is unsafe")
+os.mkdir(destination, 0o700)
+seen = set()
+required_directories = set()
+regular_paths = set()
+members = 0
+expanded = 0
+with tarfile.open(archive, "r:") as source:
+    for member in source:
+        members += 1
+        name = member.name.rstrip("/")
+        parts = name.split("/")
+        if (
+            members > members_max
+            or not name
+            or name.startswith("/")
+            or "\\" in name
+            or any(part in ("", ".", "..") for part in parts)
+            or parts[0] != "shadowpipe"
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name)
+            or name in seen
+            or any("/".join(parts[:index]) in regular_paths
+                   for index in range(1, len(parts)))
+            or (not member.isdir() and name in required_directories)
+            or member.issparse()
+            or set(member.pax_headers) - {"path", "comment"}
+        ):
+            raise SystemExit("source archive has an unsafe member graph")
+        seen.add(name)
+        for index in range(1, len(parts)):
+            required_directories.add("/".join(parts[:index]))
+        relative_parts = parts[1:]
+        if not relative_parts:
+            if not member.isdir():
+                raise SystemExit("source archive root is not a directory")
+            continue
+        target = os.path.join(destination, *relative_parts)
+        if os.path.commonpath((destination, target)) != destination:
+            raise SystemExit("source archive escaped private destination")
+        if member.isdir():
+            if os.path.lexists(target):
+                if not stat.S_ISDIR(os.lstat(target).st_mode):
+                    raise SystemExit("source directory collided with a file")
+            else:
+                os.makedirs(target, mode=0o700, exist_ok=False)
+            continue
+        if not member.isfile() or member.size < 0:
+            raise SystemExit("source archive contains a link or special member")
+        regular_paths.add(name)
+        expanded += member.size
+        if expanded > expanded_max:
+            raise SystemExit("source archive expanded-byte bound exceeded")
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        if os.path.lexists(target):
+            raise SystemExit("source archive file path already exists")
+        incoming = source.extractfile(member)
+        if incoming is None:
+            raise SystemExit("source archive regular member is unreadable")
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o700 if member.mode & 0o111 else 0o600,
+        )
+        written = 0
+        try:
+            while written < member.size:
+                chunk = incoming.read(min(1024 * 1024, member.size - written))
+                if not chunk:
+                    raise SystemExit("source archive member ended early")
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(descriptor, chunk[offset:])
+                written += len(chunk)
+            if incoming.read(1):
+                raise SystemExit("source archive member exceeded declared size")
+        finally:
+            os.close(descriptor)
+after_hash = file_hash(archive)
+if after_hash != before_hash:
+    raise SystemExit("source archive changed during private extraction")
+for required in ("Cargo.toml", "Cargo.lock"):
+    path = os.path.join(destination, required)
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise SystemExit(f"private pinned source lacks {required}")
+with open(output, "x", encoding="ascii", newline="\n") as stream:
+    stream.write("vendor_source=pinned_git_archive\n")
+    stream.write(f"source_archive_sha256_before={before_hash}\n")
+    stream.write(f"source_archive_sha256_after={after_hash}\n")
+    stream.write(f"source_archive_members={members}\n")
+    stream.write(f"source_expanded_bytes={expanded}\n")
+PY
+}
+
+seal_cargo_vendor_tree() {
+  local vendor="$1" lock="$2" archive="$3" metadata="$4"
+  local pinned_head="$5" source_hash="$6" guest_vendor="$7"
+  /usr/bin/python3 -I -S - \
+    "${vendor}" "${lock}" "${archive}" "${metadata}" \
+    "${pinned_head}" "${source_hash}" "${guest_vendor}" \
+    "${MAX_VENDOR_ARCHIVE_BYTES}" "${MAX_VENDOR_EXPANDED_BYTES}" \
+    "${MAX_VENDOR_MEMBERS}" <<'PY'
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import stat
+import sys
+import tarfile
+
+(vendor, lock, archive, metadata, pinned_head, source_hash, guest_vendor,
+ archive_max_text, expanded_max_text, members_max_text) = sys.argv[1:]
+archive_max = int(archive_max_text, 10)
+expanded_max = int(expanded_max_text, 10)
+members_max = int(members_max_text, 10)
+if re.fullmatch(r"[0-9a-f]{40,64}", pinned_head) is None:
+    raise SystemExit("invalid pinned commit for Cargo vendor bundle")
+if re.fullmatch(r"[0-9a-f]{64}", source_hash) is None:
+    raise SystemExit("invalid source archive digest for Cargo vendor bundle")
+if re.fullmatch(
+    r"/var/tmp/shadowpipe-phase3-[A-Za-z0-9._-]+/cargo-vendor/vendor",
+    guest_vendor,
+) is None:
+    raise SystemExit("unsafe guest Cargo vendor path")
+
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def load_lock(path):
+    raw = open(path, "rb").read()
+    if not raw or len(raw) > 16 * 1024 * 1024 or b"\0" in raw or b"\r" in raw:
+        raise SystemExit("Cargo.lock bytes are unsafe")
+    text = raw.decode("utf-8")
+    packages = []
+    current = None
+    field_re = re.compile(r'^(name|version|source|checksum) = "([^"\\]*)"$')
+    for line in text.splitlines():
+        if line == "[[package]]":
+            if current is not None:
+                packages.append(current)
+            current = {}
+            continue
+        if current is None:
+            continue
+        match = field_re.fullmatch(line)
+        if match:
+            key, value = match.groups()
+            if key in current:
+                raise SystemExit("duplicate Cargo.lock package field")
+            current[key] = value
+    if current is not None:
+        packages.append(current)
+    registry = {}
+    for package in packages:
+        if "name" not in package or "version" not in package:
+            raise SystemExit("Cargo.lock package lacks name or version")
+        source = package.get("source")
+        if source is None:
+            if "checksum" in package:
+                raise SystemExit("workspace Cargo.lock package has a checksum")
+            continue
+        if source != "registry+https://github.com/rust-lang/crates.io-index":
+            raise SystemExit("Cargo.lock contains an unsupported non-crates.io source")
+        checksum = package.get("checksum", "")
+        if re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
+            raise SystemExit("registry Cargo.lock package lacks a checksum")
+        name = package["name"]
+        version = package["version"]
+        if re.fullmatch(r"[A-Za-z0-9_+.-]+", name) is None or re.fullmatch(
+            r"[A-Za-z0-9_+.-]+", version
+        ) is None:
+            raise SystemExit("Cargo.lock package identity is unsafe")
+        directory = f"{name}-{version}"
+        if directory in registry:
+            raise SystemExit("Cargo.lock has a colliding versioned vendor directory")
+        registry[directory] = (name, version, checksum)
+    if not registry:
+        raise SystemExit("Cargo.lock has no crates.io packages")
+    return raw, registry
+
+lock_bytes, expected_packages = load_lock(lock)
+lock_hash = hashlib.sha256(lock_bytes).hexdigest()
+vendor_info = os.lstat(vendor)
+if not stat.S_ISDIR(vendor_info.st_mode) or stat.S_ISLNK(vendor_info.st_mode):
+    raise SystemExit("Cargo vendor root is unsafe")
+actual_roots = sorted(os.listdir(vendor))
+if actual_roots != sorted(expected_packages):
+    raise SystemExit("versioned vendor directories differ from Cargo.lock")
+directories = []
+files = []
+total_bytes = 0
+for package_dir in actual_roots:
+    package_root = os.path.join(vendor, package_dir)
+    package_info = os.lstat(package_root)
+    if not stat.S_ISDIR(package_info.st_mode) or stat.S_ISLNK(package_info.st_mode):
+        raise SystemExit("versioned vendor package root is unsafe")
+    directories.append(package_dir)
+    checksum_path = os.path.join(package_root, ".cargo-checksum.json")
+    checksum_info = os.lstat(checksum_path)
+    if not stat.S_ISREG(checksum_info.st_mode) or checksum_info.st_nlink != 1:
+        raise SystemExit("vendor package checksum metadata is unsafe")
+    with open(checksum_path, "r", encoding="utf-8") as stream:
+        checksum_document = json.load(stream, object_pairs_hook=unique_object)
+    if type(checksum_document) is not dict or set(checksum_document) != {"files", "package"}:
+        raise SystemExit("vendor package checksum schema is invalid")
+    if checksum_document["package"] != expected_packages[package_dir][2]:
+        raise SystemExit("vendor package checksum differs from Cargo.lock")
+    checksum_files = checksum_document["files"]
+    if type(checksum_files) is not dict:
+        raise SystemExit("vendor package file checksums are invalid")
+    actual_checksum_files = {}
+    for current, dirnames, filenames in os.walk(package_root, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        for dirname in dirnames:
+            path = os.path.join(current, dirname)
+            info = os.lstat(path)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise SystemExit("vendor tree contains a linked directory")
+            relative = os.path.relpath(path, vendor)
+            if "\\" in relative or any(part in ("", ".", "..") for part in relative.split("/")):
+                raise SystemExit("vendor directory path is unsafe")
+            directories.append(relative)
+        for filename in filenames:
+            path = os.path.join(current, filename)
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise SystemExit("vendor tree contains a link or special file")
+            relative = os.path.relpath(path, vendor)
+            if "\\" in relative or any(part in ("", ".", "..") for part in relative.split("/")):
+                raise SystemExit("vendor file path is unsafe")
+            digest = sha256_path(path)
+            files.append({
+                "path": relative,
+                "bytes": info.st_size,
+                "executable": bool(stat.S_IMODE(info.st_mode) & 0o111),
+                "sha256": digest,
+            })
+            total_bytes += info.st_size
+            package_relative = os.path.relpath(path, package_root)
+            if package_relative != ".cargo-checksum.json":
+                actual_checksum_files[package_relative] = digest
+    if checksum_files != actual_checksum_files:
+        raise SystemExit("vendor package files differ from .cargo-checksum.json")
+directories = sorted(set(directories))
+files.sort(key=lambda item: item["path"])
+if len(directories) + len(files) + 4 > members_max:
+    raise SystemExit("Cargo vendor member bound exceeded before archiving")
+if total_bytes > expanded_max:
+    raise SystemExit("Cargo vendor expanded-byte bound exceeded before archiving")
+manifest_document = {
+    "schema_version": 1,
+    "cargo_lock_sha256": lock_hash,
+    "registry_packages": [
+        {"directory": directory, "name": values[0], "version": values[1],
+         "package_checksum": values[2]}
+        for directory, values in sorted(expected_packages.items())
+    ],
+    "directories": directories,
+    "files": files,
+}
+manifest_bytes = (
+    json.dumps(manifest_document, ensure_ascii=True, sort_keys=True,
+               separators=(",", ":")) + "\n"
+).encode("ascii")
+manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+config_bytes = (
+    '[source.crates-io]\n'
+    'replace-with = "shadowpipe-vendored-sources"\n\n'
+    '[source.shadowpipe-vendored-sources]\n'
+    f'directory = "{guest_vendor}"\n\n'
+    '[net]\n'
+    'offline = true\n'
+).encode("ascii")
+config_hash = hashlib.sha256(config_bytes).hexdigest()
+binding_bytes = (
+    "schema_version=1\n"
+    f"pinned_head={pinned_head}\n"
+    f"source_archive_sha256={source_hash}\n"
+    f"cargo_lock_sha256={lock_hash}\n"
+    f"vendor_manifest_sha256={manifest_hash}\n"
+    f"cargo_config_sha256={config_hash}\n"
+).encode("ascii")
+auxiliary = {
+    "cargo-vendor/binding.env": binding_bytes,
+    "cargo-vendor/cargo-config.toml": config_bytes,
+    "cargo-vendor/vendor-manifest.json": manifest_bytes,
+}
+
+if os.path.lexists(archive):
+    raise SystemExit("Cargo vendor archive path already exists")
+raw = open(archive, "xb", buffering=0)
+try:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=6, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as target:
+            def add_directory(name):
+                item = tarfile.TarInfo(name)
+                item.type = tarfile.DIRTYPE
+                item.mode = 0o700
+                item.uid = item.gid = item.mtime = 0
+                item.uname = item.gname = "root"
+                target.addfile(item)
+            add_directory("cargo-vendor")
+            add_directory("cargo-vendor/vendor")
+            for relative in directories:
+                add_directory(f"cargo-vendor/vendor/{relative}")
+            for entry in files:
+                path = os.path.join(vendor, *entry["path"].split("/"))
+                info = tarfile.TarInfo(f"cargo-vendor/vendor/{entry['path']}")
+                info.size = entry["bytes"]
+                info.mode = 0o700 if entry["executable"] else 0o600
+                info.uid = info.gid = info.mtime = 0
+                info.uname = info.gname = "root"
+                with open(path, "rb", buffering=0) as source:
+                    target.addfile(info, source)
+            for name, content in sorted(auxiliary.items()):
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                info.mode = 0o600
+                info.uid = info.gid = info.mtime = 0
+                info.uname = info.gname = "root"
+                target.addfile(info, io.BytesIO(content))
+finally:
+    raw.close()
+os.chmod(archive, 0o600)
+archive_info = os.lstat(archive)
+if (
+    not stat.S_ISREG(archive_info.st_mode)
+    or archive_info.st_nlink != 1
+    or stat.S_IMODE(archive_info.st_mode) != 0o600
+    or archive_info.st_size <= 0
+    or archive_info.st_size > archive_max
+):
+    raise SystemExit("Cargo vendor archive size or metadata is unsafe")
+archive_hash = sha256_path(archive)
+seen = set()
+regular = set()
+required_directories = set()
+member_count = 0
+expanded = 0
+with tarfile.open(archive, "r:gz") as source:
+    for member in source:
+        member_count += 1
+        name = member.name.rstrip("/")
+        parts = name.split("/")
+        if (
+            member_count > members_max
+            or not name
+            or name.startswith("/")
+            or "\\" in name
+            or any(part in ("", ".", "..") for part in parts)
+            or parts[0] != "cargo-vendor"
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name)
+            or name in seen
+            or any("/".join(parts[:index]) in regular for index in range(1, len(parts)))
+            or (not member.isdir() and name in required_directories)
+            or member.issparse()
+            or set(member.pax_headers) - {"path"}
+        ):
+            raise SystemExit("Cargo vendor archive member graph is unsafe")
+        seen.add(name)
+        for index in range(1, len(parts)):
+            required_directories.add("/".join(parts[:index]))
+        if member.isdir():
+            continue
+        if not member.isfile() or member.size < 0:
+            raise SystemExit("Cargo vendor archive contains a link or special member")
+        regular.add(name)
+        expanded += member.size
+        if expanded > expanded_max:
+            raise SystemExit("Cargo vendor archive expanded-byte bound exceeded")
+with open(metadata, "x", encoding="ascii", newline="\n") as stream:
+    stream.write("dependency_bundle=cargo_vendor_v1\n")
+    stream.write("cargo_vendor_command=offline_locked_versioned_dirs\n")
+    stream.write("cargo_cache_boundary=trusted_same_user_host_cache\n")
+    stream.write(f"pinned_head={pinned_head}\n")
+    stream.write(f"source_archive_sha256={source_hash}\n")
+    stream.write(f"cargo_lock_sha256={lock_hash}\n")
+    stream.write(f"vendor_manifest_sha256={manifest_hash}\n")
+    stream.write(f"vendor_tree_sha256={manifest_hash}\n")
+    stream.write(f"cargo_config_sha256={config_hash}\n")
+    stream.write(f"vendor_archive_sha256={archive_hash}\n")
+    stream.write(f"vendor_archive_bytes={archive_info.st_size}\n")
+    stream.write(f"vendor_archive_members={member_count}\n")
+    stream.write(f"vendor_expanded_bytes={expanded}\n")
+    stream.write(f"vendor_registry_packages={len(expected_packages)}\n")
+    stream.write(f"vendor_files={len(files)}\n")
+    stream.write(f"vendor_directories={len(directories)}\n")
+PY
+}
+
+validate_cargo_workspace_metadata() {
+  local source_root="$1" lock="$2" metadata_json="$3" output="$4"
+  /usr/bin/python3 -I -S - \
+    "${source_root}" "${lock}" "${metadata_json}" "${output}" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+root = os.path.realpath(sys.argv[1])
+lock_path, metadata_path, output = sys.argv[2:]
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+lock_bytes = open(lock_path, "rb").read()
+if not lock_bytes or len(lock_bytes) > 16 * 1024 * 1024 or b"\0" in lock_bytes:
+    raise SystemExit("Cargo.lock is unsafe before cargo metadata")
+lock_hash = hashlib.sha256(lock_bytes).hexdigest()
+source_less = set()
+current = None
+field_re = re.compile(r'^(name|version|source|checksum) = "([^"\\]*)"$')
+packages = []
+for line in lock_bytes.decode("utf-8").splitlines():
+    if line == "[[package]]":
+        if current is not None:
+            packages.append(current)
+        current = {}
+        continue
+    if current is None:
+        continue
+    match = field_re.fullmatch(line)
+    if match:
+        key, value = match.groups()
+        if key in current:
+            raise SystemExit("duplicate Cargo.lock field before metadata")
+        current[key] = value
+if current is not None:
+    packages.append(current)
+for package in packages:
+    if "name" not in package or "version" not in package:
+        raise SystemExit("Cargo.lock package identity is incomplete")
+    source = package.get("source")
+    if source is None:
+        identity = (package["name"], package["version"])
+        if identity in source_less:
+            raise SystemExit("duplicate source-less Cargo.lock package identity")
+        source_less.add(identity)
+    elif source != "registry+https://github.com/rust-lang/crates.io-index":
+        raise SystemExit("Cargo.lock contains an unsupported external source")
+if not source_less:
+    raise SystemExit("Cargo.lock has no pinned workspace packages")
+metadata_info = os.lstat(metadata_path)
+if (
+    not stat.S_ISREG(metadata_info.st_mode) or metadata_info.st_nlink != 1
+    or metadata_info.st_size <= 0 or metadata_info.st_size > 32 * 1024 * 1024
+):
+    raise SystemExit("bounded cargo metadata JSON is unsafe")
+with open(metadata_path, "r", encoding="utf-8") as stream:
+    document = json.load(stream, object_pairs_hook=unique_object)
+if type(document) is not dict or type(document.get("packages")) is not list:
+    raise SystemExit("cargo metadata schema is invalid")
+if os.path.realpath(document.get("workspace_root", "")) != root:
+    raise SystemExit("cargo metadata workspace root differs from pinned source")
+observed_source_less = set()
+for package in document["packages"]:
+    if type(package) is not dict:
+        raise SystemExit("cargo metadata package is not an object")
+    source = package.get("source")
+    if source is not None:
+        continue
+    name = package.get("name")
+    version = package.get("version")
+    manifest = package.get("manifest_path")
+    if not all(type(value) is str and value for value in (name, version, manifest)):
+        raise SystemExit("source-less cargo metadata package is malformed")
+    real_manifest = os.path.realpath(manifest)
+    if os.path.commonpath((root, real_manifest)) != root:
+        raise SystemExit("source-less Cargo package escaped pinned source root")
+    info = os.lstat(real_manifest)
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise SystemExit("source-less Cargo manifest is unsafe")
+    identity = (name, version)
+    if identity in observed_source_less:
+        raise SystemExit("duplicate source-less cargo metadata identity")
+    observed_source_less.add(identity)
+if observed_source_less != source_less:
+    raise SystemExit("source-less cargo metadata differs from Cargo.lock")
+with open(output, "x", encoding="ascii", newline="\n") as stream:
+    stream.write("cargo_metadata=valid\n")
+    stream.write("path_dependencies=inside_pinned_source_only\n")
+    stream.write(f"workspace_packages={len(source_less)}\n")
+    stream.write(f"cargo_lock_sha256={lock_hash}\n")
+PY
+}
+
+create_cargo_vendor_bundle() {
+  local repo_root="$1" source_archive="$2" source_size="$3" source_hash="$4"
+  local pinned_head="$5" stage="$6" archive="$7" metadata="$8"
+  local guest_vendor="$9" cargo_home cargo_bin cargo_path source_root vendor
+  local lock_hash_before lock_hash_after
+  cargo_home="${HOME}/.cargo"
+  validate_host_cargo_boundary "${cargo_home}" "${metadata}.boundary.env" \
+    || return 1
+  [[ ! -e "${stage}" && ! -L "${stage}" ]] || return 1
+  mkdir -m 0700 -- "${stage}" || return 1
+  source_root="${stage}/shadowpipe"
+  extract_host_source_for_vendor "${source_archive}" "${source_root}" \
+    "${source_size}" "${source_hash}" "${metadata}.source-extract.env" \
+    || return 1
+  vendor="${stage}/vendor"
+  cargo_bin="$(command -v cargo)" || return 1
+  [[ "${cargo_bin}" == /* && -x "${cargo_bin}" ]] || return 1
+  cargo_path="${cargo_bin%/*}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  # Full metadata (rather than --no-deps) is intentionally bounded so a future
+  # external path dependency cannot hide outside the pinned private source.
+  # shellcheck disable=SC2016
+  run_recorded_limited "${HOST_EVIDENCE_TIMEOUT_SECONDS}" \
+    "${metadata}.cargo-metadata.json" "$((32 * 1024 * 1024))" \
+    "${RECORDED_STDERR_MAX_BYTES}" /bin/sh -c '
+      cd /
+      exec /usr/bin/env -i \
+        HOME="$1" CARGO_HOME="$2" PATH="$3" \
+        CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=never COPYFILE_DISABLE=1 \
+        "$4" metadata --offline --locked --format-version=1 \
+        --manifest-path "$5"
+    ' cargo-metadata "${HOME}" "${cargo_home}" "${cargo_path}" \
+    "${cargo_bin}" "${source_root}/Cargo.toml" || return 1
+  validate_cargo_workspace_metadata "${source_root}" \
+    "${source_root}/Cargo.lock" "${metadata}.cargo-metadata.json" \
+    "${metadata}.cargo-metadata.env" || return 1
+  lock_hash_before="$(metadata_field \
+    "${metadata}.cargo-metadata.env" cargo_lock_sha256)" || return 1
+  # Start from / so Cargo cannot discover repository/ancestor config. env -i
+  # drops proxy, wrapper and ambient Cargo/Rust variables; only the validated
+  # default same-user cache is trusted as the offline package input.
+  # shellcheck disable=SC2016
+  run_recorded_limited "${VENDOR_CREATE_TIMEOUT_SECONDS}" \
+    "${metadata}.cargo-vendor.stdout" "$((1024 * 1024))" \
+    "${RECORDED_STDERR_MAX_BYTES}" /bin/sh -c '
+      cd /
+      exec /usr/bin/env -i \
+        HOME="$1" CARGO_HOME="$2" PATH="$3" \
+        CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=never COPYFILE_DISABLE=1 \
+        "$4" vendor --offline --locked --versioned-dirs \
+        --manifest-path "$5" "$6"
+    ' cargo-vendor "${HOME}" "${cargo_home}" "${cargo_path}" \
+    "${cargo_bin}" "${source_root}/Cargo.toml" "${vendor}" || return 1
+  [[ -d "${vendor}" && ! -L "${vendor}" ]] || return 1
+  lock_hash_after="$(sha256sum "${source_root}/Cargo.lock" | awk '{print $1}')" \
+    || return 1
+  [[ "${lock_hash_after}" == "${lock_hash_before}" ]] || return 1
+  seal_cargo_vendor_tree "${vendor}" "${source_root}/Cargo.lock" \
+    "${archive}" "${metadata}" "${pinned_head}" "${source_hash}" \
+    "${guest_vendor}" || return 1
+  validate_git_metadata_safety "${repo_root}" \
+    "${metadata}.git-metadata-safety-after-vendor.json" \
+    "${pinned_head}" || return 1
+}
+
 stream_source_archive_to_guest() {
   local clone_id="$1" archive="$2" guest_root="$3" guest_archive="$4"
   local expected_size="$5" expected_hash="$6" output="$7"
@@ -1146,6 +1829,338 @@ finally:
 print(f"source_archive_bytes={size}")
 print(f"source_archive_sha256={expected}")
 ' "${guest_root}" "${guest_archive}" "${expected_size}" "${expected_hash}"
+}
+
+stream_cargo_vendor_to_guest() {
+  local clone_id="$1" archive="$2" guest_root="$3" guest_archive="$4"
+  local expected_size="$5" expected_hash="$6" output="$7"
+  run_recorded_with_stdin \
+    "${VENDOR_TRANSFER_TIMEOUT_SECONDS}" "${output}" "${archive}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import os
+import stat
+import sys
+
+root, destination, size_text, expected = sys.argv[1:]
+size = int(size_text, 10)
+if size <= 0 or size > 256 * 1024 * 1024:
+    raise SystemExit("invalid bounded Cargo vendor archive size")
+if os.path.dirname(destination) != root or os.path.basename(destination) != "cargo-vendor.tar.gz":
+    raise SystemExit("unsafe guest Cargo vendor archive path")
+root_info = os.lstat(root)
+if (
+    not stat.S_ISDIR(root_info.st_mode)
+    or stat.S_ISLNK(root_info.st_mode)
+    or root_info.st_uid != 0
+    or root_info.st_gid != 0
+    or stat.S_IMODE(root_info.st_mode) != 0o700
+):
+    raise SystemExit("guest source root is unsafe before vendor transfer")
+flags = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+descriptor = os.open(destination, flags, 0o600)
+digest = hashlib.sha256()
+observed = 0
+try:
+    while observed <= size:
+        chunk = sys.stdin.buffer.read(min(1024 * 1024, size + 1 - observed))
+        if not chunk:
+            break
+        observed += len(chunk)
+        if observed > size:
+            raise SystemExit("Cargo vendor stream exceeded declared size")
+        digest.update(chunk)
+        offset = 0
+        while offset < len(chunk):
+            offset += os.write(descriptor, chunk[offset:])
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+if observed != size or digest.hexdigest() != expected:
+    raise SystemExit("Cargo vendor stream size or digest mismatch")
+info = os.lstat(destination)
+if (
+    not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_uid != 0 or info.st_gid != 0 or info.st_size != size
+):
+    raise SystemExit("guest Cargo vendor archive metadata differs")
+print(f"vendor_archive_bytes={size}")
+print(f"vendor_archive_sha256={expected}")
+' "${guest_root}" "${guest_archive}" "${expected_size}" "${expected_hash}"
+}
+
+extract_guest_cargo_vendor() {
+  local clone_id="$1" guest_root="$2" guest_archive="$3" bundle_root="$4"
+  local cargo_home="$5" expected_size="$6" expected_hash="$7"
+  local expected_members="$8" expected_expanded="$9" output="${10}"
+  run_recorded "${VENDOR_EXTRACT_TIMEOUT_SECONDS}" "${output}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import os
+import stat
+import sys
+import tarfile
+
+(root, archive, bundle_root, cargo_home, size_text, expected_hash,
+ members_text, expanded_text) = sys.argv[1:]
+size = int(size_text, 10)
+expected_members = int(members_text, 10)
+expected_expanded = int(expanded_text, 10)
+if bundle_root != os.path.join(root, "cargo-vendor"):
+    raise SystemExit("unsafe guest Cargo vendor root")
+if cargo_home != os.path.join(root, "cargo-home"):
+    raise SystemExit("unsafe guest private CARGO_HOME")
+if os.path.lexists(bundle_root) or os.path.lexists(cargo_home):
+    raise SystemExit("guest Cargo vendor state is stale")
+info = os.lstat(archive)
+if (
+    not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_uid != 0 or info.st_gid != 0 or info.st_size != size
+):
+    raise SystemExit("guest Cargo vendor archive changed before extraction")
+
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+before_hash = sha256_path(archive)
+if before_hash != expected_hash:
+    raise SystemExit("guest Cargo vendor digest changed before extraction")
+seen = set()
+regular = set()
+required_directories = set()
+members = 0
+expanded = 0
+with tarfile.open(archive, "r:gz") as source:
+    for member in source:
+        members += 1
+        name = member.name.rstrip("/")
+        parts = name.split("/")
+        if (
+            members > 50000
+            or not name or name.startswith("/") or "\\" in name
+            or any(part in ("", ".", "..") for part in parts)
+            or parts[0] != "cargo-vendor"
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name)
+            or name in seen
+            or any("/".join(parts[:index]) in regular for index in range(1, len(parts)))
+            or (not member.isdir() and name in required_directories)
+            or member.issparse()
+            or set(member.pax_headers) - {"path"}
+        ):
+            raise SystemExit("Cargo vendor archive has an unsafe member graph")
+        seen.add(name)
+        for index in range(1, len(parts)):
+            required_directories.add("/".join(parts[:index]))
+        destination = os.path.join(root, *parts)
+        if os.path.commonpath((root, destination)) != root:
+            raise SystemExit("Cargo vendor archive escaped guest root")
+        if member.isdir():
+            if os.path.lexists(destination):
+                raise SystemExit("Cargo vendor directory path already exists")
+            os.makedirs(destination, mode=0o700, exist_ok=False)
+            continue
+        if not member.isfile() or member.size < 0:
+            raise SystemExit("Cargo vendor archive contains a link or special member")
+        regular.add(name)
+        expanded += member.size
+        if expanded > 768 * 1024 * 1024:
+            raise SystemExit("Cargo vendor expanded-byte bound exceeded")
+        parent = os.path.dirname(destination)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        parent_info = os.lstat(parent)
+        if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
+            raise SystemExit("Cargo vendor file parent is unsafe")
+        if os.path.lexists(destination):
+            raise SystemExit("Cargo vendor file path already exists")
+        incoming = source.extractfile(member)
+        if incoming is None:
+            raise SystemExit("Cargo vendor regular member is unreadable")
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o700 if member.mode & 0o111 else 0o600,
+        )
+        written = 0
+        try:
+            while written < member.size:
+                chunk = incoming.read(min(1024 * 1024, member.size - written))
+                if not chunk:
+                    raise SystemExit("Cargo vendor member ended early")
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(descriptor, chunk[offset:])
+                written += len(chunk)
+            if incoming.read(1):
+                raise SystemExit("Cargo vendor member exceeded declared size")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+after_hash = sha256_path(archive)
+if before_hash != after_hash:
+    raise SystemExit("Cargo vendor archive changed during extraction")
+if members != expected_members or expanded != expected_expanded:
+    raise SystemExit("Cargo vendor archive census differs from host seal")
+for required in ("vendor", "binding.env", "cargo-config.toml", "vendor-manifest.json"):
+    if not os.path.lexists(os.path.join(bundle_root, required)):
+        raise SystemExit("extracted Cargo vendor bundle is incomplete")
+for path in ("/.cargo/config", "/.cargo/config.toml"):
+    if os.path.lexists(path):
+        raise SystemExit("guest root Cargo configuration is not allowed")
+os.mkdir(cargo_home, 0o700)
+os.unlink(archive)
+print("vendor_extraction=valid")
+print(f"vendor_archive_sha256_before={before_hash}")
+print(f"vendor_archive_sha256_after={after_hash}")
+print(f"vendor_archive_members={members}")
+print(f"vendor_expanded_bytes={expanded}")
+print("cargo_home_initially_empty=true")
+print("root_cargo_config=absent")
+' "${guest_root}" "${guest_archive}" "${bundle_root}" "${cargo_home}" \
+    "${expected_size}" "${expected_hash}" "${expected_members}" \
+    "${expected_expanded}"
+}
+
+verify_guest_cargo_vendor() {
+  local clone_id="$1" bundle_root="$2" guest_repo="$3" cargo_home="$4"
+  local expected_head="$5" source_hash="$6" lock_hash="$7"
+  local manifest_hash="$8" config_hash="$9" output="${10}"
+  run_recorded "${ORB_COMMAND_TIMEOUT_SECONDS}" "${output}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+(bundle_root, repo, cargo_home, expected_head, source_hash, lock_hash,
+ manifest_hash, config_hash) = sys.argv[1:]
+vendor = os.path.join(bundle_root, "vendor")
+binding_path = os.path.join(bundle_root, "binding.env")
+config_path = os.path.join(bundle_root, "cargo-config.toml")
+manifest_path = os.path.join(bundle_root, "vendor-manifest.json")
+lock_path = os.path.join(repo, "Cargo.lock")
+
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+binding_info = os.lstat(binding_path)
+if not stat.S_ISREG(binding_info.st_mode) or binding_info.st_nlink != 1:
+    raise SystemExit("Cargo vendor binding is unsafe")
+binding = {}
+with open(binding_path, "r", encoding="ascii", newline="") as stream:
+    lines = stream.read(8193).splitlines()
+if not lines or len(lines) > 16:
+    raise SystemExit("Cargo vendor binding size is invalid")
+for line in lines:
+    key, separator, value = line.partition("=")
+    if not separator or not key or not value or key in binding:
+        raise SystemExit("Cargo vendor binding is malformed")
+    binding[key] = value
+expected_binding = {
+    "schema_version": "1",
+    "pinned_head": expected_head,
+    "source_archive_sha256": source_hash,
+    "cargo_lock_sha256": lock_hash,
+    "vendor_manifest_sha256": manifest_hash,
+    "cargo_config_sha256": config_hash,
+}
+if binding != expected_binding:
+    raise SystemExit("Cargo vendor binding differs from host evidence")
+if sha256_path(lock_path) != lock_hash:
+    raise SystemExit("guest Cargo.lock differs from vendor binding")
+if sha256_path(config_path) != config_hash:
+    raise SystemExit("guest Cargo source config differs from vendor binding")
+if sha256_path(manifest_path) != manifest_hash:
+    raise SystemExit("guest vendor manifest differs from vendor binding")
+expected_config = (
+    "[source.crates-io]\n"
+    "replace-with = \"shadowpipe-vendored-sources\"\n\n"
+    "[source.shadowpipe-vendored-sources]\n"
+    f"directory = \"{vendor}\"\n\n"
+    "[net]\n"
+    "offline = true\n"
+).encode("ascii")
+with open(config_path, "rb") as stream:
+    if stream.read() != expected_config:
+        raise SystemExit("guest Cargo source config content is not canonical")
+with open(manifest_path, "r", encoding="ascii") as stream:
+    manifest = json.load(stream, object_pairs_hook=unique_object)
+if type(manifest) is not dict or manifest.get("schema_version") != 1:
+    raise SystemExit("guest vendor manifest schema is invalid")
+if manifest.get("cargo_lock_sha256") != lock_hash:
+    raise SystemExit("guest vendor manifest is not bound to Cargo.lock")
+expected_directories = manifest.get("directories")
+expected_files = manifest.get("files")
+packages = manifest.get("registry_packages")
+if type(expected_directories) is not list or type(expected_files) is not list or type(packages) is not list:
+    raise SystemExit("guest vendor manifest collections are invalid")
+if len(packages) == 0 or len(expected_files) == 0:
+    raise SystemExit("guest vendor manifest is empty")
+observed_directories = []
+observed_files = []
+for current, dirnames, filenames in os.walk(vendor, followlinks=False):
+    dirnames.sort()
+    filenames.sort()
+    for dirname in dirnames:
+        path = os.path.join(current, dirname)
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise SystemExit("guest vendor contains a linked directory")
+        observed_directories.append(os.path.relpath(path, vendor))
+    for filename in filenames:
+        path = os.path.join(current, filename)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SystemExit("guest vendor contains a link or special file")
+        observed_files.append({
+            "path": os.path.relpath(path, vendor),
+            "bytes": info.st_size,
+            "executable": bool(stat.S_IMODE(info.st_mode) & 0o111),
+            "sha256": sha256_path(path),
+        })
+observed_directories.sort()
+observed_files.sort(key=lambda item: item["path"])
+if observed_directories != expected_directories or observed_files != expected_files:
+    raise SystemExit("guest Cargo vendor tree differs from sealed manifest")
+home_info = os.lstat(cargo_home)
+if (
+    not stat.S_ISDIR(home_info.st_mode) or stat.S_ISLNK(home_info.st_mode)
+    or home_info.st_uid != 0 or home_info.st_gid != 0
+    or stat.S_IMODE(home_info.st_mode) != 0o700
+):
+    raise SystemExit("guest private CARGO_HOME metadata is unsafe")
+print("cargo_vendor_provenance=valid")
+print(f"pinned_head={expected_head}")
+print(f"source_archive_sha256={source_hash}")
+print(f"cargo_lock_sha256={lock_hash}")
+print(f"vendor_manifest_sha256={manifest_hash}")
+print(f"cargo_config_sha256={config_hash}")
+print(f"vendor_registry_packages={len(packages)}")
+print(f"vendor_files={len(expected_files)}")
+' "${bundle_root}" "${guest_repo}" "${cargo_home}" "${expected_head}" \
+    "${source_hash}" "${lock_hash}" "${manifest_hash}" "${config_hash}"
 }
 
 capture_guest_isolation_preflight() {
@@ -3567,7 +4582,7 @@ host_main() {
   local tool
   for tool in orb orbctl route netstat scutil pgrep ps mktemp awk sed tr wc \
     date sha256sum find sort pfctl stat grep git openssl head mkfifo \
-    /usr/bin/env /usr/bin/python3; do
+    cargo /usr/bin/env /usr/bin/python3; do
     command -v "${tool}" >/dev/null \
       || die "${EX_UNAVAILABLE}" "missing host dependency: ${tool}"
   done
@@ -3584,7 +4599,8 @@ host_main() {
     || die "${EX_USAGE}" 'SHADOWPIPE_MAGIC must be one explicit u32 value'
   local script_dir repo_root result_root run_id clone_vm helper
   local guest_root guest_archive guest_repo guest_target guest_result
-  local guest_source_manifest guest_runner
+  local guest_source_manifest guest_runner guest_vendor_archive
+  local guest_vendor_root guest_vendor_dir guest_cargo_config guest_cargo_home
   script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
   repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
   result_root="${script_dir}/results"
@@ -3600,10 +4616,16 @@ host_main() {
   guest_result="${guest_root}/result"
   guest_source_manifest="${guest_root}/source-files.sha256"
   guest_runner="${guest_repo}/tests/host-recovery/run-orbstack-phase3.sh"
+  guest_vendor_archive="${guest_root}/cargo-vendor.tar.gz"
+  guest_vendor_root="${guest_root}/cargo-vendor"
+  guest_vendor_dir="${guest_vendor_root}/vendor"
+  guest_cargo_config="${guest_vendor_root}/cargo-config.toml"
+  guest_cargo_home="${guest_root}/cargo-home"
   helper="${guest_target}/release/examples/${HELPER_NAME}"
 
   local host_tmp before after build_log guest_log build_contract orb_evidence result_dir
   local private_owner_file guest_owner_marker host_lock_dir source_archive
+  local vendor_stage vendor_archive
   local guest_evidence_archive guest_evidence_stage owner_token
   host_tmp="$(mktemp -d "${TMPDIR:-/tmp}/shadowpipe-phase3-host.XXXXXX")"
   before="${host_tmp}/mac-before"
@@ -3616,6 +4638,8 @@ host_main() {
   private_owner_file="${host_tmp}/clone-owner.env"
   guest_owner_marker="${GUEST_OWNER_DIRECTORY}/${clone_vm}.owner"
   source_archive="${host_tmp}/source.tar"
+  vendor_stage="${host_tmp}/cargo-vendor-stage"
+  vendor_archive="${host_tmp}/cargo-vendor.tar.gz"
   guest_evidence_archive="${host_tmp}/guest-evidence.tar"
   guest_evidence_stage="${host_tmp}/guest-evidence-stage"
   owner_token="$(openssl rand -hex 32)"
@@ -3629,13 +4653,20 @@ host_main() {
   : >"${build_log}"
   : >"${guest_log}"
   {
-    printf 'schema_version=2\n'
+    printf 'schema_version=3\n'
     printf 'profile=release\n'
     printf 'package=shadowpipe-core\n'
     printf 'example=%s\n' "${HELPER_NAME}"
     printf 'features=no-default-features\n'
     printf 'cargo_network=offline\n'
+    printf 'cargo_build_network_namespace=isolated\n'
+    printf 'cargo_resolution=frozen\n'
+    printf 'cargo_home=fresh_guest_private\n'
+    printf 'cargo_dependencies=sealed_versioned_vendor_bundle\n'
+    printf 'cargo_cache_boundary=trusted_same_user_host_cache\n'
+    printf 'cargo_config_precedence=cli_config_from_root_cwd\n'
     printf 'source_transport=bounded_git_archive_stdin\n'
+    printf 'dependency_transport=bounded_validated_gzip_tar_stdin\n'
     printf 'evidence_transport=bounded_validated_tar_stdout\n'
     printf 'guest_storage=guest_local_only\n'
     printf 'orb_shared_checkout=false\n'
@@ -3995,7 +5026,7 @@ host_main() {
       printf -- '- Host-safety timing: before/after endpoint snapshots, not a continuous mutation monitor.\n'
       printf -- '- Evidence authenticity: relative SHA-256 plus a final census; no external signature or timestamp authority.\n'
       printf -- '- VM identity: strict duplicate-key-rejecting OrbStack JSON bound opaque source/clone IDs plus exact isolated/network-isolated/no-mount/no-forward/no-agent capabilities; start/stop/guest operations used the clone ID, while delete-by-name required an immediate name-to-ID revalidation.\n'
-      printf -- '- Source/evidence boundary: clean pushed main was pinned by commit-bearing git archive, streamed by bounded stdin into guest-local storage, and sealed evidence returned by bounded validated stdout tar; no shared checkout or host target mount was used.\n'
+      printf -- '- Source/dependency/evidence boundary: clean pushed main was pinned by commit-bearing git archive; all crates.io lock entries were carried in a checksummed versioned Cargo vendor bundle; both entered guest-local storage through bounded stdin, the guest used fresh CARGO_HOME plus CLI source replacement and --frozen, and sealed evidence returned by bounded validated stdout tar. No shared checkout or host target mount was used.\n'
       printf '\nAn unrelated same-host OrbStack lifecycle operator is outside this run\047s trust boundary.\n'
     } >"${result_dir}/FINAL-RESULT.md" || evidence_status=failed
     printf 'finalization=complete\nrun_id=%s\n' "${run_id}" \
@@ -4063,6 +5094,9 @@ host_main() {
     || die "${EX_UNAVAILABLE}" \
       "repository must be clean pushed main before creating the guest archive"
   local pinned_head source_archive_size source_archive_hash
+  local vendor_archive_size vendor_archive_hash vendor_archive_members
+  local vendor_expanded_bytes cargo_lock_hash vendor_manifest_hash
+  local cargo_config_hash vendor_registry_packages vendor_files
   pinned_head="$(<"${orb_evidence}/git-checkout-before/head.txt")"
   create_pinned_source_archive "${repo_root}" "${pinned_head}" \
     "${source_archive}" "${orb_evidence}/source-archive.env" \
@@ -4078,6 +5112,53 @@ host_main() {
     printf 'source_archive_bytes=%s\n' "${source_archive_size}"
     printf 'source_archive_sha256=%s\n' "${source_archive_hash}"
   } >>"${build_contract}"
+  create_cargo_vendor_bundle "${repo_root}" "${source_archive}" \
+    "${source_archive_size}" "${source_archive_hash}" "${pinned_head}" \
+    "${vendor_stage}" "${vendor_archive}" \
+    "${orb_evidence}/cargo-vendor.env" "${guest_vendor_dir}" \
+    || die "${EX_UNAVAILABLE}" \
+      "could not create the provenance-bound offline Cargo vendor bundle"
+  vendor_archive_size="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" vendor_archive_bytes)" \
+    || die "${EX_UNAVAILABLE}" "vendor archive size proof is malformed"
+  vendor_archive_hash="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" vendor_archive_sha256)" \
+    || die "${EX_UNAVAILABLE}" "vendor archive digest proof is malformed"
+  vendor_archive_members="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" vendor_archive_members)" \
+    || die "${EX_UNAVAILABLE}" "vendor archive member proof is malformed"
+  vendor_expanded_bytes="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" vendor_expanded_bytes)" \
+    || die "${EX_UNAVAILABLE}" "vendor expanded-byte proof is malformed"
+  cargo_lock_hash="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" cargo_lock_sha256)" \
+    || die "${EX_UNAVAILABLE}" "Cargo.lock digest proof is malformed"
+  vendor_manifest_hash="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" vendor_manifest_sha256)" \
+    || die "${EX_UNAVAILABLE}" "vendor manifest digest proof is malformed"
+  cargo_config_hash="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" cargo_config_sha256)" \
+    || die "${EX_UNAVAILABLE}" "Cargo config digest proof is malformed"
+  vendor_registry_packages="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" vendor_registry_packages)" \
+    || die "${EX_UNAVAILABLE}" "vendor package census is malformed"
+  vendor_files="$(metadata_field \
+    "${orb_evidence}/cargo-vendor.env" vendor_files)" \
+    || die "${EX_UNAVAILABLE}" "vendor file census is malformed"
+  {
+    printf 'cargo_lock_sha256=%s\n' "${cargo_lock_hash}"
+    printf 'vendor_archive_bytes=%s\n' "${vendor_archive_size}"
+    printf 'vendor_archive_sha256=%s\n' "${vendor_archive_hash}"
+    printf 'vendor_archive_members=%s\n' "${vendor_archive_members}"
+    printf 'vendor_expanded_bytes=%s\n' "${vendor_expanded_bytes}"
+    printf 'vendor_manifest_sha256=%s\n' "${vendor_manifest_hash}"
+    printf 'cargo_config_sha256=%s\n' "${cargo_config_hash}"
+    printf 'vendor_registry_packages=%s\n' "${vendor_registry_packages}"
+    printf 'vendor_files=%s\n' "${vendor_files}"
+  } >>"${build_contract}"
+  capture_git_checkout_proof "${repo_root}" \
+    "${orb_evidence}/git-checkout-after-vendor" "${pinned_head}" \
+    || die 1 "host checkout changed while creating the dependency bundle"
 
   local source_state clone_state
   source_state="$(orb_exact_state "${source_vm}" "${orb_evidence}/initial.list")" \
@@ -4178,21 +5259,63 @@ host_main() {
     "${clone_orb_id}" "${guest_repo}" "${guest_source_manifest}" \
     "${orb_evidence}/source-manifest-before-build.env" \
     || die 1 "guest source manifest failed before build"
+  stream_cargo_vendor_to_guest "${clone_orb_id}" "${vendor_archive}" \
+    "${guest_root}" "${guest_vendor_archive}" "${vendor_archive_size}" \
+    "${vendor_archive_hash}" "${orb_evidence}/vendor-transfer.env" \
+    || die 1 "bounded Cargo vendor bundle transfer into the clone failed"
+  extract_guest_cargo_vendor "${clone_orb_id}" "${guest_root}" \
+    "${guest_vendor_archive}" "${guest_vendor_root}" "${guest_cargo_home}" \
+    "${vendor_archive_size}" "${vendor_archive_hash}" \
+    "${vendor_archive_members}" "${vendor_expanded_bytes}" \
+    "${orb_evidence}/vendor-extract.env" \
+    || die 1 "guest Cargo vendor extraction or fresh CARGO_HOME setup failed"
+  verify_guest_cargo_vendor "${clone_orb_id}" "${guest_vendor_root}" \
+    "${guest_repo}" "${guest_cargo_home}" "${pinned_head}" \
+    "${source_archive_hash}" "${cargo_lock_hash}" \
+    "${vendor_manifest_hash}" "${cargo_config_hash}" \
+    "${orb_evidence}/vendor-before-build.env" \
+    || die 1 "guest Cargo vendor provenance failed before build"
 
   say "building lab-only helper inside ${clone_vm}"
   # Positional parameters intentionally expand only in the guest Bash.
   # shellcheck disable=SC2016
   if ! run_bounded "${ORB_BUILD_TIMEOUT_SECONDS}" \
-    orb -m "${clone_orb_id}" -u root env \
-    SHADOWPIPE_MAGIC="${magic}" CARGO_NET_OFFLINE=true \
-    CARGO_TARGET_DIR="${guest_target}" /bin/bash -ceu '
-      cd -- "$1"
-      cargo build --offline --release --locked --no-default-features \
-        -p shadowpipe-core --example "$2"
-      test -x "$3"
-      printf "shadowpipe_magic=%s\n" "$4"
-      sha256sum "$3"
-    ' phase3-guest-build "${guest_repo}" "${HELPER_NAME}" "${helper}" "${magic}" \
+    orb -m "${clone_orb_id}" -u root /bin/bash -ceu '
+      repo=$1
+      example=$2
+      helper=$3
+      magic=$4
+      cargo_home=$5
+      cargo_config=$6
+      target=$7
+      build_tmp=$8
+      test -d "${cargo_home}" && test ! -L "${cargo_home}"
+      test -z "$(find "${cargo_home}" -mindepth 1 -print -quit)"
+      test ! -e /.cargo/config && test ! -e /.cargo/config.toml
+      mkdir -m 0700 -- "${build_tmp}"
+      cargo_bin=$(command -v cargo)
+      unshare_bin=$(command -v unshare)
+      case "${cargo_bin}" in /*) ;; *) exit 1 ;; esac
+      case "${unshare_bin}" in /*) ;; *) exit 1 ;; esac
+      clean_path="${cargo_bin%/*}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+      cd /
+      "${unshare_bin}" --net -- /usr/bin/env -i \
+        HOME=/root USER=root LOGNAME=root PATH="${clean_path}" \
+        CARGO_HOME="${cargo_home}" CARGO_TARGET_DIR="${target}" \
+        CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=never CARGO_INCREMENTAL=0 \
+        COPYFILE_DISABLE=1 TMPDIR="${build_tmp}" SHADOWPIPE_MAGIC="${magic}" \
+        "${cargo_bin}" --config "${cargo_config}" build --frozen \
+          --manifest-path "${repo}/Cargo.toml" --release \
+          --no-default-features -p shadowpipe-core --example "${example}"
+      test -x "${helper}"
+      printf "cargo_home_initially_empty=true\n"
+      printf "cargo_resolution=frozen\n"
+      printf "cargo_build_network_namespace=isolated\n"
+      printf "shadowpipe_magic=%s\n" "${magic}"
+      sha256sum "${helper}"
+    ' phase3-guest-build "${guest_repo}" "${HELPER_NAME}" "${helper}" \
+    "${magic}" "${guest_cargo_home}" "${guest_cargo_config}" \
+    "${guest_target}" "${guest_root}/build-tmp" \
     >"${build_log}" 2>&1; then
     die 1 "guest helper build failed"
   fi
@@ -4203,6 +5326,12 @@ host_main() {
     "${clone_orb_id}" "${guest_repo}" "${guest_source_manifest}" \
     "${orb_evidence}/source-manifest-after-build.env" \
     || die 1 "guest source changed during the Phase-3 build"
+  verify_guest_cargo_vendor "${clone_orb_id}" "${guest_vendor_root}" \
+    "${guest_repo}" "${guest_cargo_home}" "${pinned_head}" \
+    "${source_archive_hash}" "${cargo_lock_hash}" \
+    "${vendor_manifest_hash}" "${cargo_config_hash}" \
+    "${orb_evidence}/vendor-after-build.env" \
+    || die 1 "guest Cargo vendor provenance changed during build"
   capture_git_checkout_proof \
     "${repo_root}" "${orb_evidence}/git-checkout-after-build" "${pinned_head}" \
     || die 1 "host checkout or pushed origin/main changed during guest-local build"
@@ -4228,6 +5357,12 @@ host_main() {
     "${clone_orb_id}" "${guest_repo}" "${guest_source_manifest}" \
     "${orb_evidence}/source-manifest-final.env" \
     || die 1 "guest source changed during the Phase-3 experiment"
+  verify_guest_cargo_vendor "${clone_orb_id}" "${guest_vendor_root}" \
+    "${guest_repo}" "${guest_cargo_home}" "${pinned_head}" \
+    "${source_archive_hash}" "${cargo_lock_hash}" \
+    "${vendor_manifest_hash}" "${cargo_config_hash}" \
+    "${orb_evidence}/vendor-final.env" \
+    || die 1 "guest Cargo vendor provenance changed during the experiment"
   if stream_guest_evidence_archive \
       "${clone_orb_id}" "${guest_runner}" "${guest_result}" "${run_id}" \
       "${clone_vm}" "${owner_token}" "${guest_evidence_archive}" \
@@ -4340,7 +5475,11 @@ self_test() {
   git -C "${temporary}/git-fixture" config protocol.file.allow always
   printf '%s\n' pinned-source-fixture \
     >"${temporary}/git-fixture/input.txt"
-  git -C "${temporary}/git-fixture" add input.txt
+  printf '%s\n' '[workspace]' 'members = []' \
+    >"${temporary}/git-fixture/Cargo.toml"
+  printf '%s\n' 'version = 4' \
+    >"${temporary}/git-fixture/Cargo.lock"
+  git -C "${temporary}/git-fixture" add input.txt Cargo.toml Cargo.lock
   git -C "${temporary}/git-fixture" commit -q -m fixture
   git -C "${temporary}/git-fixture" branch -M main
   git init -q --bare "${temporary}/git-origin.git"
@@ -4457,7 +5596,107 @@ self_test() {
     =~ ^[1-9][0-9]*$ ]]
   [[ "$(git -C "${temporary}/git-fixture" get-tar-commit-id \
     <"${temporary}/git-fixture.tar")" == "${fixture_head}" ]]
+  extract_host_source_for_vendor "${temporary}/git-fixture.tar" \
+    "${temporary}/private-source-fixture" \
+    "$(metadata_field \
+      "${temporary}/git-fixture-archive.env" source_archive_bytes)" \
+    "$(metadata_field \
+      "${temporary}/git-fixture-archive.env" source_archive_sha256)" \
+    "${temporary}/private-source-fixture.env"
+  [[ -f "${temporary}/private-source-fixture/input.txt" ]]
   if find "${temporary}" -name '*.pipes.*' -print -quit | grep -q .; then
+    return 1
+  fi
+
+  mkdir -m 0700 -- "${temporary}/cargo-home-fixture"
+  validate_host_cargo_boundary "${temporary}/cargo-home-fixture" \
+    "${temporary}/cargo-boundary.env"
+  if CARGO_HOME="${temporary}/ambient-cargo" validate_host_cargo_boundary \
+    "${temporary}/cargo-home-fixture" \
+    "${temporary}/cargo-boundary-ambient.env" \
+    >"${temporary}/cargo-boundary-ambient.out" \
+    2>"${temporary}/cargo-boundary-ambient.err"; then
+    return 1
+  fi
+  mkdir -p -- "${temporary}/vendor-fixture/fixture-1.0.0/src" \
+    "${temporary}/vendor-workspace/crates/workspace"
+  printf '%s\n' 'pub fn fixture() {}' \
+    >"${temporary}/vendor-fixture/fixture-1.0.0/src/lib.rs"
+  local fixture_file_hash
+  fixture_file_hash="$(sha256sum \
+    "${temporary}/vendor-fixture/fixture-1.0.0/src/lib.rs" | awk '{print $1}')"
+  jq -cn --arg hash "${fixture_file_hash}" \
+    '{files:{"src/lib.rs":$hash},package:("a" * 64)}' \
+    >"${temporary}/vendor-fixture/fixture-1.0.0/.cargo-checksum.json"
+  printf '%s\n' \
+    'version = 4' \
+    '' \
+    '[[package]]' \
+    'name = "fixture"' \
+    'version = "1.0.0"' \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    'checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    '' \
+    '[[package]]' \
+    'name = "workspace"' \
+    'version = "0.1.0"' \
+    >"${temporary}/vendor-workspace/Cargo.lock"
+  printf '%s\n' \
+    '[package]' \
+    'name = "workspace"' \
+    'version = "0.1.0"' \
+    'edition = "2021"' \
+    >"${temporary}/vendor-workspace/crates/workspace/Cargo.toml"
+  jq -cn --arg root "${temporary}/vendor-workspace" \
+    --arg manifest "${temporary}/vendor-workspace/crates/workspace/Cargo.toml" \
+    '{workspace_root:$root,packages:[
+      {name:"workspace",version:"0.1.0",source:null,manifest_path:$manifest},
+      {name:"fixture",version:"1.0.0",source:"registry+https://github.com/rust-lang/crates.io-index",manifest_path:"/registry/fixture/Cargo.toml"}
+    ]}' >"${temporary}/vendor-metadata.json"
+  validate_cargo_workspace_metadata "${temporary}/vendor-workspace" \
+    "${temporary}/vendor-workspace/Cargo.lock" \
+    "${temporary}/vendor-metadata.json" \
+    "${temporary}/vendor-metadata.env"
+  seal_cargo_vendor_tree "${temporary}/vendor-fixture" \
+    "${temporary}/vendor-workspace/Cargo.lock" \
+    "${temporary}/vendor-fixture.tar.gz" \
+    "${temporary}/vendor-fixture.env" \
+    1111111111111111111111111111111111111111 \
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    /var/tmp/shadowpipe-phase3-selftest/cargo-vendor/vendor
+  [[ "$(metadata_field \
+    "${temporary}/vendor-fixture.env" vendor_registry_packages)" == 1 ]]
+  [[ "$(metadata_field \
+    "${temporary}/vendor-fixture.env" vendor_files)" == 2 ]]
+  [[ "$(metadata_field \
+    "${temporary}/vendor-fixture.env" vendor_archive_members)" \
+    =~ ^[1-9][0-9]*$ ]]
+  ln -s /etc/passwd \
+    "${temporary}/vendor-fixture/fixture-1.0.0/unsafe-link"
+  if seal_cargo_vendor_tree "${temporary}/vendor-fixture" \
+    "${temporary}/vendor-workspace/Cargo.lock" \
+    "${temporary}/vendor-symlink.tar.gz" \
+    "${temporary}/vendor-symlink.env" \
+    1111111111111111111111111111111111111111 \
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    /var/tmp/shadowpipe-phase3-selftest/cargo-vendor/vendor \
+    >"${temporary}/vendor-symlink.out" \
+    2>"${temporary}/vendor-symlink.err"; then
+    return 1
+  fi
+  rm -- "${temporary}/vendor-fixture/fixture-1.0.0/unsafe-link"
+  cp -- "${temporary}/vendor-workspace/Cargo.lock" \
+    "${temporary}/vendor-workspace/Cargo-git.lock"
+  sed 's#registry+https://github.com/rust-lang/crates.io-index#git+https://example.invalid/repo#' \
+    "${temporary}/vendor-workspace/Cargo.lock" \
+    >"${temporary}/vendor-workspace/Cargo-git.lock"
+  if seal_cargo_vendor_tree "${temporary}/vendor-fixture" \
+    "${temporary}/vendor-workspace/Cargo-git.lock" \
+    "${temporary}/vendor-git.tar.gz" "${temporary}/vendor-git.env" \
+    1111111111111111111111111111111111111111 \
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    /var/tmp/shadowpipe-phase3-selftest/cargo-vendor/vendor \
+    >"${temporary}/vendor-git.out" 2>"${temporary}/vendor-git.err"; then
     return 1
   fi
 
