@@ -3957,7 +3957,7 @@ if manager.returncode != 0 or manager.stderr:
 manager_lines = manager.stdout.decode("utf-8").splitlines()
 if len(manager_lines) != 1:
     raise SystemExit("systemd manager Version is not one line")
-version_match = re.match(r"^([0-9]+)(?:\s|$)", manager_lines[0])
+version_match = re.match(r"^([0-9]+)(?:[. -]|$)", manager_lines[0])
 if version_match is None or int(version_match.group(1), 10) < 254:
     raise SystemExit("live systemd manager is older than 254")
 boot_id = one_line("/proc/sys/kernel/random/boot_id").lower()
@@ -4029,7 +4029,7 @@ if not os.path.isabs(values["exe"]) or os.path.basename(values["exe"]) != "syste
     raise SystemExit("PID-1 executable proof differs")
 if re.fullmatch(r"[1-9][0-9]*", values["pid1_start_ticks"]) is None:
     raise SystemExit("PID-1 start ticks are malformed")
-version = re.match(r"^([0-9]+)(?:\s|$)", values["manager_version"])
+version = re.match(r"^([0-9]+)(?:[. -]|$)", values["manager_version"])
 if version is None or int(version.group(1), 10) < 254:
     raise SystemExit("PID-1 live systemd manager version is too old")
 if re.fullmatch(
@@ -5941,7 +5941,7 @@ PY
     'status_name=systemd' \
     'ppid=0' \
     'pid1_start_ticks=10' \
-    'manager_version=261 (261-1-arch)' \
+    'manager_version=261.1-1-arch' \
     'boot_id=11111111-2222-3333-4444-555555555555' \
     'machine_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
     'kernel_release=7.0.11-orbstack-test' \
@@ -5956,7 +5956,7 @@ PY
     'status_name=systemd' \
     'ppid=0' \
     'pid1_start_ticks=20' \
-    'manager_version=261 (261-1-arch)' \
+    'manager_version=261.1-1-arch' \
     'boot_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' \
     'machine_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
     'kernel_release=7.0.11-orbstack-test' \
