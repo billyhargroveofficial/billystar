@@ -6,7 +6,7 @@ use shadowpipe_core::mux::MuxConfig;
 use shadowpipe_core::pacing::{
     build_ping_reply, build_ping_request, parse_ping, PacerConfig, PingMsg,
 };
-use shadowpipe_core::proto::{CamouflageMode, FrameFlags};
+use shadowpipe_core::proto::{CamouflageMode, CarrierBinding, FrameFlags};
 use shadowpipe_core::session::{AuthenticatedSession, ServerState};
 use shadowpipe_core::tun_dev::{nat_setup_hint, open_async_exclusive_named, SharedTun};
 use shadowpipe_core::tunnel::{
@@ -223,15 +223,33 @@ struct Args {
     /// Terminate a real Chrome-JA4 TLS layer (boring-front) and run shadowpipe
     /// inside it. On the wire the connection looks like HTTPS. Uses an ephemeral
     /// self-signed cert; the client pins the inner ML-KEM server identity instead.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "http_stream")]
     tls: bool,
+
+    /// Clean-room XHTTP-class carrier: terminate browser TLS, then accept one
+    /// genuine HTTP/2 POST upload body plus concurrent response body. Current
+    /// eligibility remains explicit no-TUN lab until real-origin certificate,
+    /// replay-safe outer admission and cover parity are complete. Requires a
+    /// build with `--features http-stream`.
+    #[arg(long, conflicts_with_all = ["tls", "reality", "quic"])]
+    http_stream: bool,
+
+    /// Opaque absolute path accepted by --http-stream. Must match the client and
+    /// contain at least 24 visible ASCII bytes.
+    #[arg(long, value_name = "PATH", requires = "http_stream")]
+    http_path: Option<String>,
+
+    /// Canonical HTTP :authority accepted by --http-stream (normally the
+    /// client's --sni value).
+    #[arg(long, value_name = "HOST", requires = "http_stream")]
+    http_authority: Option<String>,
 
     /// Use the REALITY carrier instead of --tls: terminate a from-scratch
     /// TLS 1.3 + REALITY handshake. Peers presenting an accepted REALITY token
     /// run shadowpipe inside; every other peer is transparently forwarded to the
     /// cover. Token acceptance is not client identity authentication. Mutually
     /// exclusive with --tls.
-    #[arg(long, conflicts_with = "tls")]
+    #[arg(long, conflicts_with_all = ["tls", "http_stream"])]
     reality: bool,
 
     /// REALITY X25519 static secret file (hex). Loaded on start, or generated if
@@ -307,7 +325,7 @@ struct Args {
     /// inside one bi-stream. The client pins the inner ML-KEM server identity,
     /// not the ephemeral certificate. Runs as its own UDP listener alongside the
     /// TCP socket. Requires a build with `--features quic`.
-    #[arg(long, conflicts_with_all = ["tls", "reality"])]
+    #[arg(long, conflicts_with_all = ["tls", "http_stream", "reality"])]
     quic: bool,
 
     /// Degradation-symmetric pacer on the server's downlink (the heavier
@@ -577,9 +595,22 @@ fn validate_daemon_carrier_security(args: &Args) -> Result<()> {
         args.allow_insecure_lab_carriers
             && args.development_user_allowlist
             && !args.tunnel,
-        "production daemon requires --reality: Raw/H2/TLS/QUIC expose a distinguishable ShadowPipe bootstrap/challenge to active probes (the mutual PSK gate still withholds ML-KEM bytes and KEM work); lab use requires --allow-insecure-lab-carriers with --development-user-allowlist and no --tunnel"
+        "production daemon requires --reality: Raw/legacy-H2/TLS/raw-QUIC/HTTP-stream carriers are not yet production-qualified against active probes (the mutual PSK gate still withholds ML-KEM bytes and KEM work); lab use requires --allow-insecure-lab-carriers with --development-user-allowlist and no --tunnel"
     );
     Ok(())
+}
+
+#[cfg(feature = "http-stream")]
+fn http_stream_route(args: &Args) -> Result<shadowpipe_core::http_stream::HttpStreamRoute> {
+    let authority = args
+        .http_authority
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--http-stream requires --http-authority"))?;
+    let path = args
+        .http_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--http-stream requires --http-path"))?;
+    shadowpipe_core::http_stream::HttpStreamRoute::new(authority, path)
 }
 
 const DEFAULT_REALITY_REPLAY_STORE: &str = "/var/lib/shadowpipe/reality-replay-v1.bin";
@@ -742,6 +773,7 @@ struct AdmittedConnection {
     runtime: RuntimeLimits,
     permit: OwnedSemaphorePermit,
     observed_camouflage: Option<CamouflageMode>,
+    observed_carrier: CarrierBinding,
 }
 
 #[derive(Clone)]
@@ -914,10 +946,20 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(not(feature = "tls-chrome"))]
-    if args.tls {
+    if args.tls || args.http_stream {
         anyhow::bail!(
-            "--tls requires a build with `--features tls-chrome` (BoringSSL not compiled in)"
+            "--tls/--http-stream require a build with `--features tls-chrome` (BoringSSL not compiled in)"
         );
+    }
+    #[cfg(not(feature = "http-stream"))]
+    if args.http_stream {
+        anyhow::bail!(
+            "--http-stream requires a build with `--features http-stream` (h2 not compiled in)"
+        );
+    }
+    #[cfg(feature = "http-stream")]
+    if args.http_stream {
+        http_stream_route(&args).context("validate --http-stream authority/path")?;
     }
     #[cfg(not(feature = "quic"))]
     if args.quic {
@@ -985,7 +1027,7 @@ async fn main() -> Result<()> {
     // tls-chrome: build the self-signed acceptor once (ephemeral per-process cert)
     // and share it across connections.
     #[cfg(feature = "tls-chrome")]
-    let acceptor = if args.tls {
+    let acceptor = if args.tls || args.http_stream {
         let acc = Arc::new(shadowpipe_core::tls::self_signed_acceptor()?);
         info!("tls-chrome enabled: wire is real TLS, shadowpipe runs inside");
         Some(acc)
@@ -1117,6 +1159,7 @@ async fn main() -> Result<()> {
                     runtime,
                     permit,
                     observed_camouflage: Some(CamouflageMode::Raw),
+                    observed_carrier: CarrierBinding::QuicRaw,
                 };
                 tokio::spawn(async move {
                     match bounded_stage(
@@ -1176,7 +1219,17 @@ async fn main() -> Result<()> {
         let connection = AdmittedConnection {
             runtime,
             permit,
-            observed_camouflage: (args.tls || args.reality).then_some(CamouflageMode::Raw),
+            observed_camouflage: (args.tls || args.http_stream || args.reality)
+                .then_some(CamouflageMode::Raw),
+            observed_carrier: if args.reality {
+                CarrierBinding::RealityTcp
+            } else if args.http_stream {
+                CarrierBinding::Http2Tls
+            } else if args.tls {
+                CarrierBinding::BrowserTlsTcp
+            } else {
+                CarrierBinding::DirectTcp
+            },
         };
         tokio::spawn(async move {
             if let Err(err) = handle_client(
@@ -1241,6 +1294,40 @@ async fn handle_client(
                     .context("drive REALITY cover splice under sliding idle deadline")
             }
         }
+    } else if args.http_stream {
+        #[cfg(feature = "http-stream")]
+        {
+            let acceptor = carriers
+                .tls_acceptor
+                .as_ref()
+                .context("HTTP stream mode started without a TLS acceptor")?;
+            let tls = bounded_stage(
+                "TLS outer handshake",
+                connection.runtime.outer_handshake,
+                shadowpipe_core::tls::accept(acceptor, stream),
+            )
+            .await?;
+            let route = http_stream_route(&args)?;
+            let stream = bounded_stage(
+                "genuine HTTP/2 request admission",
+                connection.runtime.outer_handshake,
+                shadowpipe_core::http_stream::server_accept(tls, &route),
+            )
+            .await?;
+            info!("genuine HTTP/2 stream carrier accepted");
+            serve(
+                stream,
+                state,
+                authorized_clients,
+                args,
+                shared_tunnel,
+                None,
+                connection,
+            )
+            .await
+        }
+        #[cfg(not(feature = "http-stream"))]
+        unreachable!("--http-stream rejected before listener bind");
     } else if args.tls {
         #[cfg(feature = "tls-chrome")]
         {
@@ -1312,17 +1399,19 @@ where
         runtime,
         permit,
         observed_camouflage,
+        observed_carrier,
     } = connection;
     let observed_camouflage = observed_camouflage
         .context("outer adapter did not provide an observed inner framing class")?;
     let (session, hello, session_id) = bounded_stage(
         "inner post-quantum session handshake",
         runtime.inner_handshake,
-        AuthenticatedSession::server_accept(
+        AuthenticatedSession::server_accept_bound(
             &mut stream,
             &state,
             &authorized_clients,
             observed_camouflage,
+            observed_carrier,
         ),
     )
     .await?;
@@ -1757,6 +1846,7 @@ mod tests {
             // Simulate a carrier translator/stripper: the authenticated hello
             // claims H2, while the server actually observed raw bytes.
             observed_camouflage: Some(CamouflageMode::Raw),
+            observed_carrier: CarrierBinding::DirectTcp,
         };
         let (mut client_io, server_io) = tokio::io::duplex(1 << 20);
         let server = tokio::spawn(serve(
@@ -2222,6 +2312,32 @@ mod tests {
             "--allow-insecure-lab-carriers",
         ])
         .unwrap();
+        validate_daemon_carrier_security(&gated).unwrap();
+    }
+
+    #[cfg(feature = "http-stream")]
+    #[test]
+    fn http_stream_is_genuine_http2_but_remains_lab_gated() {
+        let flags = [
+            "--http-stream",
+            "--http-authority",
+            "example.com",
+            "--http-path",
+            "/api/events/0123456789abcdef0123456789abcdef",
+        ];
+        let mut ungated = vec!["shadowpipe-server"];
+        ungated.extend(flags);
+        let ungated = Args::try_parse_from(ungated).unwrap();
+        assert!(validate_daemon_carrier_security(&ungated).is_err());
+
+        let mut gated = vec![
+            "shadowpipe-server",
+            "--development-user-allowlist",
+            "--allow-insecure-lab-carriers",
+        ];
+        gated.extend(flags);
+        let gated = Args::try_parse_from(gated).unwrap();
+        http_stream_route(&gated).unwrap();
         validate_daemon_carrier_security(&gated).unwrap();
     }
 

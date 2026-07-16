@@ -21,12 +21,13 @@ the following are true:
    independently generated uniform 256-bit PSK enrolled on the server;
 5. the server proved possession of that same PSK again in ServerFinished;
 6. access proofs bind roles/domains, version/build, the inner camouflage
-   framing class, kid and
+   framing class, the exact outer carrier class, kid and
    challenge/nonces/server tag; encrypted Finished proofs commit `H0`, which
    contains the access flights and hybrid-handshake fields;
 7. the outer adapter's observed `raw`/`h2` framing class equals the authenticated
-   inner claim. This is not an outer-transport identity: direct TCP, TLS, QUIC
-   and REALITY all currently terminate to `raw`.
+   inner claim, and its locally observed carrier class equals the carrier class
+   used by the client. The current stable classes distinguish direct TCP,
+   REALITY/TCP, browser-TLS/TCP, raw QUIC, HTTP/2+TLS and HTTP/3+QUIC.
 
 The PSK HMAC is a symmetric post-quantum authentication hedge, conditional on a
 secret authenticated provisioning channel. Ed25519 remains classical. The
@@ -162,17 +163,18 @@ inner bootstrap. Raw/H2/TLS/QUIC answer active probes with a distinguishable
 ShadowPipe bootstrap/challenge and are accepted only behind the explicit
 `--allow-insecure-lab-carriers --development-user-allowlist` no-TUN gate.
 
-Deterministic access-MAC vector (`B=0x01020304`, `V=3`, `C=h2`, PSK=`11` repeated
-32 bytes, `kid=00..0f`, `R_s=20..3f`, `R_c=40..5f`):
+Deterministic access-MAC vector (`B=0x01020304`, `V=3`, `C=h2`,
+`carrier=direct-tcp`, PSK=`11` repeated 32 bytes, `kid=00..0f`,
+`R_s=20..3f`, `R_c=40..5f`):
 
 ```text
-S   = 7be4628e91caad7b2c30d03a689da81218230129a3018eda91ce7db66b204f63
-C_p = 77a2cfbc5798f50e0ff4b064d542a81f17b41947c9bff7c8ee513c206aeb5886
+S   = 0ad1172ae902cdb298bebcf81845c52e029462dfed724cae9dfe5f45e3c6ea5c
+C_p = 227dd695fd3a5d233b7efb959eb94ea9293fa22c24b1fb51e997ae5736c205cc
 ```
 
 ## Canonical transcript
 
-`H0 = SHA-256(domain || field(1)..field(19))`, where each field is encoded as
+`H0 = SHA-256(domain || field(1)..field(20))`, where each field is encoded as
 `tag:u8 || length:u32 || value`. Unique tags and fixed-width lengths make the
 encoding prefix-free for this schema. The committed values are:
 
@@ -191,12 +193,13 @@ encoding prefix-free for this schema. The committed values are:
 12. session id;
 13. the ClientHello magic again;
 14. the ClientHello version again;
-15. claimed inner camouflage framing class (`raw` or `h2`), not a unique outer
-    transport identifier;
+15. claimed inner camouflage framing class (`raw` or `h2`);
 16. padding profile;
 17. the exact 16-byte client access hello (`kid`);
 18. the exact 64-byte server access proof;
-19. the exact 64-byte client access proof.
+19. the exact 64-byte client access proof;
+20. the exact outer carrier class selected by the client and locally observed
+    by the server.
 
 The duplication of version/build fields is intentional belt-and-suspenders
 binding, not extra entropy.
@@ -207,7 +210,7 @@ The deterministic H0 vector in the implementation uses explicit build magic
 the test. Its expected digest is:
 
 ```text
-7f884dcae0c7afe0dd214dd6e028de55b5faef55e514e50cf940fea3759252b3
+4602407f409510dc99e0143c54d55ed5c5027e49af41fd138535fedb6a5f0573
 ```
 
 Production/release client and server artifacts must be compiled with the same
@@ -430,11 +433,13 @@ cryptographic-proof or production evidence.
   still requires the device PSK and Ed25519 key.
 - Endpoint IPs, ports, carrier choice, packet sizes and timing remain visible to
   an on-path observer unless an outer carrier hides a particular field.
-- The authenticated camouflage field prevents `raw`/`h2` framing translation or
-  stripping. It does **not** prevent replay across outer transports that share
-  `raw`; transport identity would require a separately designed channel binding.
-  Production mitigates the current exposure operationally by admitting only
-  REALITY, while direct TCP/TLS/QUIC remain explicit no-TUN lab paths.
+- The authenticated camouflage and carrier fields prevent `raw`/`h2` framing
+  translation and replay between the daemon's distinct direct, REALITY, browser
+  TLS, raw QUIC, HTTP/2 and HTTP/3 adapter classes. This is an authenticated
+  local adapter identity, not a TLS exporter or a proof that a buggy/malicious
+  adapter labeled the underlying channel correctly. A stronger channel-binding
+  claim would require binding exporter/connection material supplied by each
+  outer protocol and an adversarial adapter-confusion audit.
 - Windows production credential/allowlist ACL verification is not implemented.
   Windows is restricted to explicit no-TUN development mode.
 - Linux host-state ownership is outside the inner cryptographic protocol.

@@ -26,6 +26,37 @@ impl CamouflageMode {
     }
 }
 
+/// Exact outer carrier identity authenticated by the inner access gate and
+/// canonical handshake transcript.
+///
+/// This is deliberately separate from [`CamouflageMode`]. The camouflage mode
+/// describes framing presented to the inner protocol, while several distinct
+/// outer carriers terminate to the same raw byte stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CarrierBinding {
+    DirectTcp = 0,
+    RealityTcp = 1,
+    BrowserTlsTcp = 2,
+    QuicRaw = 3,
+    Http2Tls = 4,
+    Http3Quic = 5,
+}
+
+impl CarrierBinding {
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(Self::DirectTcp),
+            1 => Ok(Self::RealityTcp),
+            2 => Ok(Self::BrowserTlsTcp),
+            3 => Ok(Self::QuicRaw),
+            4 => Ok(Self::Http2Tls),
+            5 => Ok(Self::Http3Quic),
+            _ => Err(anyhow!("unknown carrier binding {v}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PaddingProfile {

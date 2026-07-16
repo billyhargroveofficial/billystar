@@ -21,9 +21,11 @@ serde_json.workspace = true
 libc = "0.2"
 
 [features]
-default = ["tls-chrome"]
+default = ["tls-chrome", "http-stream"]
 # Chrome-JA4 TLS carrier (BoringSSL). Off for musl static builds.
 tls-chrome = ["shadowpipe-core/tls-chrome"]
+# Genuine HTTP/2 stream carried inside browser TLS.
+http-stream = ["tls-chrome", "shadowpipe-core/http-stream"]
 # Off-by-default QUIC carrier (--quic). Forwards to the core `quic` feature
 # (pulls quinn/rustls). Build with: cargo build -p shadowpipe-client --features quic
 quic = ["shadowpipe-core/quic"]

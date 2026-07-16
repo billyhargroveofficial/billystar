@@ -12,14 +12,18 @@
 //! uses — a graceful close so the responder never tears down the QUIC connection
 //! with a reply still in flight.
 //!
+//! This is a raw QUIC lab carrier, not HTTP/3. It negotiates the private
+//! `shadowpipe-lab/1` ALPN; the regression below checks the actual completed
+//! handshake so the carrier cannot silently return to falsely advertising `h3`.
+//!
 //! ⚠️ The anti-DPI premise (UDP/QUIC traverses the RU TSPU better than TCP) is a
 //! wire property NOT exercised here — it needs a real host on the censored path.
 //! These tests cover correctness, not stealth.
 #![cfg(feature = "quic")]
 
 use shadowpipe_core::client_auth::ClientCredential;
-use shadowpipe_core::proto::{CamouflageMode, FrameFlags, PaddingProfile};
-use shadowpipe_core::quic::{quic_connect, QuicListener};
+use shadowpipe_core::proto::{CamouflageMode, CarrierBinding, FrameFlags, PaddingProfile};
+use shadowpipe_core::quic::{quic_connect, QuicListener, LAB_QUIC_ALPN};
 use shadowpipe_core::session::{AuthenticatedSession, ClientConfig, ServerState};
 use std::future::Future;
 use std::sync::Arc;
@@ -30,6 +34,44 @@ async fn within<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(15), future)
         .await
         .expect("QUIC loopback E2E exceeded its monotonic 15-second bound")
+}
+
+/// Wire-truth regression: both peers negotiate the private raw-carrier ALPN,
+/// and the lab carrier never claims the standard HTTP/3 `h3` protocol.
+#[tokio::test]
+async fn quic_lab_carrier_does_not_advertise_h3() {
+    within(async {
+        assert_eq!(LAB_QUIC_ALPN, b"shadowpipe-lab/1");
+        assert_ne!(LAB_QUIC_ALPN, b"h3");
+
+        let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let connecting = listener.accept().await.expect("incoming connection");
+            let mut stream = connecting.establish().await.expect("handshake + bi-stream");
+            assert_eq!(
+                stream.negotiated_alpn().as_deref(),
+                Some(LAB_QUIC_ALPN),
+                "server negotiated the private raw-carrier ALPN"
+            );
+            let mut materialize = [0u8; 1];
+            stream.read_exact(&mut materialize).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let mut stream = quic_connect(addr, "localhost").await.expect("quic connect");
+        assert_eq!(
+            stream.negotiated_alpn().as_deref(),
+            Some(LAB_QUIC_ALPN),
+            "client negotiated the private raw-carrier ALPN"
+        );
+        stream.write_all(&[0]).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        server.await.unwrap();
+    })
+    .await;
 }
 
 /// Raw bytes over a QUIC bi-stream, client-first (matching mandatory v3): the
@@ -91,11 +133,12 @@ async fn quic_carrier_carries_a_pq_session_end_to_end() {
         let server = tokio::spawn(async move {
             let connecting = listener.accept().await.expect("incoming connection");
             let mut stream = connecting.establish().await.expect("handshake + bi-stream");
-            let (mut session, _hello, _sid) = AuthenticatedSession::server_accept(
+            let (mut session, _hello, _sid) = AuthenticatedSession::server_accept_bound(
                 &mut stream,
                 &srv_state,
                 &srv_authorized,
                 CamouflageMode::Raw,
+                CarrierBinding::QuicRaw,
             )
             .await
             .unwrap();
@@ -118,9 +161,10 @@ async fn quic_carrier_carries_a_pq_session_end_to_end() {
             server_fingerprint: server_fp, // pin the inner ML-KEM key
             client_credential: credential,
         };
-        let (mut session, _sid) = AuthenticatedSession::client_connect(&mut stream, &cfg)
-            .await
-            .unwrap();
+        let (mut session, _sid) =
+            AuthenticatedSession::client_connect_bound(&mut stream, &cfg, CarrierBinding::QuicRaw)
+                .await
+                .unwrap();
         session
             .send(&mut stream, 0, FrameFlags::DATA, b"through quic + pq")
             .await
@@ -159,11 +203,12 @@ async fn quic_carrier_streams_sustained_bulk_traffic() {
         let server = tokio::spawn(async move {
             let connecting = listener.accept().await.expect("incoming connection");
             let mut stream = connecting.establish().await.expect("handshake + bi-stream");
-            let (mut session, _hello, _sid) = AuthenticatedSession::server_accept(
+            let (mut session, _hello, _sid) = AuthenticatedSession::server_accept_bound(
                 &mut stream,
                 &srv_state,
                 &srv_authorized,
                 CamouflageMode::Raw,
+                CarrierBinding::QuicRaw,
             )
             .await
             .unwrap();
@@ -185,9 +230,10 @@ async fn quic_carrier_streams_sustained_bulk_traffic() {
             server_fingerprint: server_fp,
             client_credential: credential,
         };
-        let (mut session, _sid) = AuthenticatedSession::client_connect(&mut stream, &cfg)
-            .await
-            .unwrap();
+        let (mut session, _sid) =
+            AuthenticatedSession::client_connect_bound(&mut stream, &cfg, CarrierBinding::QuicRaw)
+                .await
+                .unwrap();
 
         for i in 0..FRAMES {
             let payload = vec![(i & 0xff) as u8; FRAME_LEN];

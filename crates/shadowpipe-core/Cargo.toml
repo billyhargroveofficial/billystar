@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes = { workspace = true, optional = true }
 chacha20poly1305.workspace = true
 hkdf.workspace = true
 ml-kem.workspace = true
@@ -16,6 +17,8 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync", "rt-multi-thread", "macros"] }
 tun.workspace = true
 hex.workspace = true
+h2 = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -58,9 +61,12 @@ libc = "0.2"
 rand = "0.8"
 
 [features]
-default = ["tls-chrome"]
+default = ["tls-chrome", "http-stream"]
 test-util = []
 tls-chrome = ["dep:boring", "dep:boring-sys", "dep:tokio-boring", "dep:foreign-types", "dep:rcgen", "dep:brotli"]
+# Genuine HTTP/2 request/response streaming. The module is transport-generic;
+# the binaries currently place it inside the browser-TLS carrier.
+http-stream = ["dep:bytes", "dep:h2", "dep:http"]
 # Off-by-default QUIC carrier. rcgen (already optional for tls-chrome) supplies
 # the ephemeral self-signed server cert; quinn + rustls do the QUIC/TLS 1.3.
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]

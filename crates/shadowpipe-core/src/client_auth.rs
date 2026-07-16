@@ -11,7 +11,11 @@ use crate::session::{
     atomic_create_private_file, atomic_write_private_file, is_not_found,
     read_private_file_to_string_bounded, CreatePrivateFileOutcome, PrivateFileOwner,
 };
-use crate::{crypto::ct_eq, proto::CamouflageMode, BUILD_MAGIC, PROTO_VERSION};
+use crate::{
+    crypto::ct_eq,
+    proto::{CamouflageMode, CarrierBinding},
+    BUILD_MAGIC, PROTO_VERSION,
+};
 use anyhow::{anyhow, Context, Result};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -295,11 +299,13 @@ fn server_access_proof_message_with_magic(
     challenge: &[u8; SERVER_ACCESS_CHALLENGE_LEN],
     key_id: &ClientKeyId,
     camouflage: CamouflageMode,
+    carrier_binding: CarrierBinding,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(
         SERVER_ACCESS_PROOF_DOMAIN.len()
             + 1
             + 4
+            + 1
             + 1
             + CLIENT_KEY_ID_LEN
             + SERVER_ACCESS_CHALLENGE_LEN,
@@ -308,6 +314,7 @@ fn server_access_proof_message_with_magic(
     message.push(PROTO_VERSION);
     message.extend_from_slice(&build_magic.to_be_bytes());
     message.push(camouflage as u8);
+    message.push(carrier_binding as u8);
     message.extend_from_slice(key_id);
     message.extend_from_slice(challenge);
     message
@@ -317,8 +324,15 @@ fn server_access_proof_message(
     challenge: &[u8; SERVER_ACCESS_CHALLENGE_LEN],
     key_id: &ClientKeyId,
     camouflage: CamouflageMode,
+    carrier_binding: CarrierBinding,
 ) -> Vec<u8> {
-    server_access_proof_message_with_magic(BUILD_MAGIC, challenge, key_id, camouflage)
+    server_access_proof_message_with_magic(
+        BUILD_MAGIC,
+        challenge,
+        key_id,
+        camouflage,
+        carrier_binding,
+    )
 }
 
 fn client_access_proof_message_with_magic(
@@ -328,17 +342,18 @@ fn client_access_proof_message_with_magic(
     key_id: &ClientKeyId,
     client_nonce: &[u8; CLIENT_ACCESS_NONCE_LEN],
     camouflage: CamouflageMode,
+    carrier_binding: CarrierBinding,
 ) -> Vec<u8> {
     // Every component has a fixed width. Role-specific domains plus the
-    // protocol/build identity and inner-framing byte prevent cross-role,
-    // downgrade, cross-build and raw↔h2 framing replay. This is not a unique
-    // outer-transport binding: several transports terminate to raw. Binding the
-    // exact server tag turns
-    // this into mutual PSK possession rather than a chosen-challenge MAC oracle.
+    // protocol/build identity, inner framing and exact outer carrier prevent
+    // cross-role, downgrade, cross-build, raw↔h2 and cross-carrier replay.
+    // Binding the exact server tag turns this into mutual PSK possession rather
+    // than a chosen-challenge MAC oracle.
     let mut message = Vec::with_capacity(
         CLIENT_ACCESS_PROOF_DOMAIN.len()
             + 1
             + 4
+            + 1
             + 1
             + CLIENT_KEY_ID_LEN
             + SERVER_ACCESS_CHALLENGE_LEN
@@ -349,6 +364,7 @@ fn client_access_proof_message_with_magic(
     message.push(PROTO_VERSION);
     message.extend_from_slice(&build_magic.to_be_bytes());
     message.push(camouflage as u8);
+    message.push(carrier_binding as u8);
     message.extend_from_slice(key_id);
     message.extend_from_slice(challenge);
     message.extend_from_slice(server_mac);
@@ -362,6 +378,7 @@ fn client_access_proof_message(
     key_id: &ClientKeyId,
     client_nonce: &[u8; CLIENT_ACCESS_NONCE_LEN],
     camouflage: CamouflageMode,
+    carrier_binding: CarrierBinding,
 ) -> Vec<u8> {
     client_access_proof_message_with_magic(
         BUILD_MAGIC,
@@ -370,6 +387,7 @@ fn client_access_proof_message(
         key_id,
         client_nonce,
         camouflage,
+        carrier_binding,
     )
 }
 
@@ -585,9 +603,14 @@ impl ClientCredential {
         &self,
         server_proof: &ServerAccessProof,
         claimed_camouflage: CamouflageMode,
+        claimed_carrier: CarrierBinding,
     ) -> Result<ClientAccessProof> {
-        let server_message =
-            server_access_proof_message(&server_proof.challenge, &self.key_id, claimed_camouflage);
+        let server_message = server_access_proof_message(
+            &server_proof.challenge,
+            &self.key_id,
+            claimed_camouflage,
+            claimed_carrier,
+        );
         let key = hmac::Key::new(hmac::HMAC_SHA256, self.psk.as_ref());
         hmac::verify(&key, &server_message, &server_proof.psk_mac)
             .map_err(|_| anyhow::Error::from(AuthFailed))?;
@@ -605,6 +628,7 @@ impl ClientCredential {
             &self.key_id,
             &client_nonce,
             claimed_camouflage,
+            claimed_carrier,
         );
         Ok(ClientAccessProof {
             client_nonce,
@@ -864,6 +888,7 @@ impl PendingClientAccess {
         &self,
         server_proof: &ServerAccessProof,
         observed_camouflage: CamouflageMode,
+        observed_carrier: CarrierBinding,
         proof: &ClientAccessProof,
     ) -> std::result::Result<ClientKeyId, AuthFailed> {
         let message = client_access_proof_message(
@@ -872,6 +897,7 @@ impl PendingClientAccess {
             &self.key_id,
             &proof.client_nonce,
             observed_camouflage,
+            observed_carrier,
         );
         let key = hmac::Key::new(hmac::HMAC_SHA256, self.psk.as_ref());
         let mac_valid = hmac::verify(&key, &message, &proof.psk_mac).is_ok();
@@ -918,6 +944,7 @@ impl AuthorizedClients {
         key_id: ClientKeyId,
         challenge: &[u8; SERVER_ACCESS_CHALLENGE_LEN],
         observed_camouflage: CamouflageMode,
+        observed_carrier: CarrierBinding,
     ) -> Result<(ServerAccessProof, PendingClientAccess)> {
         // Always allocate a fresh secret dummy and scan the complete bounded
         // allowlist. This avoids the obvious known/unknown binary-search plus
@@ -934,7 +961,8 @@ impl AuthorizedClients {
             }
             authorized |= matches;
         }
-        let message = server_access_proof_message(challenge, &key_id, observed_camouflage);
+        let message =
+            server_access_proof_message(challenge, &key_id, observed_camouflage, observed_carrier);
         let server_proof = ServerAccessProof {
             challenge: *challenge,
             psk_mac: hmac_sha256(&psk, &message),
@@ -1352,15 +1380,16 @@ mod tests {
             &challenge,
             &key_id,
             CamouflageMode::H2Chunk,
+            CarrierBinding::DirectTcp,
         );
         assert_eq!(
             hex::encode(&server_message),
-            "736861646f77706970652d76332f7365727665722d6163636573732d70726f6f6600030102030401000102030405060708090a0b0c0d0e0f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+            "736861646f77706970652d76332f7365727665722d6163636573732d70726f6f660003010203040100000102030405060708090a0b0c0d0e0f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
         );
         let server_mac = hmac_sha256(&psk, &server_message);
         assert_eq!(
             hex::encode(server_mac),
-            "7be4628e91caad7b2c30d03a689da81218230129a3018eda91ce7db66b204f63"
+            "0ad1172ae902cdb298bebcf81845c52e029462dfed724cae9dfe5f45e3c6ea5c"
         );
 
         let client_message = client_access_proof_message_with_magic(
@@ -1370,14 +1399,15 @@ mod tests {
             &key_id,
             &client_nonce,
             CamouflageMode::H2Chunk,
+            CarrierBinding::DirectTcp,
         );
         assert_eq!(
             hex::encode(&client_message),
-            "736861646f77706970652d76332f636c69656e742d6163636573732d70726f6f6600030102030401000102030405060708090a0b0c0d0e0f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f7be4628e91caad7b2c30d03a689da81218230129a3018eda91ce7db66b204f63404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+            "736861646f77706970652d76332f636c69656e742d6163636573732d70726f6f660003010203040100000102030405060708090a0b0c0d0e0f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f0ad1172ae902cdb298bebcf81845c52e029462dfed724cae9dfe5f45e3c6ea5c404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
         );
         assert_eq!(
             hex::encode(hmac_sha256(&psk, &client_message)),
-            "77a2cfbc5798f50e0ff4b064d542a81f17b41947c9bff7c8ee513c206aeb5886"
+            "227dd695fd3a5d233b7efb959eb94ea9293fa22c24b1fb51e997ae5736c205cc"
         );
     }
 
@@ -1391,16 +1421,36 @@ mod tests {
         let challenge = [0x5A; SERVER_ACCESS_CHALLENGE_LEN];
 
         let (known_one, known_pending) = allowlist
-            .begin_access(second.key_id(), &challenge, CamouflageMode::H2Chunk)
+            .begin_access(
+                second.key_id(),
+                &challenge,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
         let (known_two, _) = allowlist
-            .begin_access(second.key_id(), &challenge, CamouflageMode::H2Chunk)
+            .begin_access(
+                second.key_id(),
+                &challenge,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
         let (unknown_one, unknown_pending) = allowlist
-            .begin_access(unknown.key_id(), &challenge, CamouflageMode::H2Chunk)
+            .begin_access(
+                unknown.key_id(),
+                &challenge,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
         let (unknown_two, _) = allowlist
-            .begin_access(unknown.key_id(), &challenge, CamouflageMode::H2Chunk)
+            .begin_access(
+                unknown.key_id(),
+                &challenge,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
 
         assert_eq!(known_one.encode().len(), SERVER_ACCESS_PROOF_LEN);
@@ -1412,19 +1462,37 @@ mod tests {
         );
 
         let known_client_proof = second
-            .verify_server_access_and_prove(&known_one, CamouflageMode::H2Chunk)
+            .verify_server_access_and_prove(
+                &known_one,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
         assert_eq!(
             known_pending
-                .verify(&known_one, CamouflageMode::H2Chunk, &known_client_proof)
+                .verify(
+                    &known_one,
+                    CamouflageMode::H2Chunk,
+                    CarrierBinding::DirectTcp,
+                    &known_client_proof,
+                )
                 .unwrap(),
             second.key_id()
         );
         assert!(unknown
-            .verify_server_access_and_prove(&unknown_one, CamouflageMode::H2Chunk)
+            .verify_server_access_and_prove(
+                &unknown_one,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .is_err());
         assert_eq!(
-            unknown_pending.verify(&unknown_one, CamouflageMode::H2Chunk, &known_client_proof,),
+            unknown_pending.verify(
+                &unknown_one,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+                &known_client_proof,
+            ),
             Err(AuthFailed)
         );
     }
@@ -1435,7 +1503,12 @@ mod tests {
         let allowlist = credential.authorized_clients().unwrap();
         let challenge = [0x41; SERVER_ACCESS_CHALLENGE_LEN];
         let (server_proof, pending) = allowlist
-            .begin_access(credential.key_id(), &challenge, CamouflageMode::H2Chunk)
+            .begin_access(
+                credential.key_id(),
+                &challenge,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
         let encoded_server = server_proof.encode();
         assert_eq!(encoded_server.len(), SERVER_ACCESS_PROOF_LEN);
@@ -1449,7 +1522,11 @@ mod tests {
         );
 
         let proof = credential
-            .verify_server_access_and_prove(&server_proof, CamouflageMode::H2Chunk)
+            .verify_server_access_and_prove(
+                &server_proof,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
         let encoded_client = proof.encode();
         assert_eq!(encoded_client.len(), CLIENT_ACCESS_PROOF_LEN);
@@ -1460,7 +1537,12 @@ mod tests {
         );
         assert_eq!(
             pending
-                .verify(&server_proof, CamouflageMode::H2Chunk, &proof)
+                .verify(
+                    &server_proof,
+                    CamouflageMode::H2Chunk,
+                    CarrierBinding::DirectTcp,
+                    &proof,
+                )
                 .unwrap(),
             credential.key_id()
         );
@@ -1472,20 +1554,35 @@ mod tests {
                 credential.key_id(),
                 &fresh_challenge,
                 CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
             )
             .unwrap();
         assert_eq!(
-            fresh_pending.verify(&fresh_server_proof, CamouflageMode::H2Chunk, &proof,),
+            fresh_pending.verify(
+                &fresh_server_proof,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+                &proof,
+            ),
             Err(AuthFailed),
             "a captured access proof must not replay against a fresh challenge"
         );
 
         assert!(matches!(
-            credential.verify_server_access_and_prove(&server_proof, CamouflageMode::Raw),
+            credential.verify_server_access_and_prove(
+                &server_proof,
+                CamouflageMode::Raw,
+                CarrierBinding::DirectTcp,
+            ),
             Err(error) if error.downcast_ref::<AuthFailed>().is_some()
         ));
         assert_eq!(
-            pending.verify(&server_proof, CamouflageMode::Raw, &proof),
+            pending.verify(
+                &server_proof,
+                CamouflageMode::Raw,
+                CarrierBinding::DirectTcp,
+                &proof,
+            ),
             Err(AuthFailed),
             "the claimed and observed carriers must agree before static-key disclosure"
         );
@@ -1494,7 +1591,11 @@ mod tests {
         tampered_server_proof.psk_mac[0] ^= 1;
         assert!(matches!(
             credential
-                .verify_server_access_and_prove(&tampered_server_proof, CamouflageMode::H2Chunk),
+                .verify_server_access_and_prove(
+                    &tampered_server_proof,
+                    CamouflageMode::H2Chunk,
+                    CarrierBinding::DirectTcp,
+                ),
             Err(error) if error.downcast_ref::<AuthFailed>().is_some()
         ));
 
@@ -1503,32 +1604,72 @@ mod tests {
         // unknown client cannot validate it and emits no client proof.
         let stranger = ClientCredential::generate().unwrap();
         let (dummy_server_proof, dummy_pending) = allowlist
-            .begin_access(stranger.key_id(), &challenge, CamouflageMode::H2Chunk)
+            .begin_access(
+                stranger.key_id(),
+                &challenge,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+            )
             .unwrap();
         assert_eq!(dummy_server_proof.encode().len(), SERVER_ACCESS_PROOF_LEN);
         assert!(matches!(
             stranger.verify_server_access_and_prove(
                 &dummy_server_proof,
-                CamouflageMode::H2Chunk
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
             ),
             Err(error) if error.downcast_ref::<AuthFailed>().is_some()
         ));
         assert_eq!(
-            dummy_pending.verify(&dummy_server_proof, CamouflageMode::H2Chunk, &proof),
+            dummy_pending.verify(
+                &dummy_server_proof,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+                &proof,
+            ),
             Err(AuthFailed),
         );
 
         let mut tampered_nonce = proof;
         tampered_nonce.client_nonce[0] ^= 1;
         assert_eq!(
-            pending.verify(&server_proof, CamouflageMode::H2Chunk, &tampered_nonce),
+            pending.verify(
+                &server_proof,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+                &tampered_nonce,
+            ),
             Err(AuthFailed)
         );
         let mut tampered_mac = proof;
         tampered_mac.psk_mac[0] ^= 1;
         assert_eq!(
-            pending.verify(&server_proof, CamouflageMode::H2Chunk, &tampered_mac),
+            pending.verify(
+                &server_proof,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::DirectTcp,
+                &tampered_mac,
+            ),
             Err(AuthFailed)
+        );
+
+        assert!(matches!(
+            credential.verify_server_access_and_prove(
+                &server_proof,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::RealityTcp,
+            ),
+            Err(error) if error.downcast_ref::<AuthFailed>().is_some()
+        ));
+        assert_eq!(
+            pending.verify(
+                &server_proof,
+                CamouflageMode::H2Chunk,
+                CarrierBinding::RealityTcp,
+                &proof,
+            ),
+            Err(AuthFailed),
+            "a captured access flight must not cross outer carriers"
         );
     }
 

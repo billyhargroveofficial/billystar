@@ -9,7 +9,7 @@
 //!     receives the cover's bytes (the anti-probe property), with no tell.
 
 use shadowpipe_core::client_auth::ClientCredential;
-use shadowpipe_core::proto::{CamouflageMode, FrameFlags, PaddingProfile};
+use shadowpipe_core::proto::{CamouflageMode, CarrierBinding, FrameFlags, PaddingProfile};
 use shadowpipe_core::reality::{
     build_authed_client_hello, default_grease, generate_static_secret, reality_accept,
     reality_connect, unix_now, PublicKey, RealityServerConfig, ReplayCache,
@@ -54,11 +54,12 @@ async fn reality_carrier_carries_a_pq_session_end_to_end() {
             .await
             .unwrap()
             .expect("client should authenticate");
-        let (mut session, _hello, _sid) = AuthenticatedSession::server_accept(
+        let (mut session, _hello, _sid) = AuthenticatedSession::server_accept_bound(
             &mut stream,
             &srv_state,
             &srv_authorized,
             CamouflageMode::Raw,
+            CarrierBinding::RealityTcp,
         )
         .await
         .unwrap();
@@ -81,9 +82,10 @@ async fn reality_carrier_carries_a_pq_session_end_to_end() {
         server_fingerprint: server_fp, // pin the inner ML-KEM key too
         client_credential: credential,
     };
-    let (mut session, _sid) = AuthenticatedSession::client_connect(&mut stream, &cfg)
-        .await
-        .unwrap();
+    let (mut session, _sid) =
+        AuthenticatedSession::client_connect_bound(&mut stream, &cfg, CarrierBinding::RealityTcp)
+            .await
+            .unwrap();
 
     session
         .send(&mut stream, 0, FrameFlags::DATA, b"through reality + pq")

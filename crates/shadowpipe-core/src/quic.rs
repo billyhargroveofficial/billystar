@@ -1,4 +1,4 @@
-//! QUIC carrier (Hysteria2-class) — off-by-default `quic` cargo feature.
+//! Raw QUIC laboratory carrier — off-by-default `quic` cargo feature.
 //!
 //! A UDP/QUIC transport that carries the post-quantum [`AuthenticatedSession`] + tunnel
 //! inside a single bidirectional stream, exactly as `--tls`/`--reality` carry it
@@ -12,16 +12,19 @@
 //! skipped** (a custom accept-any certificate verifier on the client, an
 //! ephemeral self-signed cert on the server) — exactly like the `--tls`
 //! carrier. The real peer authentication is the inner ML-KEM `--server-fp` pin
-//! inside the [`AuthenticatedSession`], not the QUIC cert. ALPN is `h3` on both sides
-//! so the handshake blends with ordinary HTTP/3 rather than carrying a custom
-//! tell.
+//! inside the [`AuthenticatedSession`], not the QUIC cert. This carrier is not
+//! HTTP/3: it negotiates a private lab ALPN and carries raw Shadowpipe bytes in
+//! one QUIC bidirectional stream. Advertising `h3` here would be a wire-level
+//! protocol lie because there are no HTTP/3 control streams, SETTINGS, QPACK or
+//! request semantics. A future production HTTP/3 carrier must implement those
+//! semantics before it may advertise the standard `h3` ALPN.
 //!
 //! ⚠️ **Anti-DPI premise is NOT validated here.** The reason a QUIC carrier is
 //! interesting in RU is that UDP/QUIC has historically traversed the TSPU
 //! better than TCP-class TLS — but that is a *wire/DPI* property that can only
 //! be confirmed on a real host on the censored path. These are loopback-correct
-//! primitives; the on-the-wire stealth claim is unproven on the build machine
-//! (same posture as the kill-switch).
+//! primitives; the private ALPN is an explicit lab fingerprint and there is no
+//! on-the-wire stealth claim (same posture as the kill-switch).
 //!
 //! [`AuthenticatedSession`]: crate::session::AuthenticatedSession
 
@@ -43,10 +46,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// ALPN advertised on both ends. `h3` blends with legitimate HTTP/3 — a custom
-/// token would itself be a trivial DPI fingerprint. Both sides MUST match or the
+/// Stable private ALPN advertised by both ends of the raw lab carrier.
+///
+/// This deliberately does not impersonate HTTP/3. Both sides MUST match or the
 /// QUIC TLS handshake aborts with a no-application-protocol alert.
-const ALPN_H3: &[u8] = b"h3";
+pub const LAB_QUIC_ALPN: &[u8] = b"shadowpipe-lab/1";
 /// Drop a silent connection after this long; keep-alive is set well below it.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(10);
@@ -69,6 +73,19 @@ pub struct QuicStream {
 }
 
 impl QuicStream {
+    /// The application protocol negotiated by the completed QUIC TLS handshake.
+    ///
+    /// Exposed so runtime evidence and regression tests can verify that the raw
+    /// laboratory carrier truthfully negotiates [`LAB_QUIC_ALPN`] rather than
+    /// claiming the standard `h3` protocol it does not implement.
+    pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        let data = self._conn.handshake_data()?;
+        data.downcast::<quinn::crypto::rustls::HandshakeData>()
+            .ok()?
+            .protocol
+            .clone()
+    }
+
     /// A cloneable live path-feedback handle for the degradation pacer. quinn's
     /// `Connection` is itself a cheap `Clone` (an `Arc` inside), so this stays
     /// valid for the whole session even after the stream is consumed by
@@ -215,7 +232,7 @@ pub async fn quic_connect(addr: SocketAddr, server_name: &str) -> Result<QuicStr
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
-    crypto.alpn_protocols = vec![ALPN_H3.to_vec()];
+    crypto.alpn_protocols = vec![LAB_QUIC_ALPN.to_vec()];
 
     let quic_crypto = QuicClientConfig::try_from(crypto).context("build quic client crypto")?;
     let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
@@ -262,7 +279,7 @@ fn server_crypto() -> Result<rustls::ServerConfig> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
         .context("rustls server single cert")?;
-    crypto.alpn_protocols = vec![ALPN_H3.to_vec()];
+    crypto.alpn_protocols = vec![LAB_QUIC_ALPN.to_vec()];
     Ok(crypto)
 }
 

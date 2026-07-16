@@ -40,7 +40,7 @@ use shadowpipe_core::network_events::{NetworkChangeAccumulator, NetworkChangeSet
 use shadowpipe_core::platform::{Ipv6Mode, NetworkChangeKind};
 use shadowpipe_core::policy_state::{PolicyExpiryCheckpoint, PolicyStateStore};
 use shadowpipe_core::profile::{profile_from_env, TunnelProfile};
-use shadowpipe_core::proto::{CamouflageMode, FrameFlags, PaddingProfile};
+use shadowpipe_core::proto::{CamouflageMode, CarrierBinding, FrameFlags, PaddingProfile};
 use shadowpipe_core::reality::RealityUri;
 use shadowpipe_core::routes::{
     current_linux_network_namespace_identity, LinuxOwnedRouteSpec, LinuxRouteOwner,
@@ -415,6 +415,7 @@ struct Args {
             "loadtest",
             "reality",
             "tls",
+            "http_stream",
             "quic",
             "uri",
             "uri_file",
@@ -454,19 +455,35 @@ struct Args {
     /// Wrap the transport in a real Chrome-JA4 TLS layer (boring-front). On the
     /// wire it looks like HTTPS; shadowpipe runs inside with raw framing, so
     /// --camouflage is ignored. The server must run with --tls too.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "http_stream")]
     tls: bool,
 
-    /// SNI for the TLS ClientHello when --tls is set. Prefer a plausible domain
-    /// that resolves to this server (with a real cert) to avoid an SNI/IP tell.
+    /// SNI for the TLS ClientHello when --tls or --http-stream is set.
     #[arg(long, default_value = "example.com")]
     sni: String,
+
+    /// Clean-room XHTTP-class carrier: a genuine HTTP/2 POST upload body plus
+    /// concurrent HTTP/2 response body inside browser TLS. This is not Xray's
+    /// wire grammar. Current daemon eligibility remains explicit no-TUN lab
+    /// until real-origin certificate, replay-safe admission and cover parity
+    /// gates are complete. Requires `--features http-stream`.
+    #[arg(
+        long,
+        conflicts_with_all = ["tls", "reality", "quic", "uri", "uri_file"]
+    )]
+    http_stream: bool,
+
+    /// Opaque absolute path for --http-stream. Must be at least 24 visible
+    /// ASCII bytes and is treated as lab admission material; do not reuse a
+    /// public/default path.
+    #[arg(long, value_name = "PATH", requires = "http_stream")]
+    http_path: Option<String>,
 
     /// Use the REALITY carrier (from-scratch TLS 1.3 + REALITY) instead of
     /// --tls/--camouflage: the wire is a genuine TLS 1.3 handshake to --sni, and
     /// the server transparently forwards any unauthenticated peer to a cover
     /// site. Requires --reality-pubkey. Mutually exclusive with --tls.
-    #[arg(long, conflicts_with = "tls")]
+    #[arg(long, conflicts_with_all = ["tls", "http_stream"])]
     reality: bool,
 
     /// Server's REALITY X25519 static PUBLIC key (64 hex), from the server's
@@ -491,6 +508,7 @@ struct Args {
             "uri_file",
             "policy_bundle",
             "tls",
+            "http_stream",
             "quic",
             "reality",
             "server",
@@ -516,6 +534,7 @@ struct Args {
             "uri",
             "policy_bundle",
             "tls",
+            "http_stream",
             "quic",
             "reality",
             "server",
@@ -532,7 +551,10 @@ struct Args {
     /// trusted (auth is the inner --server-fp pin); SNI reuses --sni. Single
     /// endpoint (--server), like --tls. Requires a build with `--features quic`.
     /// Hysteria2-class: UDP often traverses TCP-tuned DPI better (premise unvalidated).
-    #[arg(long, conflicts_with_all = ["tls", "reality", "uri", "uri_file"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["tls", "http_stream", "reality", "uri", "uri_file"]
+    )]
     quic: bool,
 
     /// Fail-closed kill-switch: while the tunnel is up, drop all egress except the
@@ -607,6 +629,8 @@ struct MeasurementOutput {
 fn measurement_transport(args: &Args, camouflage: CamouflageMode) -> TransportKind {
     if args.quic {
         TransportKind::Quic
+    } else if args.http_stream {
+        TransportKind::Http2
     } else if args.reality {
         TransportKind::Reality
     } else if args.tls {
@@ -646,15 +670,25 @@ fn measurement_output(
     if args.quic {
         anyhow::bail!("--quic measurement requires a build with `--features quic`");
     }
+    #[cfg(not(feature = "http-stream"))]
+    if args.http_stream {
+        anyhow::bail!("--http-stream measurement requires a build with `--features http-stream`");
+    }
     #[cfg(not(feature = "tls-chrome"))]
-    if args.tls {
-        anyhow::bail!("--tls measurement requires a build with `--features tls-chrome`");
+    if args.tls || args.http_stream {
+        anyhow::bail!(
+            "--tls/--http-stream measurement requires a build with `--features tls-chrome`"
+        );
     }
     if args.reality {
         // Syntax/configuration faults are preflight errors, not network
         // observations. Validate them before reserving output or opening TCP.
         reality_server_pub(args).context("preflight --reality-pubkey")?;
         parse_short_id(&args.reality_short_id).context("preflight --reality-short-id")?;
+    }
+    #[cfg(feature = "http-stream")]
+    if args.http_stream {
+        http_stream_route(args).context("preflight --http-stream route")?;
     }
     let scope: EvidenceScope = args
         .measurement_scope
@@ -1645,10 +1679,15 @@ fn validate_policy_authority(args: &Args) -> Result<()> {
         if !args.tunnel || !args.auto_route {
             anyhow::bail!("--policy-bundle requires fail-closed --tunnel --auto-route");
         }
-        if args.tls || args.quic || args.reality || !args.uri.is_empty() || args.uri_file.is_some()
+        if args.tls
+            || args.http_stream
+            || args.quic
+            || args.reality
+            || !args.uri.is_empty()
+            || args.uri_file.is_some()
         {
             anyhow::bail!(
-                "--policy-bundle is an exclusive REALITY/TCP authority; do not mix --tls/--quic/--reality/--uri/--uri-file"
+                "--policy-bundle is an exclusive REALITY/TCP authority; do not mix --tls/--http-stream/--quic/--reality/--uri/--uri-file"
             );
         }
         if args.server_fp.is_some()
@@ -1787,6 +1826,7 @@ fn validate_release_lockdown_mode(args: &Args) -> Result<()> {
                 && args.loadtest == 0
                 && !args.reality
                 && !args.tls
+                && !args.http_stream
                 && !args.quic
                 && args.uri.is_empty()
                 && args.uri_file.is_none()
@@ -1816,6 +1856,7 @@ fn validate_restore_lockdown_mode(args: &Args) -> Result<()> {
                 && args.loadtest == 0
                 && !args.reality
                 && !args.tls
+                && !args.http_stream
                 && !args.quic
                 && args.uri.is_empty()
                 && args.uri_file.is_none()
@@ -1848,11 +1889,21 @@ fn validate_runtime_safety(args: &Args) -> Result<()> {
     if args.quic {
         anyhow::bail!("--quic requires a build with `--features quic` (quinn not compiled in)");
     }
-    #[cfg(not(feature = "tls-chrome"))]
-    if args.tls {
+    #[cfg(not(feature = "http-stream"))]
+    if args.http_stream {
         anyhow::bail!(
-            "--tls requires a build with `--features tls-chrome` (BoringSSL not compiled in)"
+            "--http-stream requires a build with `--features http-stream` (h2 not compiled in)"
         );
+    }
+    #[cfg(not(feature = "tls-chrome"))]
+    if args.tls || args.http_stream {
+        anyhow::bail!(
+            "--tls/--http-stream require a build with `--features tls-chrome` (BoringSSL not compiled in)"
+        );
+    }
+    #[cfg(feature = "http-stream")]
+    if args.http_stream {
+        http_stream_route(args).context("validate --http-stream authority/path")?;
     }
     validate_policy_authority(args)?;
     if args.policy_bundle.is_none() {
@@ -1907,6 +1958,15 @@ fn parse_camouflage(s: &str) -> Result<CamouflageMode> {
         ),
         other => Err(anyhow::anyhow!("unknown camouflage {other}")),
     }
+}
+
+#[cfg(feature = "http-stream")]
+fn http_stream_route(args: &Args) -> Result<shadowpipe_core::http_stream::HttpStreamRoute> {
+    let path = args
+        .http_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--http-stream requires --http-path"))?;
+    shadowpipe_core::http_stream::HttpStreamRoute::new(&args.sni, path)
 }
 
 /// Strict client-side URI parser. Server-side research helpers retain a more
@@ -2311,7 +2371,7 @@ async fn main() -> Result<()> {
                 server_fingerprint: server_fp,
                 client_credential: Arc::clone(&client_credential),
             };
-            return run_session(stream, &config, &args).await;
+            return run_session(stream, &config, CarrierBinding::QuicRaw, &args).await;
         }
         #[cfg(not(feature = "quic"))]
         anyhow::bail!("--quic requires a build with `--features quic` (quinn not compiled in)");
@@ -2338,7 +2398,34 @@ async fn main() -> Result<()> {
             server_fingerprint: server_fp,
             client_credential: Arc::clone(&client_credential),
         };
-        run_session(stream, &config, &args).await
+        run_session(stream, &config, CarrierBinding::RealityTcp, &args).await
+    } else if args.http_stream {
+        #[cfg(feature = "http-stream")]
+        {
+            info!(server = %args.server, sni = %args.sni, "connected (genuine HTTP/2 over tls-chrome)");
+            let tls = bounded_stage(
+                "TLS outer handshake",
+                deadlines.outer_handshake,
+                shadowpipe_core::tls::chrome_connect(tcp, &args.sni),
+            )
+            .await?;
+            let route = http_stream_route(&args)?;
+            let stream = bounded_stage(
+                "HTTP/2 stream establishment",
+                deadlines.outer_handshake,
+                shadowpipe_core::http_stream::client_connect(tls, &route),
+            )
+            .await?;
+            let config = ClientConfig {
+                camouflage: CamouflageMode::Raw,
+                padding_profile: PaddingProfile::Balanced,
+                server_fingerprint: server_fp,
+                client_credential: Arc::clone(&client_credential),
+            };
+            run_session(stream, &config, CarrierBinding::Http2Tls, &args).await
+        }
+        #[cfg(not(feature = "http-stream"))]
+        unreachable!("--http-stream rejected before socket startup");
     } else if args.tls {
         #[cfg(feature = "tls-chrome")]
         {
@@ -2355,7 +2442,7 @@ async fn main() -> Result<()> {
                 server_fingerprint: server_fp,
                 client_credential: Arc::clone(&client_credential),
             };
-            run_session(stream, &config, &args).await
+            run_session(stream, &config, CarrierBinding::BrowserTlsTcp, &args).await
         }
         #[cfg(not(feature = "tls-chrome"))]
         anyhow::bail!(
@@ -2375,7 +2462,7 @@ async fn main() -> Result<()> {
             server_fingerprint: server_fp,
             client_credential,
         };
-        run_session(stream, &config, &args).await
+        run_session(stream, &config, CarrierBinding::DirectTcp, &args).await
     }
 }
 
@@ -2414,6 +2501,7 @@ async fn run_measured_loadtest(
                     shadowpipe_core::quic::quic_connect(addr, &args.sni).await
                 },
                 &config,
+                CarrierBinding::QuicRaw,
                 args.loadtest,
                 measurement,
                 LOADTEST_MEASUREMENT_DIAL_TIMEOUT,
@@ -2440,11 +2528,40 @@ async fn run_measured_loadtest(
                     .await
             },
             &config,
+            CarrierBinding::RealityTcp,
             args.loadtest,
             measurement,
             LOADTEST_MEASUREMENT_DIAL_TIMEOUT,
         )
         .await;
+    }
+
+    if args.http_stream {
+        #[cfg(feature = "http-stream")]
+        {
+            let config = ClientConfig {
+                camouflage: CamouflageMode::Raw,
+                padding_profile: PaddingProfile::Balanced,
+                server_fingerprint: server_fp,
+                client_credential: Arc::clone(&client_credential),
+            };
+            let route = http_stream_route(args)?;
+            return establish_and_run_measured(
+                async {
+                    let tcp = TcpStream::connect(&args.server).await?;
+                    let tls = shadowpipe_core::tls::chrome_connect(tcp, &args.sni).await?;
+                    shadowpipe_core::http_stream::client_connect(tls, &route).await
+                },
+                &config,
+                CarrierBinding::Http2Tls,
+                args.loadtest,
+                measurement,
+                LOADTEST_MEASUREMENT_DIAL_TIMEOUT,
+            )
+            .await;
+        }
+        #[cfg(not(feature = "http-stream"))]
+        unreachable!("measurement preflight rejects HTTP stream when the feature is absent");
     }
 
     if args.tls {
@@ -2462,6 +2579,7 @@ async fn run_measured_loadtest(
                     shadowpipe_core::tls::chrome_connect(tcp, &args.sni).await
                 },
                 &config,
+                CarrierBinding::BrowserTlsTcp,
                 args.loadtest,
                 measurement,
                 LOADTEST_MEASUREMENT_DIAL_TIMEOUT,
@@ -2484,6 +2602,7 @@ async fn run_measured_loadtest(
             client_connect(tcp, camouflage).await
         },
         &config,
+        CarrierBinding::DirectTcp,
         args.loadtest,
         measurement,
         LOADTEST_MEASUREMENT_DIAL_TIMEOUT,
@@ -2494,6 +2613,7 @@ async fn run_measured_loadtest(
 async fn establish_and_run_measured<S, F>(
     connect_outer: F,
     config: &ClientConfig,
+    carrier_binding: CarrierBinding,
     mb: u64,
     mut measurement: LoadtestMeasurement,
     dial_timeout: Duration,
@@ -2507,9 +2627,10 @@ where
         let mut stream = connect_outer
             .await
             .map_err(|error| (EstablishmentStage::OuterCarrier, error))?;
-        let (session, session_id) = AuthenticatedSession::client_connect(&mut stream, config)
-            .await
-            .map_err(|error| (EstablishmentStage::InnerAuthentication, error))?;
+        let (session, session_id) =
+            AuthenticatedSession::client_connect_bound(&mut stream, config, carrier_binding)
+                .await
+                .map_err(|error| (EstablishmentStage::InnerAuthentication, error))?;
         Ok::<_, (EstablishmentStage, anyhow::Error)>((stream, session, session_id))
     })
     .await;
@@ -2613,7 +2734,12 @@ fn establishment_failure_outcomes(
 /// inner-handshake deadline used by tunnel mode, then dispatch only the
 /// established typed session to loadtest or echo/stdin. Interactive lifetime is
 /// intentionally unbounded; unauthenticated establishment is not.
-async fn run_session<S>(mut stream: S, config: &ClientConfig, args: &Args) -> Result<()>
+async fn run_session<S>(
+    mut stream: S,
+    config: &ClientConfig,
+    carrier_binding: CarrierBinding,
+    args: &Args,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -2623,7 +2749,7 @@ where
     let (session, session_id) = bounded_stage(
         "inner authenticated handshake",
         deadlines.inner_handshake,
-        AuthenticatedSession::client_connect(&mut stream, config),
+        AuthenticatedSession::client_connect_bound(&mut stream, config, carrier_binding),
     )
     .await?;
     let handshake_duration = handshake_start.elapsed();
@@ -6428,6 +6554,21 @@ async fn run_tunnel_mode(
                         server_fp,
                         &client_credential,
                     ).await
+                } else if args.http_stream {
+                    #[cfg(feature = "http-stream")]
+                    {
+                        run_http_stream_session(
+                            args,
+                            carrier_endpoints[endpoint_idx].address,
+                            &args.sni,
+                            &profile,
+                            &tun,
+                            server_fp,
+                            &client_credential,
+                        ).await
+                    }
+                    #[cfg(not(feature = "http-stream"))]
+                    unreachable!("--http-stream rejected before retry loop")
                 } else if args.tls {
                     #[cfg(feature = "tls-chrome")]
                     {
@@ -6701,7 +6842,11 @@ async fn run_tls_session(
     let (session, session_id) = bounded_stage(
         "inner post-quantum authentication",
         deadlines.inner_handshake,
-        AuthenticatedSession::client_connect(&mut tls, &config),
+        AuthenticatedSession::client_connect_bound(
+            &mut tls,
+            &config,
+            CarrierBinding::BrowserTlsTcp,
+        ),
     )
     .await?;
     info!(
@@ -6718,6 +6863,67 @@ async fn run_tls_session(
         args.mtu,
         guard,
         pacer,
+        None,
+        Some(deadlines.liveness),
+    )
+    .await
+}
+
+/// Genuine HTTP/2 request/response streaming inside the browser-TLS carrier.
+#[cfg(feature = "http-stream")]
+async fn run_http_stream_session(
+    args: &Args,
+    server_addr: SocketAddrV4,
+    sni: &str,
+    profile: &TunnelProfile,
+    tun: &SharedTun,
+    server_fp: [u8; 32],
+    client_credential: &Arc<ClientCredential>,
+) -> Result<()> {
+    let deadlines = RuntimeDeadlines::from_args(args).expect("runtime deadlines validated");
+    let tcp = bounded_stage(
+        "TCP connect",
+        deadlines.connect,
+        TcpStream::connect(server_addr),
+    )
+    .await?;
+    let tls = bounded_stage(
+        "outer browser-TLS handshake",
+        deadlines.outer_handshake,
+        shadowpipe_core::tls::chrome_connect(tcp, sni),
+    )
+    .await?;
+    let route = http_stream_route(args)?;
+    let mut stream = bounded_stage(
+        "genuine HTTP/2 stream establishment",
+        deadlines.outer_handshake,
+        shadowpipe_core::http_stream::client_connect(tls, &route),
+    )
+    .await?;
+    let config = ClientConfig {
+        camouflage: CamouflageMode::Raw,
+        padding_profile: PaddingProfile::Balanced,
+        server_fingerprint: server_fp,
+        client_credential: Arc::clone(client_credential),
+    };
+    let (session, session_id) = bounded_stage(
+        "inner post-quantum authentication",
+        deadlines.inner_handshake,
+        AuthenticatedSession::client_connect_bound(&mut stream, &config, CarrierBinding::Http2Tls),
+    )
+    .await?;
+    info!(
+        session_id = hex::encode(session_id),
+        "handshake ok (genuine HTTP/2 stream)"
+    );
+    run_tunnel_guarded_with_liveness(
+        tun.clone(),
+        stream,
+        session,
+        profile.mux.clone(),
+        args.mtu,
+        volume_guard_from_config(profile.volume_guard),
+        Arc::new(pacer_from_config(profile.pacer)),
         None,
         Some(deadlines.liveness),
     )
@@ -6760,7 +6966,12 @@ async fn run_reality_session(
     let (session, session_id) = bounded_stage(
         "inner pinned post-quantum authentication",
         deadlines.inner_handshake,
-        AuthenticatedSession::client_connect_pins(&mut stream, &config, &endpoint.server_pins),
+        AuthenticatedSession::client_connect_pins_bound(
+            &mut stream,
+            &config,
+            &endpoint.server_pins,
+            CarrierBinding::RealityTcp,
+        ),
     )
     .await?;
     info!(
@@ -6815,7 +7026,7 @@ async fn run_quic_session(
     let (session, session_id) = bounded_stage(
         "inner post-quantum authentication",
         deadlines.inner_handshake,
-        AuthenticatedSession::client_connect(&mut stream, &config),
+        AuthenticatedSession::client_connect_bound(&mut stream, &config, CarrierBinding::QuicRaw),
     )
     .await?;
     info!(session_id = hex::encode(session_id), "handshake ok (quic)");
@@ -7612,7 +7823,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            run_session(client_io, &config, &args),
+            run_session(client_io, &config, CarrierBinding::DirectTcp, &args),
         )
         .await
         .expect("ordinary echo path exceeded its inner-handshake bound")
@@ -8121,7 +8332,11 @@ mod tests {
 
     #[test]
     fn unavailable_carriers_fail_preflight_before_runtime_state() {
-        #[cfg(any(not(feature = "quic"), not(feature = "tls-chrome")))]
+        #[cfg(any(
+            not(feature = "quic"),
+            not(feature = "tls-chrome"),
+            not(feature = "http-stream")
+        ))]
         let fp = "11".repeat(32);
         #[cfg(not(feature = "quic"))]
         {
@@ -8136,6 +8351,20 @@ mod tests {
                 Args::try_parse_from(["shadowpipe-client", "--server-fp", &fp, "--tls"]).unwrap();
             let error = validate_runtime_safety(&args).unwrap_err().to_string();
             assert!(error.contains("--features tls-chrome"));
+        }
+        #[cfg(not(feature = "http-stream"))]
+        {
+            let args = Args::try_parse_from([
+                "shadowpipe-client",
+                "--server-fp",
+                &fp,
+                "--http-stream",
+                "--http-path",
+                "/api/events/0123456789abcdef0123456789abcdef",
+            ])
+            .unwrap();
+            let error = validate_runtime_safety(&args).unwrap_err().to_string();
+            assert!(error.contains("--features http-stream"));
         }
         let dns_error = parse_camouflage("dns").unwrap_err().to_string();
         assert!(dns_error.contains("not implemented"));
@@ -8395,6 +8624,7 @@ mod tests {
         establish_and_run_measured(
             async { Ok(client_io) },
             &config,
+            CarrierBinding::DirectTcp,
             1,
             measurement,
             Duration::from_secs(5),
@@ -8544,6 +8774,7 @@ mod tests {
                 )
             },
             &config,
+            CarrierBinding::DirectTcp,
             1,
             measurement,
             Duration::from_secs(1),
@@ -8580,6 +8811,7 @@ mod tests {
         let result = establish_and_run_measured(
             async { Ok(client_io) },
             &ClientConfig::pinned([0x11; 32], test_client_auth().0),
+            CarrierBinding::DirectTcp,
             1,
             measurement,
             Duration::from_secs(1),
@@ -8632,6 +8864,7 @@ mod tests {
         let result = establish_and_run_measured(
             async { Ok(client_io) },
             &config,
+            CarrierBinding::DirectTcp,
             1,
             measurement,
             Duration::from_secs(5),
@@ -8667,6 +8900,7 @@ mod tests {
         let result = establish_and_run_measured(
             std::future::pending::<Result<tokio::io::DuplexStream>>(),
             &ClientConfig::pinned([0x11; 32], test_client_auth().0),
+            CarrierBinding::DirectTcp,
             1,
             measurement,
             Duration::from_millis(10),

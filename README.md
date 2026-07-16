@@ -184,7 +184,7 @@ cargo run -p shadowpipe-client -- \
   --server 127.0.0.1:47843 --server-fp SERVER_FP --camouflage h2 --message hello
 ```
 
-Raw/H2/TLS/QUIC daemon carriers are intentionally restricted to this explicit
+Raw/legacy-H2/TLS/raw-QUIC/HTTP-stream daemon carriers are intentionally restricted to this explicit
 user-owned, no-TUN lab mode: an active probe can distinguish their ShadowPipe
 bootstrap/challenge even though the mutual PSK gate emits no ML-KEM key or KEM
 work before authorization. A normal daemon and every full-tunnel deployment
@@ -410,6 +410,45 @@ TLS тут — **lab-камуфляж**: серт клиент НЕ провер
 через пин ML-KEM-ключа (`--server-fp`, см. B1). `--sni` лучше указывать как
 домен, который правдоподобно резолвится в этот сервер (иначе SNI/IP-mismatch —
 сам по себе tell). `--camouflage` при `--tls` игнорируется (внутри raw-фрейминг).
+
+### Genuine HTTP/2 stream carrier (clean-room XHTTP class)
+
+Default builds include a separate `--http-stream` carrier. It is not the
+legacy fake-H2 framing and does not copy Xray XHTTP: the client opens a genuine
+HTTP/2 `POST`; its request body is the uplink and the concurrent `200` response
+body is the downlink. HTTP/2 flow control and local bridge queues are bounded.
+Wrong authority/path/method/media type receives an ordinary bounded HTTP status
+and never reaches the inner ML-KEM flight. The exact `Http2Tls` carrier identity
+is authenticated by the mutual PSK gate and field 20 of `H0`.
+
+The route must be an operator-chosen opaque absolute path of at least 24 visible
+ASCII bytes:
+
+```bash
+HTTP_PATH=/api/events/0123456789abcdef0123456789abcdef
+
+cargo run -p shadowpipe-server -- \
+  --development-user-allowlist --allow-insecure-lab-carriers \
+  --client-allowlist "$PWD/.shadowpipe/dev-auth/allowlist.json" \
+  --keys "$PWD/.shadowpipe/dev-auth/server-keys.json" \
+  --listen 127.0.0.1:47843 \
+  --http-stream --http-authority example.com --http-path "$HTTP_PATH"
+
+cargo run -p shadowpipe-client -- \
+  --development-user-credential \
+  --client-credential "$PWD/.shadowpipe/dev-auth/client.json" \
+  --server 127.0.0.1:47843 --server-fp SERVER_FP \
+  --http-stream --sni example.com --http-path "$HTTP_PATH" --message hello
+```
+
+This remains an explicit no-TUN lab carrier. Production eligibility requires a
+real certificate/origin, replay-safe outer admission, genuine static or
+reverse-proxy cover behavior, active-probe comparison and field evidence.
+
+The QUIC path is also an honest raw laboratory carrier. It now negotiates the
+private `shadowpipe-lab/1` ALPN instead of falsely advertising `h3`; standard
+`h3` stays forbidden until a real HTTP/3 implementation supplies control
+streams, SETTINGS, QPACK and request semantics.
 
 **Защита от утечек (full-tunnel, Linux):** `--auto-route` без `--kill-switch` и
 `--dns <ip>` теперь fail closed ещё на preflight. Kill-switch разрешает только

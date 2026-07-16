@@ -4,7 +4,7 @@ use shadowpipe_core::client_auth::{
     AuthFailed, AuthorizedClients, ClientCredential, CLIENT_ACCESS_HELLO_LEN,
     CLIENT_ACCESS_PROOF_LEN, SERVER_ACCESS_PROOF_LEN,
 };
-use shadowpipe_core::proto::CamouflageMode;
+use shadowpipe_core::proto::{CamouflageMode, CarrierBinding};
 use shadowpipe_core::session::{AuthenticatedSession, ClientConfig, ServerPins, ServerState};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -14,6 +14,56 @@ const CLIENT_HELLO_WIRE_LEN: usize = 4 + 1 + 16 + 32 + 2 + 1088 + 1 + 1;
 const SERVER_HELLO_WIRE_LEN: usize = 16 + 32 + 8;
 const CLIENT_FINISHED_WIRE_LEN: usize = 1 + 16 + 64 + 32 + 16;
 const SERVER_FINISHED_WIRE_LEN: usize = 1 + 32 + 16;
+
+#[tokio::test]
+async fn cross_carrier_replay_is_rejected_before_static_key_disclosure() {
+    let state = Arc::new(ServerState::generate());
+    let credential = Arc::new(ClientCredential::generate().unwrap());
+    let authorized = credential.authorized_clients().unwrap();
+    let config = ClientConfig::pinned(state.fingerprint(), credential);
+    let (mut client_io, mut server_io) = tokio::io::duplex(4096);
+    let server_state = Arc::clone(&state);
+
+    let server = tokio::spawn(async move {
+        AuthenticatedSession::server_accept_bound(
+            &mut server_io,
+            &server_state,
+            &authorized,
+            CamouflageMode::Raw,
+            CarrierBinding::RealityTcp,
+        )
+        .await
+    });
+    let client = tokio::spawn(async move {
+        AuthenticatedSession::client_connect_bound(&mut client_io, &config, CarrierBinding::QuicRaw)
+            .await
+    });
+
+    let client_result = tokio::time::timeout(std::time::Duration::from_secs(1), client)
+        .await
+        .expect("client hung on cross-carrier server proof")
+        .unwrap();
+    let client_error = match client_result {
+        Ok(_) => panic!("client accepted a server proof from a different outer carrier"),
+        Err(error) => error,
+    };
+    assert!(
+        client_error.downcast_ref::<AuthFailed>().is_some(),
+        "unexpected client rejection: {client_error:#}"
+    );
+    let server_result = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("server hung after cross-carrier client rejection")
+        .unwrap();
+    let server_error = match server_result {
+        Ok(_) => panic!("server constructed a session after cross-carrier rejection"),
+        Err(error) => error,
+    };
+    assert!(
+        server_error.downcast_ref::<AuthFailed>().is_some(),
+        "unexpected server rejection: {server_error:#}"
+    );
+}
 
 #[derive(Debug)]
 struct CapturedHandshake {

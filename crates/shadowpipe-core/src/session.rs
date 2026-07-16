@@ -23,7 +23,8 @@ use crate::crypto::{
 use crate::proto::{
     random_padding, read_client_hello, read_frame, read_mlkem_public, read_server_hello,
     write_client_hello, write_frame, write_mlkem_public, write_server_hello, CamouflageMode,
-    ClientHello, Frame, FrameFlags, PaddingProfile, ServerHello, MAX_FRAME_PAYLOAD, MAX_PADDING,
+    CarrierBinding, ClientHello, Frame, FrameFlags, PaddingProfile, ServerHello, MAX_FRAME_PAYLOAD,
+    MAX_PADDING,
 };
 use crate::volume_guard::estimate_frame_wire_bytes;
 use crate::{BUILD_MAGIC, PROTO_VERSION};
@@ -540,6 +541,7 @@ fn pre_finished_transcript(
     server_pk: &[u8],
     client_hello: &ClientHello,
     server_hello: &ServerHello,
+    carrier_binding: CarrierBinding,
 ) -> [u8; 32] {
     pre_finished_transcript_with_magic(
         BUILD_MAGIC,
@@ -547,9 +549,19 @@ fn pre_finished_transcript(
         server_access_proof,
         client_access_proof,
         server_pk,
-        client_hello,
-        server_hello,
+        TranscriptCarrierContext {
+            client_hello,
+            server_hello,
+            carrier_binding,
+        },
     )
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptCarrierContext<'a> {
+    client_hello: &'a ClientHello,
+    server_hello: &'a ServerHello,
+    carrier_binding: CarrierBinding,
 }
 
 fn pre_finished_transcript_with_magic(
@@ -558,9 +570,13 @@ fn pre_finished_transcript_with_magic(
     server_access_proof: &[u8; SERVER_ACCESS_PROOF_LEN],
     client_access_proof: &[u8; CLIENT_ACCESS_PROOF_LEN],
     server_pk: &[u8],
-    client_hello: &ClientHello,
-    server_hello: &ServerHello,
+    context: TranscriptCarrierContext<'_>,
 ) -> [u8; 32] {
+    let TranscriptCarrierContext {
+        client_hello,
+        server_hello,
+        carrier_binding,
+    } = context;
     let mut canonical = Vec::with_capacity(TRANSCRIPT_DOMAIN.len() + server_pk.len() + 1400);
     canonical.extend_from_slice(TRANSCRIPT_DOMAIN);
     append_transcript_field(&mut canonical, 1, &[PROTO_VERSION]);
@@ -582,6 +598,7 @@ fn pre_finished_transcript_with_magic(
     append_transcript_field(&mut canonical, 17, access_hello);
     append_transcript_field(&mut canonical, 18, server_access_proof);
     append_transcript_field(&mut canonical, 19, client_access_proof);
+    append_transcript_field(&mut canonical, 20, &[carrier_binding as u8]);
     let mut h = Sha256::new();
     h.update(&canonical);
     let mut out = [0u8; 32];
@@ -796,8 +813,20 @@ impl AuthenticatedSession {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        Self::client_connect_bound(stream, config, CarrierBinding::DirectTcp).await
+    }
+
+    /// Establish a session while authenticating the exact outer carrier.
+    pub async fn client_connect_bound<S>(
+        stream: &mut S,
+        config: &ClientConfig,
+        carrier_binding: CarrierBinding,
+    ) -> Result<(Self, [u8; 8])>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let pins = ServerPins::single(config.server_fingerprint);
-        Self::client_connect_pins(stream, config, &pins).await
+        Self::client_connect_pins_bound(stream, config, &pins, carrier_binding).await
     }
 
     /// Establish a session using a bounded authenticated pin set. The mutual
@@ -807,6 +836,20 @@ impl AuthenticatedSession {
         stream: &mut S,
         config: &ClientConfig,
         server_pins: &ServerPins,
+    ) -> Result<(Self, [u8; 8])>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        Self::client_connect_pins_bound(stream, config, server_pins, CarrierBinding::DirectTcp)
+            .await
+    }
+
+    /// Pin-set variant of [`Self::client_connect_bound`].
+    pub async fn client_connect_pins_bound<S>(
+        stream: &mut S,
+        config: &ClientConfig,
+        server_pins: &ServerPins,
+        carrier_binding: CarrierBinding,
     ) -> Result<(Self, [u8; 8])>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -822,7 +865,11 @@ impl AuthenticatedSession {
             ServerAccessProof::decode(&server_access_proof).map_err(anyhow::Error::from)?;
         let client_access_proof = config
             .client_credential
-            .verify_server_access_and_prove(&decoded_server_access_proof, config.camouflage)
+            .verify_server_access_and_prove(
+                &decoded_server_access_proof,
+                config.camouflage,
+                carrier_binding,
+            )
             .context("verify server pre-key PSK proof")?
             .encode();
         write_access_proof(stream, &client_access_proof).await?;
@@ -875,6 +922,7 @@ impl AuthenticatedSession {
             &pk_bytes,
             &client_hello,
             &server_hello,
+            carrier_binding,
         );
         let handshake_keys = derive_handshake_traffic_keys(
             &x_shared,
@@ -946,6 +994,28 @@ impl AuthenticatedSession {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        Self::server_accept_bound(
+            stream,
+            state,
+            authorized_clients,
+            observed_camouflage,
+            CarrierBinding::DirectTcp,
+        )
+        .await
+    }
+
+    /// Accept a session while authenticating the exact locally observed outer
+    /// carrier before the ML-KEM public-key flight.
+    pub async fn server_accept_bound<S>(
+        stream: &mut S,
+        state: &ServerState,
+        authorized_clients: &AuthorizedClients,
+        observed_camouflage: CamouflageMode,
+        observed_carrier: CarrierBinding,
+    ) -> Result<(Self, ClientHello, [u8; 8])>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         anyhow::ensure!(
             observed_camouflage != CamouflageMode::DnsChunk,
             "DnsChunk carrier is not implemented; refusing authenticated session"
@@ -963,6 +1033,7 @@ impl AuthenticatedSession {
             access_hello,
             &access_challenge,
             observed_camouflage,
+            observed_carrier,
         )?;
         let server_access_proof = server_access.encode();
         write_server_access_proof(stream, &server_access_proof).await?;
@@ -975,6 +1046,7 @@ impl AuthenticatedSession {
             .verify(
                 &server_access,
                 observed_camouflage,
+                observed_carrier,
                 &decoded_client_access_proof,
             )
             .map_err(anyhow::Error::from)?;
@@ -1038,6 +1110,7 @@ impl AuthenticatedSession {
             &server_public,
             &client_hello,
             &server_hello,
+            observed_carrier,
         );
         let handshake_keys = derive_handshake_traffic_keys(
             &x_shared,
@@ -1622,7 +1695,7 @@ mod tests {
     #[test]
     fn pre_finished_h0_known_answer_is_stable() {
         // Explicit magic makes the vector independent of build.rs's random
-        // debug/test default. The suite string and all 19 canonical fields are
+        // debug/test default. The suite string and all 20 canonical fields are
         // therefore covered by a reproducible cross-implementation oracle.
         let build_magic = 0x0102_0304;
         let (pk, mut ch, sh) = sample_hellos();
@@ -1636,12 +1709,15 @@ mod tests {
             &server_access_proof,
             &client_access_proof,
             &pk,
-            &ch,
-            &sh,
+            TranscriptCarrierContext {
+                client_hello: &ch,
+                server_hello: &sh,
+                carrier_binding: CarrierBinding::DirectTcp,
+            },
         );
         assert_eq!(
             hex::encode(h0),
-            "7f884dcae0c7afe0dd214dd6e028de55b5faef55e514e50cf940fea3759252b3"
+            "4602407f409510dc99e0143c54d55ed5c5027e49af41fd138535fedb6a5f0573"
         );
     }
 
@@ -1658,6 +1734,7 @@ mod tests {
             &pk,
             &ch,
             &sh,
+            CarrierBinding::DirectTcp,
         );
         // Identical views -> identical transcript (the no-tamper case).
         assert_eq!(
@@ -1669,6 +1746,7 @@ mod tests {
                 &pk,
                 &ch,
                 &sh,
+                CarrierBinding::DirectTcp,
             )
         );
 
@@ -1683,6 +1761,7 @@ mod tests {
                 &pk,
                 &ch,
                 &sh,
+                CarrierBinding::DirectTcp,
             ),
             "access hello must bind"
         );
@@ -1697,6 +1776,7 @@ mod tests {
                 &pk,
                 &ch,
                 &sh,
+                CarrierBinding::DirectTcp,
             ),
             "server access proof must bind"
         );
@@ -1711,6 +1791,7 @@ mod tests {
                 &pk,
                 &ch,
                 &sh,
+                CarrierBinding::DirectTcp,
             ),
             "client access proof must bind"
         );
@@ -1727,6 +1808,7 @@ mod tests {
                 &pk,
                 &ch_pad,
                 &sh,
+                CarrierBinding::DirectTcp,
             ),
             "padding must bind"
         );
@@ -1742,6 +1824,7 @@ mod tests {
                 &pk,
                 &ch_cam,
                 &sh,
+                CarrierBinding::DirectTcp,
             ),
             "camouflage must bind"
         );
@@ -1758,6 +1841,7 @@ mod tests {
                 &pk2,
                 &ch,
                 &sh,
+                CarrierBinding::DirectTcp,
             ),
             "server key must bind"
         );
@@ -1773,8 +1857,22 @@ mod tests {
                 &pk,
                 &ch,
                 &sh2,
+                CarrierBinding::DirectTcp,
             ),
             "server hello must bind"
+        );
+        assert_ne!(
+            base,
+            pre_finished_transcript(
+                &access_hello,
+                &server_access_proof,
+                &client_access_proof,
+                &pk,
+                &ch,
+                &sh,
+                CarrierBinding::RealityTcp,
+            ),
+            "outer carrier identity must bind"
         );
     }
 

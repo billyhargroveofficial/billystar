@@ -10,6 +10,8 @@ pub mod endpoint_policy;
 pub mod endpoint_runtime;
 pub mod host_recovery;
 pub mod host_state;
+#[cfg(feature = "http-stream")]
+pub mod http_stream;
 pub mod lockdown;
 pub mod measurement;
 pub mod mux;

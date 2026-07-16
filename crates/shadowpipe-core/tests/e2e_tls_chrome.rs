@@ -6,7 +6,7 @@
 #![cfg(feature = "tls-chrome")]
 
 use shadowpipe_core::client_auth::ClientCredential;
-use shadowpipe_core::proto::{CamouflageMode, FrameFlags, PaddingProfile};
+use shadowpipe_core::proto::{CamouflageMode, CarrierBinding, FrameFlags, PaddingProfile};
 use shadowpipe_core::session::{AuthenticatedSession, ClientConfig, ServerState};
 use shadowpipe_core::tls;
 use std::sync::Arc;
@@ -30,11 +30,12 @@ async fn pq_session_inside_chrome_tls() {
         // Terminate the Chrome-JA4 TLS, then run the shadowpipe server handshake
         // INSIDE it — exactly what the real server will do.
         let mut tls = tls::accept(&acc, tcp).await.unwrap();
-        let (mut session, _, _) = AuthenticatedSession::server_accept(
+        let (mut session, _, _) = AuthenticatedSession::server_accept_bound(
             &mut tls,
             &server_state,
             &server_authorized,
             CamouflageMode::Raw,
+            CarrierBinding::BrowserTlsTcp,
         )
         .await
         .unwrap();
@@ -61,9 +62,13 @@ async fn pq_session_inside_chrome_tls() {
         server_fingerprint,
         client_credential: credential,
     };
-    let (mut session, _) = AuthenticatedSession::client_connect(&mut tls, &config)
-        .await
-        .unwrap();
+    let (mut session, _) = AuthenticatedSession::client_connect_bound(
+        &mut tls,
+        &config,
+        CarrierBinding::BrowserTlsTcp,
+    )
+    .await
+    .unwrap();
 
     // Small PQ-encrypted echo, all inside the TLS record layer.
     session
@@ -125,11 +130,12 @@ async fn run_tunnel_over_chrome_tls() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut tls = tls::accept(&acc, tcp).await.unwrap();
-        let (session, _, _) = AuthenticatedSession::server_accept(
+        let (session, _, _) = AuthenticatedSession::server_accept_bound(
             &mut tls,
             &server_state,
             &server_authorized,
             CamouflageMode::Raw,
+            CarrierBinding::BrowserTlsTcp,
         )
         .await
         .unwrap();
@@ -149,9 +155,10 @@ async fn run_tunnel_over_chrome_tls() {
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let mut tls = tls::chrome_connect(tcp, "example.com").await.unwrap();
-    let (session, _) = AuthenticatedSession::client_connect(
+    let (session, _) = AuthenticatedSession::client_connect_bound(
         &mut tls,
         &ClientConfig::pinned(server_fingerprint, credential),
+        CarrierBinding::BrowserTlsTcp,
     )
     .await
     .unwrap();
