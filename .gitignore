@@ -4,10 +4,29 @@
 *.env
 .env.*
 
+# External source trees are audit inputs, never vendored implementation.
+/upstream/
+/upstreams/
+/vendor/
+/vendor-reference/
+/reference-checkouts/
+
 # Secrets — never commit
 .shadowpipe/
 keys.json
 **/keys.json
+*.key
+*.pem
+*.p12
+*.mobileprovision
+*.cose
+*.pcap
+*.pcapng
+*.log
+*credential*.json
+*enrollment*.json
+*policy-state*.bin
+*short-id*
 
 # Disposable VM/netns evidence (large pcaps, logs, host snapshots).
 # Keep raw bundles local by default; explicitly force-add only reviewed,

@@ -20,6 +20,8 @@ readonly BOOT_READY_TIMEOUT=180
 readonly OWNERSHIP_MARKER=.shadowpipe-lockdown-reboot-owner
 readonly CLONE_QUIESCENCE_SAMPLES=60
 readonly CLONE_QUIESCENCE_REQUIRED_STABLE=4
+readonly EXPECTED_SINGBOX_CONFIG="${SHADOWPIPE_HOST_SINGBOX_CONFIG:-${HOME}/sing-box/config.json}"
+readonly EXPECTED_SINGBOX_DIRECTORY="${SHADOWPIPE_HOST_SINGBOX_DIRECTORY:-${EXPECTED_SINGBOX_CONFIG%/*}}"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -325,14 +327,16 @@ PY
 
 validate_singbox_command() {
   local command_file="$1"
-  python3 -I -S - "${command_file}" <<'PY'
+  python3 -I -S - "${command_file}" "${EXPECTED_SINGBOX_CONFIG}" \
+    "${EXPECTED_SINGBOX_DIRECTORY}" <<'PY'
 import re
 import sys
-with open(sys.argv[1], "r", encoding="utf-8") as stream:
+command_file, expected_config, expected_directory = sys.argv[1:]
+with open(command_file, "r", encoding="utf-8") as stream:
     command = stream.read().strip()
 if re.fullmatch(
-    r"^(?:\S*/)?sing-box run -c /Users/billy/sing-box/config\.json "
-    r"-D /Users/billy/sing-box$",
+    r"^(?:\S*/)?sing-box run -c " + re.escape(expected_config)
+    + r" -D " + re.escape(expected_directory) + r"$",
     command,
 ) is None:
     raise SystemExit("sing-box argv is not the protected live configuration")
@@ -463,8 +467,8 @@ validate_singbox_reproof() {
 self_test_singbox_observer() {
   local root="$1" exact unrelated foreign
   mkdir -p -- "${root}" || return 1
-  exact='/opt/homebrew/bin/sing-box run -c /Users/billy/sing-box/config.json -D /Users/billy/sing-box'
-  unrelated='/Applications/SkyComputerUseClient turn-ended payload=sing-box run -c /Users/billy/sing-box/config.json -D /Users/billy/sing-box'
+  exact="/opt/homebrew/bin/sing-box run -c ${EXPECTED_SINGBOX_CONFIG} -D ${EXPECTED_SINGBOX_DIRECTORY}"
+  unrelated="/Applications/SkyComputerUseClient turn-ended payload=sing-box run -c ${EXPECTED_SINGBOX_CONFIG} -D ${EXPECTED_SINGBOX_DIRECTORY}"
   foreign='/opt/homebrew/bin/sing-box run -c /tmp/foreign.json -D /tmp/foreign'
 
   printf '101\t%s\n' "${exact}" >"${root}/records"
@@ -664,13 +668,13 @@ snapshot_macos() {
   capture_required "${output}/sing-box.command" \
     ps -ww -p "${pid}" -o command= || return 1
   validate_singbox_command "${output}/sing-box.command" || return 1
-  [[ -f /Users/billy/sing-box/config.json \
-    && ! -L /Users/billy/sing-box/config.json ]] || return 1
+  [[ -f "${EXPECTED_SINGBOX_CONFIG}" \
+    && ! -L "${EXPECTED_SINGBOX_CONFIG}" ]] || return 1
   capture_required "${output}/sing-box-config.stat" \
     stat -f '%HT %Su %Sg %Sp %l %z %m %N' \
-    /Users/billy/sing-box/config.json || return 1
+    "${EXPECTED_SINGBOX_CONFIG}" || return 1
   capture_required "${output}/sing-box-config.sha256" \
-    sha256sum /Users/billy/sing-box/config.json || return 1
+    sha256sum "${EXPECTED_SINGBOX_CONFIG}" || return 1
   capture_singbox_binary "${pid}" "${output}/sing-box-binary.path" || return 1
   binary="$(<"${output}/sing-box-binary.path")"
   [[ -n "${binary}" && -f "${binary}" ]] || return 1
@@ -702,7 +706,7 @@ snapshot_macos() {
   final_binary="$(<"${output}/sing-box-binary-final.path")"
   capture_required "${output}/sing-box-config-final.stat" \
     stat -f '%HT %Su %Sg %Sp %l %z %m %N' \
-    /Users/billy/sing-box/config.json || return 1
+    "${EXPECTED_SINGBOX_CONFIG}" || return 1
   capture_required "${output}/sing-box-binary-final.stat" \
     stat -f '%HT %Su %Sg %Sp %l %z %m %N' "${final_binary}" || return 1
   validate_singbox_reproof "${output}" || return 1
@@ -2399,11 +2403,11 @@ run_self_test() (
   fi
 
   printf '%s\n' \
-    '/opt/homebrew/bin/sing-box run -c /Users/billy/sing-box/config.json -D /Users/billy/sing-box' \
+    "/opt/homebrew/bin/sing-box run -c ${EXPECTED_SINGBOX_CONFIG} -D ${EXPECTED_SINGBOX_DIRECTORY}" \
     >"${temporary}/sing-box.command"
   validate_singbox_command "${temporary}/sing-box.command"
   printf '%s\n' \
-    'sing-box run -c /Users/billy/sing-box/config.json -D /Users/billy/sing-box' \
+    "sing-box run -c ${EXPECTED_SINGBOX_CONFIG} -D ${EXPECTED_SINGBOX_DIRECTORY}" \
     >"${temporary}/sing-box.command"
   validate_singbox_command "${temporary}/sing-box.command"
   printf '%s\n' '/opt/homebrew/bin/sing-box run -c /tmp/foreign.json' \

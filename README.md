@@ -502,4 +502,10 @@ preregistrations. The VM-only impairment harness is documented in
 - Power-loss/torn-write durability and production fleet reboot/rollback drills
 - Independent cryptographic/security review и field-tested fleet rotation/revocation
 
-См. `~/Documents/billynotes/vpn/investigation/`
+Operator-specific private research notes are intentionally not part of the
+public source repository.
+
+Upstream implementations are reference inputs only. Shadowpipe keeps its own
+protocol, signed-policy, packet-tunnel and WAL architecture; license and
+clean-room rules are defined in
+[`docs/upstream-clean-room-policy.md`](docs/upstream-clean-room-policy.md).

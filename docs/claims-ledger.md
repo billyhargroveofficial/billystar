@@ -46,7 +46,9 @@ topology and are not required to build or test Shadowpipe.
 | `CAR-005` | CensorLess-style serverless rotation переживает RU default-deny whitelist. | `H`, E0 | CensorLess подтверждает serverless bridge, refresh/migration и cost в своей модели; не подтверждает allowlisting конкретного foreign FaaS edge в РФ. | Paired field test на целевом операторе; проход до meaningful byte floor; provider ToS review. |
 | `CAR-006` | Degradation symmetry требует, чтобы treatment и real cover делили destination/path/bottleneck. | `H` grounded in primary work, E0 | Отдельный probe к другому origin измеряет чужую очередь и не идентифицирует counterfactual treatment response. | Co-routed paired experiment показывает bounded differential response при нескольких impairment levels. |
 
-Vault provenance: `~/Documents/billynotes/vpn/investigation/yandex-cloud-whitelist-relay-2026-07-10.md`, `zatmenie-aplane-design-2026-05-29.md`, `anti-dpi-research-2026-05-30.md`.
+Vault provenance: operator-specific private field notes retained outside the
+public repository. Their bounded conclusions are restated here without private
+infrastructure details.
 
 ## Academic claims and their exact scope
 
