@@ -14,6 +14,7 @@ pub mod lockdown;
 pub mod measurement;
 pub mod mux;
 pub mod netguard;
+pub mod network_events;
 pub mod pacing;
 pub mod packet;
 pub mod platform;
