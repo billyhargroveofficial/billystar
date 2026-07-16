@@ -15,6 +15,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::platform::NetworkChangeKind;
+use crate::routes::SHADOWPIPE_ROUTE_PROTOCOL;
 
 /// Hard cap for one kernel netlink datagram.
 ///
@@ -25,9 +26,14 @@ pub const MAX_NETLINK_DATAGRAM_BYTES: usize = 64 * 1024;
 const NLMSG_ALIGN_TO: usize = 4;
 const NLMSG_HEADER_BYTES: usize = 16;
 const RTATTR_HEADER_BYTES: usize = 4;
+const NLA_TYPE_MASK: u16 = 0x3fff;
 const IFINFO_MESSAGE_BYTES: usize = 16;
 const IFADDR_MESSAGE_BYTES: usize = 8;
 const ROUTE_MESSAGE_BYTES: usize = 12;
+const FIB_RULE_HEADER_BYTES: usize = 12;
+const RTA_TABLE: u16 = 15;
+const RT_TABLE_COMPAT: u32 = 252;
+const RT_TABLE_MAIN: u32 = 254;
 
 // Public Linux UAPI message values from <linux/netlink.h> and
 // <linux/rtnetlink.h>. They remain local constants so the pure decoder is
@@ -42,40 +48,89 @@ const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
+const RTM_NEWRULE: u16 = 32;
+const RTM_DELRULE: u16 = 33;
 const LINUX_AF_INET: u8 = 2;
 const LINUX_AF_INET6: u8 = 10;
 
-const NETWORK_CHANGE_KINDS: [NetworkChangeKind; 8] = [
+// Public multicast masks from <linux/rtnetlink.h>. Linux exposes IPv6 rule
+// notifications as RTNLGRP_IPV6_RULE (group 19) but does not define a legacy
+// RTMGRP_IPV6_RULE macro, so its nl_groups bit is derived from that public UAPI
+// group number.
+#[cfg(any(test, target_os = "linux"))]
+const RTMGRP_LINK: u32 = 0x0001;
+#[cfg(any(test, target_os = "linux"))]
+const RTMGRP_IPV4_IFADDR: u32 = 0x0010;
+#[cfg(any(test, target_os = "linux"))]
+const RTMGRP_IPV4_ROUTE: u32 = 0x0040;
+#[cfg(any(test, target_os = "linux"))]
+const RTMGRP_IPV4_RULE: u32 = 0x0080;
+#[cfg(any(test, target_os = "linux"))]
+const RTMGRP_IPV6_IFADDR: u32 = 0x0100;
+#[cfg(any(test, target_os = "linux"))]
+const RTMGRP_IPV6_ROUTE: u32 = 0x0400;
+#[cfg(any(test, target_os = "linux"))]
+const RTNLGRP_IPV6_RULE: u32 = 19;
+#[cfg(any(test, target_os = "linux"))]
+const RTMGRP_IPV6_RULE: u32 = 1 << (RTNLGRP_IPV6_RULE - 1);
+
+/// Address-family scope for Linux underlay invalidation notifications.
+///
+/// IPv4-only clients deliberately avoid subscribing to IPv6 address, route,
+/// and policy-rule groups. A future dual-stack underlay can opt into all three
+/// IPv6 groups without changing decoder semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxNetworkEventInterest {
+    Ipv4UnderlayOnly,
+    DualStack,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+const fn rtnetlink_subscription_groups(interest: LinuxNetworkEventInterest) -> u32 {
+    let ipv4 = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE | RTMGRP_IPV4_RULE;
+    match interest {
+        LinuxNetworkEventInterest::Ipv4UnderlayOnly => ipv4,
+        LinuxNetworkEventInterest::DualStack => {
+            ipv4 | RTMGRP_IPV6_IFADDR | RTMGRP_IPV6_ROUTE | RTMGRP_IPV6_RULE
+        }
+    }
+}
+
+const NETWORK_CHANGE_KINDS: [NetworkChangeKind; 10] = [
     NetworkChangeKind::InitialObservation,
     NetworkChangeKind::InterfaceSetChanged,
     NetworkChangeKind::InterfaceAddressChanged,
     NetworkChangeKind::DefaultRouteChanged,
+    NetworkChangeKind::RoutingPolicyChanged,
+    NetworkChangeKind::OwnedRouteChanged,
     NetworkChangeKind::DnsConfigurationChanged,
     NetworkChangeKind::ConnectivityChanged,
     NetworkChangeKind::Suspend,
     NetworkChangeKind::Resume,
 ];
 
-const fn kind_bit(kind: NetworkChangeKind) -> u8 {
+const fn kind_bit(kind: NetworkChangeKind) -> u16 {
     match kind {
         NetworkChangeKind::InitialObservation => 1 << 0,
         NetworkChangeKind::InterfaceSetChanged => 1 << 1,
         NetworkChangeKind::InterfaceAddressChanged => 1 << 2,
         NetworkChangeKind::DefaultRouteChanged => 1 << 3,
-        NetworkChangeKind::DnsConfigurationChanged => 1 << 4,
-        NetworkChangeKind::ConnectivityChanged => 1 << 5,
-        NetworkChangeKind::Suspend => 1 << 6,
-        NetworkChangeKind::Resume => 1 << 7,
+        NetworkChangeKind::RoutingPolicyChanged => 1 << 4,
+        NetworkChangeKind::OwnedRouteChanged => 1 << 5,
+        NetworkChangeKind::DnsConfigurationChanged => 1 << 6,
+        NetworkChangeKind::ConnectivityChanged => 1 << 7,
+        NetworkChangeKind::Suspend => 1 << 8,
+        NetworkChangeKind::Resume => 1 << 9,
     }
 }
 
 /// Fixed-capacity set of coalesced change triggers.
 ///
-/// Its storage is always one byte. Repeated notifications set an existing bit
+/// Its storage is always two bytes. Repeated notifications set an existing bit
 /// instead of creating an unbounded queue.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkChangeSet {
-    bits: u8,
+    bits: u16,
 }
 
 impl NetworkChangeSet {
@@ -311,6 +366,14 @@ pub enum NetlinkDecodeError {
         declared: usize,
         remaining: usize,
     },
+    DuplicateAttribute {
+        message_type: u16,
+        attribute_type: u16,
+    },
+    ConflictingRouteTable {
+        header_table: u32,
+        attribute_table: u32,
+    },
     KernelError(i32),
     KernelOverrun,
 }
@@ -365,6 +428,20 @@ impl fmt::Display for NetlinkDecodeError {
             } => write!(
                 formatter,
                 "rtnetlink type {message_type} attribute at byte {offset} declares {declared} bytes, {remaining} remain"
+            ),
+            Self::DuplicateAttribute {
+                message_type,
+                attribute_type,
+            } => write!(
+                formatter,
+                "rtnetlink type {message_type} repeats attribute type {attribute_type}"
+            ),
+            Self::ConflictingRouteTable {
+                header_table,
+                attribute_table,
+            } => write!(
+                formatter,
+                "rtnetlink route table differs between rtmsg ({header_table}) and RTA_TABLE ({attribute_table})"
             ),
             Self::KernelError(code) => {
                 write!(formatter, "kernel returned rtnetlink error {code}")
@@ -468,12 +545,63 @@ fn validate_attributes(
     Ok(())
 }
 
+fn route_table_id(message_type: u16, payload: &[u8]) -> Result<u32, NetlinkDecodeError> {
+    let header_table = u32::from(payload[4]);
+    let mut attribute_table = None;
+    let mut offset = ROUTE_MESSAGE_BYTES;
+
+    while offset < payload.len() {
+        let length = usize::from(read_u16_ne(&payload[offset..offset + 2]));
+        let attribute_type = read_u16_ne(&payload[offset + 2..offset + 4]) & NLA_TYPE_MASK;
+        if attribute_type == RTA_TABLE {
+            if length != RTATTR_HEADER_BYTES + size_of::<u32>() {
+                return Err(NetlinkDecodeError::InvalidAttributeLength {
+                    message_type,
+                    offset,
+                    length,
+                });
+            }
+            let table = read_u32_ne(
+                &payload
+                    [offset + RTATTR_HEADER_BYTES..offset + RTATTR_HEADER_BYTES + size_of::<u32>()],
+            );
+            if attribute_table.replace(table).is_some() {
+                return Err(NetlinkDecodeError::DuplicateAttribute {
+                    message_type,
+                    attribute_type,
+                });
+            }
+        }
+
+        let aligned = align4(length).expect("validated route attribute length aligns");
+        if offset + aligned > payload.len() {
+            break;
+        }
+        offset += aligned;
+    }
+
+    if let Some(attribute_table) = attribute_table {
+        if header_table != 0 && header_table != RT_TABLE_COMPAT && header_table != attribute_table {
+            return Err(NetlinkDecodeError::ConflictingRouteTable {
+                header_table,
+                attribute_table,
+            });
+        }
+        Ok(attribute_table)
+    } else {
+        Ok(header_table)
+    }
+}
+
 /// Decode one Linux `NETLINK_ROUTE` multicast datagram into bounded triggers.
 ///
 /// This is pure and portable so malformed-input tests run on macOS and
-/// Windows. Link and address messages always trigger fresh observation.
-/// Route messages trigger only when their destination prefix length is zero
-/// for IPv4 or IPv6; other routes cannot directly replace a default route.
+/// Windows. Link and address messages always trigger fresh observation. Every
+/// IPv4/IPv6 route change invalidates cached routing state: external `/0`
+/// changes are classified as default-route changes, external non-default
+/// prefixes as connectivity changes, and protocol-186 routes separately so a
+/// caller may suppress only an exactly revalidated owned mutation. Policy-rule
+/// messages have their own invalidation class.
 pub fn decode_rtnetlink_datagram(datagram: &[u8]) -> Result<NetworkChangeSet, NetlinkDecodeError> {
     if datagram.is_empty() {
         return Err(NetlinkDecodeError::EmptyDatagram);
@@ -539,11 +667,24 @@ pub fn decode_rtnetlink_datagram(datagram: &[u8]) -> Result<NetworkChangeSet, Ne
                 validate_attributes(message_type, payload, ROUTE_MESSAGE_BYTES)?;
                 let family = payload[0];
                 let destination_prefix_length = payload[1];
-                if matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
-                    && destination_prefix_length == 0
-                {
-                    changes.insert(NetworkChangeKind::DefaultRouteChanged);
+                let protocol = payload[5];
+                let table = route_table_id(message_type, payload)?;
+                if matches!(family, LINUX_AF_INET | LINUX_AF_INET6) {
+                    if family == LINUX_AF_INET
+                        && table == RT_TABLE_MAIN
+                        && protocol == SHADOWPIPE_ROUTE_PROTOCOL
+                    {
+                        changes.insert(NetworkChangeKind::OwnedRouteChanged);
+                    } else if destination_prefix_length == 0 {
+                        changes.insert(NetworkChangeKind::DefaultRouteChanged);
+                    } else {
+                        changes.insert(NetworkChangeKind::ConnectivityChanged);
+                    }
                 }
+            }
+            RTM_NEWRULE | RTM_DELRULE => {
+                validate_attributes(message_type, payload, FIB_RULE_HEADER_BYTES)?;
+                changes.insert(NetworkChangeKind::RoutingPolicyChanged);
             }
             _ => {
                 // A valid message outside the subscribed change classes is
@@ -586,22 +727,11 @@ pub mod linux {
     use std::mem::{size_of, MaybeUninit};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+    pub use super::LinuxNetworkEventInterest;
     use super::{
-        decode_rtnetlink_datagram, NetlinkDecodeError, NetworkChangeSet, MAX_NETLINK_DATAGRAM_BYTES,
+        decode_rtnetlink_datagram, rtnetlink_subscription_groups, NetlinkDecodeError,
+        NetworkChangeSet, MAX_NETLINK_DATAGRAM_BYTES,
     };
-
-    // Public multicast masks from <linux/rtnetlink.h>. Only link, IPv4/IPv6
-    // address, and IPv4/IPv6 route notifications are subscribed.
-    const RTMGRP_LINK: u32 = 0x0001;
-    const RTMGRP_IPV4_IFADDR: u32 = 0x0010;
-    const RTMGRP_IPV4_ROUTE: u32 = 0x0040;
-    const RTMGRP_IPV6_IFADDR: u32 = 0x0100;
-    const RTMGRP_IPV6_ROUTE: u32 = 0x0400;
-    const SUBSCRIBED_GROUPS: u32 = RTMGRP_LINK
-        | RTMGRP_IPV4_IFADDR
-        | RTMGRP_IPV4_ROUTE
-        | RTMGRP_IPV6_IFADDR
-        | RTMGRP_IPV6_ROUTE;
     const RECEIVE_BUFFER_BYTES: libc::c_int = (MAX_NETLINK_DATAGRAM_BYTES * 4) as libc::c_int;
 
     #[derive(Debug)]
@@ -645,7 +775,9 @@ pub mod linux {
     }
 
     impl LinuxNetworkEventSource {
-        pub fn open() -> Result<Self, LinuxNetworkEventSourceError> {
+        pub fn open(
+            interest: LinuxNetworkEventInterest,
+        ) -> Result<Self, LinuxNetworkEventSourceError> {
             // SAFETY: socket has no pointer arguments and returns a fresh fd.
             let raw = unsafe {
                 libc::socket(
@@ -682,7 +814,7 @@ pub mod linux {
             // for sockaddr_nl, including libc's private padding.
             let mut local = unsafe { MaybeUninit::<libc::sockaddr_nl>::zeroed().assume_init() };
             local.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-            local.nl_groups = SUBSCRIBED_GROUPS;
+            local.nl_groups = rtnetlink_subscription_groups(interest);
             // SAFETY: local is initialized and the exact sockaddr_nl size is
             // provided to bind.
             let result = unsafe {
@@ -776,14 +908,10 @@ pub mod linux {
         use super::*;
 
         #[test]
-        fn subscription_mask_contains_only_documented_change_groups() {
-            assert_eq!(SUBSCRIBED_GROUPS, 0x0551);
-        }
-
-        #[test]
         #[ignore = "opens a read-only NETLINK_ROUTE socket on a Linux host"]
         fn socket_smoke_test_is_non_mutating() {
-            let mut source = LinuxNetworkEventSource::open().unwrap();
+            let mut source =
+                LinuxNetworkEventSource::open(LinuxNetworkEventInterest::Ipv4UnderlayOnly).unwrap();
             assert!(source.as_raw_fd() >= 0);
             let _ = source.try_read().unwrap();
         }
@@ -805,9 +933,49 @@ mod tests {
     }
 
     fn route_payload(family: u8, destination_prefix_length: u8) -> [u8; ROUTE_MESSAGE_BYTES] {
+        route_payload_with_protocol(family, destination_prefix_length, 0)
+    }
+
+    fn route_payload_with_protocol(
+        family: u8,
+        destination_prefix_length: u8,
+        protocol: u8,
+    ) -> [u8; ROUTE_MESSAGE_BYTES] {
+        route_payload_with_protocol_and_table(family, destination_prefix_length, protocol, 0)
+    }
+
+    fn route_payload_with_protocol_and_table(
+        family: u8,
+        destination_prefix_length: u8,
+        protocol: u8,
+        table: u8,
+    ) -> [u8; ROUTE_MESSAGE_BYTES] {
         let mut payload = [0u8; ROUTE_MESSAGE_BYTES];
         payload[0] = family;
         payload[1] = destination_prefix_length;
+        payload[4] = table;
+        payload[5] = protocol;
+        payload
+    }
+
+    fn route_payload_with_table_attribute(
+        family: u8,
+        destination_prefix_length: u8,
+        protocol: u8,
+        table: u32,
+    ) -> Vec<u8> {
+        let mut payload =
+            route_payload_with_protocol_and_table(family, destination_prefix_length, protocol, 0)
+                .to_vec();
+        payload.extend_from_slice(&8u16.to_ne_bytes());
+        payload.extend_from_slice(&RTA_TABLE.to_ne_bytes());
+        payload.extend_from_slice(&table.to_ne_bytes());
+        payload
+    }
+
+    fn rule_payload(family: u8) -> [u8; FIB_RULE_HEADER_BYTES] {
+        let mut payload = [0u8; FIB_RULE_HEADER_BYTES];
+        payload[0] = family;
         payload
     }
 
@@ -815,6 +983,7 @@ mod tests {
     fn change_set_is_fixed_and_iterates_in_canonical_order() {
         let changes: NetworkChangeSet = [
             NetworkChangeKind::Resume,
+            NetworkChangeKind::OwnedRouteChanged,
             NetworkChangeKind::DefaultRouteChanged,
             NetworkChangeKind::Resume,
             NetworkChangeKind::InterfaceSetChanged,
@@ -822,13 +991,15 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert_eq!(changes.len(), 3);
+        assert_eq!(std::mem::size_of::<NetworkChangeSet>(), 2);
+        assert_eq!(changes.len(), 4);
         assert!(changes.contains(NetworkChangeKind::Resume));
         assert_eq!(
             changes.iter().collect::<Vec<_>>(),
             vec![
                 NetworkChangeKind::InterfaceSetChanged,
                 NetworkChangeKind::DefaultRouteChanged,
+                NetworkChangeKind::OwnedRouteChanged,
                 NetworkChangeKind::Resume,
             ]
         );
@@ -913,8 +1084,154 @@ mod tests {
     }
 
     #[test]
-    fn decoder_ignores_non_default_and_unknown_valid_messages() {
+    fn decoder_classifies_ipv4_24_and_32_routes_as_connectivity_changes() {
         let mut datagram = netlink_message(RTM_NEWROUTE, &route_payload(LINUX_AF_INET, 24));
+        datagram.extend(netlink_message(
+            RTM_DELROUTE,
+            &route_payload(LINUX_AF_INET, 32),
+        ));
+
+        let changes = decode_rtnetlink_datagram(&datagram).unwrap();
+        assert_eq!(changes, NetworkChangeKind::ConnectivityChanged.into());
+    }
+
+    #[test]
+    fn decoder_classifies_ipv6_non_default_route_as_connectivity_change() {
+        let datagram = netlink_message(RTM_NEWROUTE, &route_payload(LINUX_AF_INET6, 128));
+
+        let changes = decode_rtnetlink_datagram(&datagram).unwrap();
+        assert_eq!(changes, NetworkChangeKind::ConnectivityChanged.into());
+    }
+
+    #[test]
+    fn decoder_classifies_protocol_186_routes_without_suppressing_them() {
+        let mut datagram = netlink_message(
+            RTM_NEWROUTE,
+            &route_payload_with_protocol_and_table(
+                LINUX_AF_INET,
+                0,
+                SHADOWPIPE_ROUTE_PROTOCOL,
+                RT_TABLE_MAIN as u8,
+            ),
+        );
+        datagram.extend(netlink_message(
+            RTM_DELROUTE,
+            &route_payload_with_table_attribute(
+                LINUX_AF_INET,
+                32,
+                SHADOWPIPE_ROUTE_PROTOCOL,
+                RT_TABLE_MAIN,
+            ),
+        ));
+
+        let changes = decode_rtnetlink_datagram(&datagram).unwrap();
+        assert_eq!(changes, NetworkChangeKind::OwnedRouteChanged.into());
+        assert!(!changes.contains(NetworkChangeKind::DefaultRouteChanged));
+        assert!(!changes.contains(NetworkChangeKind::ConnectivityChanged));
+    }
+
+    #[test]
+    fn protocol_186_is_owned_only_for_ipv4_main_table() {
+        let mut datagram = netlink_message(
+            RTM_NEWROUTE,
+            &route_payload_with_protocol_and_table(
+                LINUX_AF_INET,
+                32,
+                SHADOWPIPE_ROUTE_PROTOCOL,
+                100,
+            ),
+        );
+        datagram.extend(netlink_message(
+            RTM_NEWROUTE,
+            &route_payload_with_protocol_and_table(
+                LINUX_AF_INET6,
+                128,
+                SHADOWPIPE_ROUTE_PROTOCOL,
+                RT_TABLE_MAIN as u8,
+            ),
+        ));
+
+        let changes = decode_rtnetlink_datagram(&datagram).unwrap();
+        assert_eq!(changes, NetworkChangeKind::ConnectivityChanged.into());
+        assert!(!changes.contains(NetworkChangeKind::OwnedRouteChanged));
+    }
+
+    #[test]
+    fn route_table_attribute_is_exact_and_cannot_conflict_or_repeat() {
+        let owned = netlink_message(
+            RTM_NEWROUTE,
+            &route_payload_with_table_attribute(
+                LINUX_AF_INET,
+                32,
+                SHADOWPIPE_ROUTE_PROTOCOL,
+                RT_TABLE_MAIN,
+            ),
+        );
+        assert_eq!(
+            decode_rtnetlink_datagram(&owned).unwrap(),
+            NetworkChangeKind::OwnedRouteChanged.into()
+        );
+
+        let mut conflicting = route_payload_with_protocol_and_table(
+            LINUX_AF_INET,
+            32,
+            SHADOWPIPE_ROUTE_PROTOCOL,
+            100,
+        )
+        .to_vec();
+        conflicting.extend_from_slice(&8u16.to_ne_bytes());
+        conflicting.extend_from_slice(&RTA_TABLE.to_ne_bytes());
+        conflicting.extend_from_slice(&RT_TABLE_MAIN.to_ne_bytes());
+        assert!(matches!(
+            decode_rtnetlink_datagram(&netlink_message(RTM_NEWROUTE, &conflicting)),
+            Err(NetlinkDecodeError::ConflictingRouteTable { .. })
+        ));
+
+        let mut extended = route_payload_with_protocol_and_table(
+            LINUX_AF_INET,
+            32,
+            SHADOWPIPE_ROUTE_PROTOCOL,
+            RT_TABLE_COMPAT as u8,
+        )
+        .to_vec();
+        extended.extend_from_slice(&8u16.to_ne_bytes());
+        extended.extend_from_slice(&RTA_TABLE.to_ne_bytes());
+        extended.extend_from_slice(&1000u32.to_ne_bytes());
+        assert_eq!(
+            decode_rtnetlink_datagram(&netlink_message(RTM_NEWROUTE, &extended)).unwrap(),
+            NetworkChangeKind::ConnectivityChanged.into()
+        );
+
+        let mut duplicate = route_payload_with_table_attribute(
+            LINUX_AF_INET,
+            32,
+            SHADOWPIPE_ROUTE_PROTOCOL,
+            RT_TABLE_MAIN,
+        );
+        duplicate.extend_from_slice(&8u16.to_ne_bytes());
+        duplicate.extend_from_slice(&RTA_TABLE.to_ne_bytes());
+        duplicate.extend_from_slice(&RT_TABLE_MAIN.to_ne_bytes());
+        assert!(matches!(
+            decode_rtnetlink_datagram(&netlink_message(RTM_NEWROUTE, &duplicate)),
+            Err(NetlinkDecodeError::DuplicateAttribute {
+                attribute_type: RTA_TABLE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decoder_classifies_rule_add_and_delete_as_routing_policy_changes() {
+        let mut datagram = netlink_message(RTM_NEWRULE, &rule_payload(LINUX_AF_INET));
+        datagram.extend(netlink_message(RTM_DELRULE, &rule_payload(LINUX_AF_INET6)));
+
+        let changes = decode_rtnetlink_datagram(&datagram).unwrap();
+        assert_eq!(changes, NetworkChangeKind::RoutingPolicyChanged.into());
+    }
+
+    #[test]
+    fn decoder_ignores_unknown_valid_messages() {
+        let mut datagram = netlink_message(99, &[1, 2, 3, 4]);
         datagram.extend(netlink_message(99, &[1, 2, 3, 4]));
 
         assert!(decode_rtnetlink_datagram(&datagram).unwrap().is_empty());
@@ -985,6 +1302,46 @@ mod tests {
             decode_rtnetlink_datagram(&netlink_message(RTM_NEWROUTE, &truncated)),
             Err(NetlinkDecodeError::TruncatedAttribute { .. })
         ));
+    }
+
+    #[test]
+    fn malformed_rule_payload_and_attributes_are_rejected() {
+        assert!(matches!(
+            decode_rtnetlink_datagram(&netlink_message(
+                RTM_NEWRULE,
+                &[0; FIB_RULE_HEADER_BYTES - 1]
+            )),
+            Err(NetlinkDecodeError::TruncatedPayload { .. })
+        ));
+
+        let mut invalid_length = vec![0u8; FIB_RULE_HEADER_BYTES];
+        invalid_length.extend_from_slice(&3u16.to_ne_bytes());
+        invalid_length.extend_from_slice(&1u16.to_ne_bytes());
+        assert!(matches!(
+            decode_rtnetlink_datagram(&netlink_message(RTM_DELRULE, &invalid_length)),
+            Err(NetlinkDecodeError::InvalidAttributeLength { .. })
+        ));
+
+        let mut truncated = vec![0u8; FIB_RULE_HEADER_BYTES];
+        truncated.extend_from_slice(&8u16.to_ne_bytes());
+        truncated.extend_from_slice(&1u16.to_ne_bytes());
+        assert!(matches!(
+            decode_rtnetlink_datagram(&netlink_message(RTM_NEWRULE, &truncated)),
+            Err(NetlinkDecodeError::TruncatedAttribute { .. })
+        ));
+    }
+
+    #[test]
+    fn subscription_masks_are_mode_aware_and_exact() {
+        assert_eq!(
+            rtnetlink_subscription_groups(LinuxNetworkEventInterest::Ipv4UnderlayOnly),
+            0x00d1
+        );
+        assert_eq!(
+            rtnetlink_subscription_groups(LinuxNetworkEventInterest::DualStack),
+            0x405d1
+        );
+        assert_eq!(RTMGRP_IPV6_RULE, 0x40000);
     }
 
     #[test]

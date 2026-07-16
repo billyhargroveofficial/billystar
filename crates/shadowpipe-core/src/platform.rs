@@ -153,6 +153,8 @@ pub enum NetworkChangeKind {
     InterfaceSetChanged,
     InterfaceAddressChanged,
     DefaultRouteChanged,
+    RoutingPolicyChanged,
+    OwnedRouteChanged,
     DnsConfigurationChanged,
     ConnectivityChanged,
     Suspend,
