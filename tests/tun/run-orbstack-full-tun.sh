@@ -2430,7 +2430,8 @@ write_full_result() {
       # shellcheck disable=SC2016
       printf -- '- Source/evidence channel: clean live-pushed `main` was pinned by commit-bearing `git archive`; source entered by bounded stdin and sealed evidence returned by validated stdout tar, with no shared checkout\n'
       printf -- '- Scope: synthetic OrbStack Linux IPv4 tunnel plus connected IPv6 OUTPUT-block/netns only; no IPv6 tunnel or L2 claim; field evidence: false\n'
-      printf -- '- Network-change handoff: real c0-to-c1 default-route replacement, strict intermediate lockdown/main-WAL proof, then generation-2 Active adoption through c1 before workloads\n'
+      printf -- '- Network-change handoff: real c0-to-c1 default-route replacement with exact DefaultRouteChanged cause, strict intermediate lockdown/main-WAL proof, then generation-2 Active adoption through c1 before workloads\n'
+      printf -- '- Observer regression: a real promiscuous packet capture toggled IFF_PROMISC without replacing generation 2; evidence captures otherwise used non-promiscuous directional capture\n'
       printf -- '- Carrier/authentication: production REALITY TLS 1.3 URI with X25519 short-id and ML-KEM pin, then mandatory protocol-v3 credential and enrolled allowlist\n'
       printf -- '- Final secret check: guest evidence scanned against stored/raw/hex/base64 variants; all host-added logs scanned against non-reversible fingerprints\n'
       printf -- '- Host safety: exact live sing-box PID/argv/config/executable plus stable routes, DNS and PF config files\n'
@@ -2913,6 +2914,35 @@ with open(output_path, "x", encoding="ascii", newline="\n") as stream:
     )
     stream.write("\n")
 PY
+}
+
+capture_positive_ipv6_drop_counter() {
+  local identity="$1" output="$2" chain listing packets
+  chain="$(jq -er '
+    if type == "object"
+      and keys == ["ipv4_chain", "ipv4_rule_count", "ipv6_chain",
+        "ipv6_rule_count", "owner", "schema_version"]
+      and (.ipv6_chain | type == "string")
+      and (.ipv6_chain | test("^SP6_[0-9a-f]{20}$"))
+    then .ipv6_chain
+    else error("invalid kill-switch identity")
+    end
+  ' "${identity}")" || return 1
+  listing="${output}.listing"
+  ip netns exec "${ns_client}" ip6tables -L "${chain}" -v -n -x \
+    >"${listing}" || return 1
+  packets="$(awk '
+    $3 == "DROP" && $1 ~ /^[0-9]+$/ {
+      count += 1
+      packets = $1
+    }
+    END {
+      if (count != 1 || packets + 0 <= 0) exit 1
+      print packets
+    }
+  ' "${listing}")" || return 1
+  printf 'ipv6_chain=%s\nipv6_drop_packets=%s\n' "${chain}" "${packets}" \
+    >"${output}"
 }
 
 host_main() {
@@ -3524,29 +3554,46 @@ PY
     copy_tree_no_follow "${run_dir}/status.env" "${run_dir}/guest-status.env" \
       || final_status=1
   fi
-  if (( guest_status == 0 )) \
-    && [[ -f "${run_dir}/status.env" && ! -L "${run_dir}/status.env" ]]; then
-    printf 'test_status=valid\ncleanup_status=valid\nscope=synthetic_orbstack_ipv4_tunnel_ipv6_block_netns_only\nfield_evidence=false\n' \
-      >"${host_tmp}/expected-guest-status"
-    if cmp -s -- "${run_dir}/status.env" "${host_tmp}/expected-guest-status" \
-      && (cd -- "${run_dir}" && sha256sum -c checksums.sha256 >/dev/null); then
-      guest_result_valid=1
-      guest_test_status=valid
-      guest_cleanup_status=valid
-    else
-      warn "successful guest published malformed or unsealed evidence"
-      final_status=1
-      guest_test_status=failed
-      guest_cleanup_status=failed
+  local sealed_guest_status=0 parsed_guest_test parsed_guest_cleanup
+  if [[ -f "${run_dir}/status.env" && ! -L "${run_dir}/status.env" ]] \
+    && awk '
+      NR == 1 && $0 !~ /^test_status=(valid|failed)$/ { exit 1 }
+      NR == 2 && $0 !~ /^cleanup_status=(valid|failed)$/ { exit 1 }
+      NR == 3 && $0 != "scope=synthetic_orbstack_ipv4_tunnel_ipv6_block_netns_only" {
+        exit 1
+      }
+      NR == 4 && $0 != "field_evidence=false" { exit 1 }
+      END { if (NR != 4) exit 1 }
+    ' "${run_dir}/status.env" \
+    && (cd -- "${run_dir}" && sha256sum -c checksums.sha256 >/dev/null); then
+    parsed_guest_test="$(source_archive_field \
+      "${run_dir}/status.env" test_status)" || parsed_guest_test=""
+    parsed_guest_cleanup="$(source_archive_field \
+      "${run_dir}/status.env" cleanup_status)" || parsed_guest_cleanup=""
+    if [[ ( "${parsed_guest_test}" == valid \
+          || "${parsed_guest_test}" == failed ) \
+        && ( "${parsed_guest_cleanup}" == valid \
+          || "${parsed_guest_cleanup}" == failed ) \
+        && ( ( "${guest_status}" == 0 \
+              && "${parsed_guest_test}" == valid \
+              && "${parsed_guest_cleanup}" == valid ) \
+          || ( "${guest_status}" != 0 \
+              && ( "${parsed_guest_test}" == failed \
+                || "${parsed_guest_cleanup}" == failed ) ) ) ]]; then
+      sealed_guest_status=1
+      guest_test_status="${parsed_guest_test}"
+      guest_cleanup_status="${parsed_guest_cleanup}"
     fi
-  else
-    if (( guest_status != 0 )); then
-      final_status="${guest_status}"
-    else
-      final_status=1
-    fi
+  fi
+  if (( sealed_guest_status == 0 )); then
+    warn "guest published malformed, inconsistent, or unsealed evidence"
+    final_status=1
     guest_test_status=failed
     guest_cleanup_status=failed
+  elif (( guest_status == 0 )); then
+    guest_result_valid=1
+  else
+    final_status="${guest_status}"
   fi
   capture_git_checkout_proof "${repo_root}" \
     "${host_artifacts}/git-checkout-final" "${pinned_head}" \
@@ -3631,6 +3678,66 @@ proc_starttime() {
   printf '%s\n' "${fields[19]}"
 }
 
+extract_log_suffix() {
+  local log="$1" prior_lines="$2" output="$3"
+  python3 -I -S - "${log}" "${prior_lines}" "${output}" <<'PY'
+import os
+import stat
+import sys
+
+source, prior_text, destination = sys.argv[1:]
+prior = int(prior_text, 10)
+if prior < 0:
+    raise SystemExit("negative log line boundary")
+info = os.lstat(source)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_nlink != 1
+    or info.st_size > 16 * 1024 * 1024
+):
+    raise SystemExit("log suffix source metadata is unsafe")
+with open(source, "r", encoding="utf-8", errors="strict", newline="") as stream:
+    lines = stream.readlines()
+if prior > len(lines):
+    raise SystemExit("log line boundary exceeds the current log")
+with open(destination, "x", encoding="utf-8", newline="") as stream:
+    stream.writelines(lines[prior:])
+PY
+}
+
+validate_exact_network_restart_suffix() {
+  local suffix="$1" expected="$2" output="$3"
+  python3 -I -S - "${suffix}" "${expected}" "${output}" <<'PY'
+import os
+import re
+import stat
+import sys
+
+source, expected, destination = sys.argv[1:]
+if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", expected) is None:
+    raise SystemExit("unsafe expected network restart cause")
+info = os.lstat(source)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_nlink != 1
+    or info.st_size <= 0
+    or info.st_size > 16 * 1024 * 1024
+):
+    raise SystemExit("network restart log suffix metadata is unsafe")
+with open(source, "r", encoding="utf-8", errors="strict", newline="") as stream:
+    text = stream.read()
+causes = re.findall(
+    r"topology changed at network-event generation [1-9][0-9]* \(([^)]*)\)",
+    text,
+)
+if not causes or any(cause != expected for cause in causes):
+    raise SystemExit(f"network restart causes are not exactly {expected}: {causes!r}")
+with open(destination, "x", encoding="ascii", newline="\n") as stream:
+    stream.write(f"network_restart_cause={expected}\n")
+    stream.write(f"cause_occurrences={len(causes)}\n")
+PY
+}
+
 pidfd_signal() {
   local pid="$1" expected_start="$2" signal_name="$3"
   python3 - "${pid}" "${expected_start}" "${signal_name}" <<'PY'
@@ -3645,19 +3752,19 @@ sig = getattr(signal, sys.argv[3])
 try:
     fd = os.pidfd_open(pid)
 except ProcessLookupError:
-    raise SystemExit(0)
+    raise SystemExit(4)
 with os.fdopen(fd):
     try:
         line = open(f"/proc/{pid}/stat", "r", encoding="ascii").read()
     except FileNotFoundError:
-        raise SystemExit(0)
+        raise SystemExit(4)
     fields = line[line.rfind(") ") + 2:].split()
     if len(fields) < 20 or fields[19] != expected:
         raise SystemExit(3)
     try:
         signal.pidfd_send_signal(fd, sig)
     except ProcessLookupError:
-        pass
+        raise SystemExit(4)
 PY
 }
 
@@ -3935,15 +4042,20 @@ write_guest_result() {
     printf -- "- Run: \`%s\`\n" "${guest_run_id}"
     printf -- '- Scope: disposable OrbStack Linux clone, private netns only\n'
     printf -- '- Guest phase: **%s** (not a final host verdict)\n' "${status_word}"
-    printf -- '- IPv6: connected c0/c1 canaries stayed enabled and were blocked at OUTPUT; IPv6 is not tunneled and no L2/ARP/ND claim is made\n'
     printf -- '- macOS host safety: evaluated after guest teardown; see status.env and mac-before/mac-after\n'
     printf -- '- Loaded macOS PF runtime rules: guest does not inspect them; host records either exact read-only state or exact permission-denied scope\n'
-    printf -- '- Carrier/authentication: production REALITY TLS 1.3 exact URI + X25519 short-id + ML-KEM pin, then protocol-v3 credential and enrolled allowlist\n'
-    printf -- '- Active probe: bounded stock-TLS forward-on-fail to a synthetic local cover, with zero inner sessions before authenticated-client start; no wider indistinguishability claim\n'
-    printf -- '- Secret handling: credentials, allowlist, ML-KEM/REALITY identities and synthetic-cover private key stayed in the owned /run work tree and were excluded from evidence\n'
-    printf -- '- Handoff: a real c0-to-c1 default-route replacement forced process generation 1 into a strictly verified durable L3/OUTPUT lockdown, then generation 2 adopted it and activated through c1 before release\n'
-    printf -- '- Shutdown: generation 2 SIGTERM armed the durable L3/OUTPUT restart barrier, followed by explicit release and c1 direct-route restoration\n'
-    printf -- '- Workload gates: foreign persistent named-TUN exclusion, two-generation handoff, ICMP, TCP, UDP, DNS, 64 MiB SHA, cut/recovery, active IPv4/IPv6 leak probes and c0/c1 packet captures\n'
+    if [[ "${status_word}" == VALID_CANDIDATE ]]; then
+      printf -- '- Secret handling: credentials, allowlist, ML-KEM/REALITY identities and synthetic-cover private key stayed in the owned /run work tree and were excluded from evidence\n'
+      printf -- '- IPv6: connected c0/c1 canaries stayed enabled; bound attempts were blocked at OUTPUT and directional captures contained no client-originated IPv6. IPv6 is not tunneled and no inbound/L2/ARP/ND claim is made\n'
+      printf -- '- Carrier/authentication: production REALITY TLS 1.3 exact URI + X25519 short-id + ML-KEM pin, then protocol-v3 credential and enrolled allowlist\n'
+      printf -- '- Active probe: bounded stock-TLS forward-on-fail to a synthetic local cover, with zero inner sessions before authenticated-client start; no wider indistinguishability claim\n'
+      printf -- '- Handoff: a real c0-to-c1 default-route replacement produced the exact DefaultRouteChanged cause, forced generation 1 into a strictly verified durable L3/OUTPUT lockdown, then generation 2 adopted it and activated through c1 before release\n'
+      printf -- '- Observer regression: a real promiscuous packet capture toggled IFF_PROMISC without replacing generation 2\n'
+      printf -- '- Shutdown: a live generation 2 received the manager-gated SIGTERM, armed the durable L3/OUTPUT restart barrier, then explicit release restored c1 direct routing without generation 3\n'
+      printf -- '- Workload gates: foreign persistent named-TUN exclusion, two-generation handoff, ICMP, TCP, UDP, DNS, 64 MiB SHA, cut/recovery, active IPv4/IPv6 leak probes and c0/c1 packet captures\n'
+    else
+      printf -- '- No secret-handling, handoff, shutdown, IPv6, observer-regression, functional-workload, or leak-proof PASS claim is made for this failed guest phase\n'
+    fi
     printf "\n## Test failures\n\n\`\`\`text\n%s\n\`\`\`\n" \
       "${guest_failures:-<none>}"
     printf "\n## Cleanup failures\n\n\`\`\`text\n%s\n\`\`\`\n" \
@@ -5021,7 +5133,7 @@ PY
   fi
 
   local marker payload health source_sha download_sha fp
-  local client_credential client_enrollment client_allowlist client_host_state
+  local client_credential client_enrollment client_allowlist client_host_state main_wal
   local reality_key reality_public reality_short_id reality_short_id_file
   local reality_replay_store reality_replay_stage_marker
   local reality_uri reality_uri_file missing_pin_uri missing_pin_uri_file uri_output
@@ -5030,6 +5142,7 @@ PY
   client_enrollment="${guest_work_dir}/client-enrollment.json"
   client_allowlist="${guest_work_dir}/client-allowlist.json"
   client_host_state="${guest_work_dir}/client-host-state"
+  main_wal="${client_host_state}/host-state-v2.json"
   reality_key="${guest_work_dir}/reality.key"
   reality_short_id_file="${guest_work_dir}/reality-short-ids"
   reality_replay_store="${guest_work_dir}/reality-replay-v1.bin"
@@ -5131,7 +5244,7 @@ PY
   # but before host-state creation, socket I/O, or TUN creation.
   start_owned missing-credential-capture \
     "${guest_result_dir}/missing-credential-capture.log" \
-    ip netns exec "${ns_client}" tcpdump -U -nn -i c0 -w \
+    ip netns exec "${ns_client}" tcpdump -p -Q out -U -nn -i c0 -w \
     "${guest_result_dir}/missing-credential-underlay.pcap" ip
   local missing_credential_capture_record="${LAST_RECORD}"
   sleep 0.25
@@ -5170,7 +5283,7 @@ PY
   # the valid credential. It must still fail before credential/host-state use,
   # socket I/O, and TUN creation.
   start_owned missing-pin-capture "${guest_result_dir}/missing-pin-capture.log" \
-    ip netns exec "${ns_client}" tcpdump -U -nn -i c0 -w \
+    ip netns exec "${ns_client}" tcpdump -p -Q out -U -nn -i c0 -w \
     "${guest_result_dir}/missing-pin-underlay.pcap" ip
   local missing_capture_record="${LAST_RECORD}"
   sleep 0.25
@@ -5243,7 +5356,7 @@ PY
 
   start_owned preexisting-tun-capture \
     "${guest_result_dir}/preexisting-tun-capture.log" \
-    ip netns exec "${ns_client}" tcpdump --immediate-mode -U -nn -i c0 \
+    ip netns exec "${ns_client}" tcpdump -p -Q out --immediate-mode -U -nn -i c0 \
     -w "${guest_result_dir}/preexisting-tun-underlay.pcap" ip
   local collision_capture_record="${LAST_RECORD}"
   sleep 0.25
@@ -5509,17 +5622,17 @@ while True:
 
   start_owned underlay-c0-ipv4-capture \
     "${guest_result_dir}/underlay-c0-ipv4-capture.log" \
-    ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c0 \
+    ip netns exec "${ns_client}" tcpdump -p -Q out -U -nn -s 192 -i c0 \
     -w "${guest_result_dir}/client-c0-ipv4.pcap" ip
   local underlay_c0_ipv4_capture_record="${LAST_RECORD}"
   start_owned underlay-c1-ipv4-capture \
     "${guest_result_dir}/underlay-c1-ipv4-capture.log" \
-    ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c1 \
+    ip netns exec "${ns_client}" tcpdump -p -Q out -U -nn -s 192 -i c1 \
     -w "${guest_result_dir}/client-c1-ipv4.pcap" ip
   local underlay_c1_ipv4_capture_record="${LAST_RECORD}"
   local underlay_c0_ipv6_capture_record underlay_c1_ipv6_capture_record
   start_owned sink-capture "${guest_result_dir}/sink-capture.log" \
-    ip netns exec "${ns_sink}" tcpdump -U -nn -s 192 -i i0 \
+    ip netns exec "${ns_sink}" tcpdump -p -Q in -U -nn -s 192 -i i0 \
     -w "${guest_result_dir}/sink-inner.pcap" \
     'src host 10.8.0.2 and (icmp or (tcp dst port 18080 and (tcp[tcpflags] & tcp-syn != 0)) or udp dst port 5201 or udp dst port 53)'
   local sink_capture_record="${LAST_RECORD}"
@@ -5732,6 +5845,9 @@ with os.fdopen(descriptor):
     "${guest_result_dir}/client-ip6tables-generation-1-active.txt" \
     "${guest_result_dir}/generation-1-active-killswitch-identity.json" \
     || die 1 "generation-1 kill-switch differs from the exact fail-closed contract"
+  strict_active_main_wal_snapshot "${main_wal}" "${real_client_pid}" \
+    "${client_pid}" c0 "${guest_result_dir}/generation-1-main-wal-active" \
+    || die 1 "generation-1 main WAL failed strict Active/c0 proof"
   require_ipv6_canary_state_unchanged generation-1-active \
     || die 1 "generation-1 activation changed the connected IPv6 canary state"
 
@@ -5739,12 +5855,12 @@ with os.fdopen(descriptor):
   # pre-policy ND/MLD/RS traffic cannot be mislabeled as a Shadowpipe leak.
   start_owned underlay-c0-ipv6-capture \
     "${guest_result_dir}/underlay-c0-ipv6-capture.log" \
-    ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c0 \
+    ip netns exec "${ns_client}" tcpdump -p -Q out -U -nn -s 192 -i c0 \
     -w "${guest_result_dir}/client-c0-ipv6.pcap" ip6
   underlay_c0_ipv6_capture_record="${LAST_RECORD}"
   start_owned underlay-c1-ipv6-capture \
     "${guest_result_dir}/underlay-c1-ipv6-capture.log" \
-    ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c1 \
+    ip netns exec "${ns_client}" tcpdump -p -Q out -U -nn -s 192 -i c1 \
     -w "${guest_result_dir}/client-c1-ipv6.pcap" ip6
   underlay_c1_ipv6_capture_record="${LAST_RECORD}"
 
@@ -5778,6 +5894,10 @@ with os.fdopen(descriptor):
   # state. Generation 2 is deliberately gated so the exact intermediate state
   # can be inspected before the retained wrapper emulates systemd restart.
   probe_direct_canaries_blocked "generation-1-active"
+  capture_positive_ipv6_drop_counter \
+    "${guest_result_dir}/generation-1-active-killswitch-identity.json" \
+    "${guest_result_dir}/generation-1-ipv6-drop-counter.env" \
+    || die 1 "generation-1 IPv6 block attempts did not hit the exact DROP rule"
   local generation_one_pid="${real_client_pid}"
   local generation_one_starttime="${real_client_starttime}"
   local generation_one_session_count
@@ -5791,6 +5911,21 @@ with os.fdopen(descriptor):
   handoff_c1_ipv4_before="$(direct_canary_result_count "${canary_c1_ipv4_log}")"
   handoff_c0_ipv6_before="$(direct_canary_result_count "${canary_c0_ipv6_log}")"
   handoff_c1_ipv6_before="$(direct_canary_result_count "${canary_c1_ipv6_log}")"
+  local current_generation_one_start handoff_log_lines_before
+  local handoff_mutation_realtime_ns
+  current_generation_one_start="$(proc_starttime "${generation_one_pid}")" \
+    || die 1 "generation 1 exited before the default-route mutation"
+  [[ "${current_generation_one_start}" == "${generation_one_starttime}" ]] \
+    || die 1 "generation-1 PID identity changed before the default-route mutation"
+  [[ ! -e "${guest_work_dir}/client-generation-1-stopped.ready" \
+    && ! -L "${guest_work_dir}/client-generation-1-stopped.ready" ]] \
+    || die 1 "generation 1 had already stopped before the default-route mutation"
+  ip -n "${ns_client}" link show sptunc >/dev/null 2>&1 \
+    || die 1 "generation-1 TUN disappeared before the default-route mutation"
+  handoff_log_lines_before="$(wc -l <"${guest_result_dir}/client.log")"
+  [[ "${handoff_log_lines_before}" =~ ^[0-9]+$ ]] \
+    || die 1 "could not bind the pre-handoff client log boundary"
+  handoff_mutation_realtime_ns="$(date +%s%N)"
   ip -n "${ns_client}" route replace default via 10.233.0.1 dev c1
   ip -n "${ns_client}" route show \
     >"${guest_result_dir}/client-routes-after-default-replacement.txt"
@@ -5810,15 +5945,26 @@ with os.fdopen(descriptor):
     && "${generation_one_status}" != 137 \
     && "${generation_one_status}" != 143 ]] \
     || die 1 "generation-1 network restart did not return a bounded non-zero status"
+  extract_log_suffix "${guest_result_dir}/client.log" \
+    "${handoff_log_lines_before}" \
+    "${guest_result_dir}/generation-1-network-restart.log" \
+    || die 1 "could not extract the generation-1 post-route log suffix"
+  validate_exact_network_restart_suffix \
+    "${guest_result_dir}/generation-1-network-restart.log" \
+    DefaultRouteChanged \
+    "${guest_result_dir}/generation-1-network-restart.env" \
+    || die 1 "generation 1 was not replaced by the exact default-route event"
+  printf 'route_replace_realtime_ns=%s\n' "${handoff_mutation_realtime_ns}" \
+    >"${guest_result_dir}/network-handoff-timing.env"
   grep -q \
     'network topology invalidated the captured underlay; replacing this process under durable lockdown' \
-    "${guest_result_dir}/client.log" \
+    "${guest_result_dir}/generation-1-network-restart.log" \
     || die 1 "generation 1 did not log topology-driven replacement"
   grep -q 'durable restart lockdown active before main host-state teardown' \
-    "${guest_result_dir}/client.log" \
+    "${guest_result_dir}/generation-1-network-restart.log" \
     || die 1 "generation 1 did not log strict restart-lockdown activation"
   if grep -Eq 'Conflict journal|journal.*Conflict|sealed.*Conflict' \
-    "${guest_result_dir}/client.log"; then
+    "${guest_result_dir}/generation-1-network-restart.log"; then
     die 1 "ordinary network handoff was incorrectly sealed as Conflict"
   fi
   if ip -n "${ns_client}" link show sptunc >/dev/null 2>&1; then
@@ -5844,7 +5990,6 @@ with os.fdopen(descriptor):
     || die 1 "generation-1 mount-private resolver was not restored"
 
   local lockdown_wal="${client_host_state}/handoff-lockdown-v1.json"
-  local main_wal="${client_host_state}/host-state-v2.json"
   [[ ! -e "${main_wal}" && ! -L "${main_wal}" ]] \
     || die 1 "complete network handoff retained a main host-state WAL"
   local handoff_lockdown_table handoff_lockdown_handle
@@ -5936,6 +6081,10 @@ with os.fdopen(descriptor):
   nsenter -t "${client_pid}" -m -n -- grep -q '^nameserver 198.18.0.2$' \
     /etc/resolv.conf || die 1 "generation-2 mount-private resolver was not pinned"
   probe_direct_canaries_blocked "generation-2-active"
+  capture_positive_ipv6_drop_counter \
+    "${guest_result_dir}/generation-2-active-killswitch-identity.json" \
+    "${guest_result_dir}/generation-2-ipv6-drop-counter.env" \
+    || die 1 "generation-2 IPv6 block attempts did not hit the exact DROP rule"
   wait_until 5 direct_canary_count_exceeds \
     "${canary_c0_ipv4_log}" "${handoff_c0_ipv4_before}" \
     || die 1 "c0 IPv4 canary attempts did not span the network handoff"
@@ -5958,6 +6107,7 @@ with os.fdopen(descriptor):
     printf 'generation_1_pid=%s\n' "${generation_one_pid}"
     printf 'generation_1_start_ticks=%s\n' "${generation_one_starttime}"
     printf 'generation_1_exit_status=%s\n' "${generation_one_status}"
+    printf 'generation_1_restart_cause=DefaultRouteChanged\n'
     printf 'default_route_transition=c0_to_c1\n'
     printf 'intermediate_main_wal=absent\n'
     printf 'intermediate_lockdown=active_strict\n'
@@ -5988,13 +6138,73 @@ with os.fdopen(descriptor):
       "${handoff_c1_ipv6_after}"
   } >"${guest_result_dir}/network-handoff.env"
 
+  # Production regression: a real packet observer may still request
+  # PACKET_MR_PROMISC. Linux emits RTM_NEWLINK with exact
+  # ifi_change=IFF_PROMISC on both refcount transitions; those observer-only
+  # notifications must not replace an otherwise unchanged client generation.
+  local promisc_restart_count_before promisc_restart_count_after
+  local promisc_current_start
+  promisc_restart_count_before="$(awk '
+    /topology changed at network-event generation/ { count += 1 }
+    END { print count + 0 }
+  ' "${guest_result_dir}/client.log")"
+  start_owned promisc-observer-regression-capture \
+    "${guest_result_dir}/promisc-observer-regression-capture.log" \
+    ip netns exec "${ns_client}" tcpdump -Q out --immediate-mode -U -nn \
+    -s 96 -i c1 -w \
+    "${guest_result_dir}/promisc-observer-regression.pcap" \
+    'host 10.232.0.2 and tcp port 47843'
+  local promisc_observer_record="${LAST_RECORD}"
+  sleep 0.5
+  ip -d -s -n "${ns_client}" link show dev c1 \
+    >"${guest_result_dir}/promisc-observer-link-active.txt"
+  grep -Eq 'promiscuity [1-9][0-9]*' \
+    "${guest_result_dir}/promisc-observer-link-active.txt" \
+    || die 1 "packet observer did not prove an active promiscuity refcount"
+  stop_role_record "${promisc_observer_record}" \
+    || die 1 "could not stop the promiscuous-observer regression capture"
+  validate_pcap_file "${guest_result_dir}/promisc-observer-regression.pcap" \
+    || die 1 "promiscuous-observer regression pcap is malformed"
+  capture_has_zero_kernel_drops \
+    "${guest_result_dir}/promisc-observer-regression-capture.log" \
+    || die 1 "promiscuous-observer regression capture dropped packets"
+  sleep 0.5
+  ip -d -s -n "${ns_client}" link show dev c1 \
+    >"${guest_result_dir}/promisc-observer-link-restored.txt"
+  grep -Eq 'promiscuity 0([[:space:]]|$)' \
+    "${guest_result_dir}/promisc-observer-link-restored.txt" \
+    || die 1 "packet observer left a promiscuity refcount behind"
+  promisc_current_start="$(proc_starttime "${real_client_pid}")" \
+    || die 1 "promiscuous packet observer replaced generation 2"
+  [[ "${promisc_current_start}" == "${real_client_starttime}" ]] \
+    || die 1 "promiscuous packet observer changed generation-2 PID identity"
+  [[ ! -e "${guest_work_dir}/client-generation-2-stopped.ready" \
+    && ! -L "${guest_work_dir}/client-generation-2-stopped.ready" ]] \
+    || die 1 "promiscuous packet observer stopped generation 2"
+  promisc_restart_count_after="$(awk '
+    /topology changed at network-event generation/ { count += 1 }
+    END { print count + 0 }
+  ' "${guest_result_dir}/client.log")"
+  [[ "${promisc_restart_count_after}" == "${promisc_restart_count_before}" ]] \
+    || die 1 "promiscuous packet observer produced a topology restart"
+  {
+    printf 'packet_membership=promiscuous\n'
+    printf 'client_pid=%s\n' "${real_client_pid}"
+    printf 'client_start_ticks=%s\n' "${real_client_starttime}"
+    printf 'topology_restart_count_before=%s\n' \
+      "${promisc_restart_count_before}"
+    printf 'topology_restart_count_after=%s\n' \
+      "${promisc_restart_count_after}"
+    printf 'client_generation_unchanged=true\n'
+  } >"${guest_result_dir}/promisc-observer-regression.env"
+
   # Keep confidentiality evidence separate from the negative leak BPF. This
   # bounded capture must contain the allowed carrier tuple, must not drop any
   # packets, and must not expose the known application payload in wire bytes.
   # It is a regression heuristic, not a substitute for AEAD security analysis.
   start_owned carrier-marker-capture \
     "${guest_result_dir}/carrier-marker-capture.log" \
-    ip netns exec "${ns_client}" tcpdump --immediate-mode -U -nn -s 0 -i c1 \
+    ip netns exec "${ns_client}" tcpdump -p -Q out --immediate-mode -U -nn -s 0 -i c1 \
     -w "${guest_result_dir}/carrier-marker.pcap" \
     'host 10.232.0.2 and tcp port 47843'
   local marker_capture_record="${LAST_RECORD}"
@@ -6130,6 +6340,17 @@ EOF
   # published before the exact child receives SIGTERM. The namespace holder
   # remains alive for strict lockdown inspection and explicit release, but the
   # restart supervisor may not create a generation 3.
+  local manager_stop_log_lines_before manager_stop_current_start
+  manager_stop_current_start="$(proc_starttime "${real_client_pid}")" \
+    || die 1 "generation 2 exited before the manager-stop transition"
+  [[ "${manager_stop_current_start}" == "${real_client_starttime}" ]] \
+    || die 1 "generation-2 PID identity changed before manager stop"
+  [[ ! -e "${guest_work_dir}/client-generation-2-stopped.ready" \
+    && ! -L "${guest_work_dir}/client-generation-2-stopped.ready" ]] \
+    || die 1 "generation 2 had already stopped before manager stop"
+  manager_stop_log_lines_before="$(wc -l <"${guest_result_dir}/client.log")"
+  [[ "${manager_stop_log_lines_before}" =~ ^[0-9]+$ ]] \
+    || die 1 "could not bind the pre-manager-stop client log boundary"
   create_empty_private_regular_file "${guest_work_dir}/manager-stop" \
     || die 1 "could not publish the manager no-restart gate"
   [[ -f "${guest_work_dir}/manager-stop" \
@@ -6158,12 +6379,20 @@ EOF
     || die 1 "namespace holder did not remain alive after manager stop"
   grep -qx '0' "${guest_work_dir}/client-exit-status" \
     || record_failure "client returned a non-zero status after graceful SIGTERM"
+  extract_log_suffix "${guest_result_dir}/client.log" \
+    "${manager_stop_log_lines_before}" \
+    "${guest_result_dir}/generation-2-manager-stop.log" \
+    || die 1 "could not extract the generation-2 manager-stop log suffix"
   grep -q 'shutdown requested; restoring routes, DNS and firewall' \
-    "${guest_result_dir}/client.log" \
+    "${guest_result_dir}/generation-2-manager-stop.log" \
     || record_failure "client did not log ordered SIGTERM teardown"
   grep -q 'durable restart lockdown active before main host-state teardown' \
-    "${guest_result_dir}/client.log" \
+    "${guest_result_dir}/generation-2-manager-stop.log" \
     || record_failure "client did not log the durable restart barrier handoff"
+  if grep -q 'topology changed at network-event generation' \
+    "${guest_result_dir}/generation-2-manager-stop.log"; then
+    record_failure "manager stop was contaminated by a topology restart"
+  fi
   if ip -n "${ns_client}" link show sptunc >/dev/null 2>&1; then
     record_failure "client TUN remained after graceful stop"
   fi
@@ -6307,7 +6536,7 @@ EOF
   # packet on the client underlay; this is deliberately not an L2/ARP claim.
   start_owned restart-lockdown-capture \
     "${guest_result_dir}/restart-lockdown-capture.log" \
-    ip netns exec "${ns_client}" tcpdump -U -nn -i c0 -w \
+    ip netns exec "${ns_client}" tcpdump -p -Q out -U -nn -i c0 -w \
     "${guest_result_dir}/restart-lockdown-underlay.pcap" \
     'ip and host 10.231.0.1 and tcp port 18081'
   local restart_lockdown_capture_record="${LAST_RECORD}"
@@ -6608,6 +6837,31 @@ PY
     || die 1 "self-test rejected a valid empty pcap"
   if validate_pcap_file "${temporary}/truncated.pcap" 2>/dev/null; then
     die 1 "self-test accepted a truncated pcap"
+  fi
+
+  printf '%s\n' \
+    baseline-one \
+    baseline-two \
+    'topology changed at network-event generation 7 (DefaultRouteChanged)' \
+    'topology changed at network-event generation 7 (DefaultRouteChanged)' \
+    >"${temporary}/client.log"
+  extract_log_suffix "${temporary}/client.log" 2 \
+    "${temporary}/network-restart.log" \
+    || die 1 "self-test could not extract a bounded log suffix"
+  validate_exact_network_restart_suffix \
+    "${temporary}/network-restart.log" DefaultRouteChanged \
+    "${temporary}/network-restart.env" \
+    || die 1 "self-test rejected an exact default-route restart suffix"
+  [[ "$(<"${temporary}/network-restart.env")" \
+    == $'network_restart_cause=DefaultRouteChanged\ncause_occurrences=2' ]] \
+    || die 1 "self-test normalized the exact network restart cause incorrectly"
+  printf '%s\n' \
+    'topology changed at network-event generation 8 (InterfaceSetChanged, DefaultRouteChanged)' \
+    >"${temporary}/mixed-network-restart.log"
+  if validate_exact_network_restart_suffix \
+    "${temporary}/mixed-network-restart.log" DefaultRouteChanged \
+    "${temporary}/mixed-network-restart.env" 2>/dev/null; then
+    die 1 "self-test accepted a mixed network restart cause"
   fi
 
   ln -s target "${temporary}/readlink-ok"
