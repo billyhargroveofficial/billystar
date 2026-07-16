@@ -1653,7 +1653,10 @@ def run(arguments):
     return result.stdout.decode("utf-8")
 
 def properties():
-    output = run(["systemctl", "show", unit, *[f"--property={name}" for name in property_names]])
+    output = run([
+        "systemctl", "show", "--all", unit,
+        *[f"--property={name}" for name in property_names],
+    ])
     values = {}
     for line in output.splitlines():
         if "=" not in line:
@@ -1724,7 +1727,7 @@ print(json.dumps(proof, sort_keys=True, separators=(",", ":")))
 capture_client_unit_status() {
   local clone_id="$1" output="$2"
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${output}" \
-    orb -m "${clone_id}" -u root env LC_ALL=C systemctl show \
+    orb -m "${clone_id}" -u root env LC_ALL=C systemctl show --all \
     shadowpipe-client-full-tunnel.service \
     -p LoadState -p FragmentPath -p UnitFileState -p ActiveState -p SubState \
     -p Result -p ExecMainCode -p ExecMainStatus -p NRestarts -p MainPID \
@@ -4258,7 +4261,7 @@ PY
 capture_effective_unit_definition() {
   local clone_id="$1" unit="$2" output="$3"
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${output}" \
-    orb -m "${clone_id}" -u root env LC_ALL=C systemctl show "${unit}" \
+    orb -m "${clone_id}" -u root env LC_ALL=C systemctl show --all "${unit}" \
     -p LoadState -p FragmentPath -p DropInPaths -p ExecCondition \
     -p ExecStartPre -p ExecStart -p ExecStartPost -p EnvironmentFiles
 }
@@ -4619,6 +4622,31 @@ print(f"cleanup_context_names={len(protected)}")
 PY
 }
 
+verify_systemctl_show_all_contract() {
+  local source="$1"
+  python3 -I -S - "${source}" <<'PY'
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    source = stream.read()
+start_marker = "\nverify_systemctl_show_all_contract() {\n"
+end_marker = "\nmain() {\n"
+if source.count(start_marker) != 1 or source.count(end_marker) != 1:
+    raise SystemExit("could not isolate systemctl collector contract")
+before, remainder = source.split(start_marker, 1)
+_, after = remainder.split(end_marker, 1)
+audited = before + end_marker + after
+shell_collectors = audited.count("systemctl show --all")
+embedded_collectors = audited.count('"systemctl", "show", "--all"')
+if shell_collectors != 4 or embedded_collectors != 1:
+    raise SystemExit(
+        "exact-census systemctl collectors do not all retain --all"
+    )
+print("systemctl_show_all_shell_collectors=4")
+print("systemctl_show_all_embedded_collectors=1")
+PY
+}
+
 main() {
   [[ "$(uname -s)" == Darwin ]] \
     || die "${EX_USAGE}" 'host mode must run on macOS'
@@ -4654,6 +4682,10 @@ main() {
     "${script_dir}/run-orbstack-reboot.sh" \
     || die "${EX_UNAVAILABLE}" \
       'cleanup context is not process-global in the real main function'
+  verify_systemctl_show_all_contract \
+    "${script_dir}/run-orbstack-reboot.sh" \
+    || die "${EX_UNAVAILABLE}" \
+      'exact-census systemctl collectors must retain --all'
   repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
   results_root="${script_dir}/results"
   [[ ! -L "${results_root}" ]] \
@@ -5408,7 +5440,7 @@ main() {
     orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl is-enabled \
     shadowpipe-lockdown-restore.service
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/systemd-restore-status.txt" \
-    orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl show \
+    orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl show --all \
     shadowpipe-lockdown-restore.service \
     -p LoadState -p UnitFileState -p ActiveState -p SubState -p Result \
     -p ExecMainCode -p ExecMainStatus -p NRestarts \
@@ -5418,7 +5450,8 @@ main() {
     -p ExecCondition -p ExecStartPre -p ExecStart -p ExecStartPost \
     -p EnvironmentFiles
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/systemd-networkd-status.txt" \
-    orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl show systemd-networkd.service \
+    orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl show --all \
+    systemd-networkd.service \
     -p LoadState -p ActiveState -p SubState \
     -p ExecMainStartTimestampMonotonic -p InactiveExitTimestampMonotonic \
     -p InvocationID -p NRestarts -p After -p Requires
@@ -5788,6 +5821,12 @@ run_self_test() (
     "${temporary}/cleanup-context-contract.env"
   grep -qx 'cleanup_context_names=29' \
     "${temporary}/cleanup-context-contract.env"
+  verify_systemctl_show_all_contract "${self_source}" \
+    >"${temporary}/systemctl-show-all-contract.env"
+  grep -qx 'systemctl_show_all_shell_collectors=4' \
+    "${temporary}/systemctl-show-all-contract.env"
+  grep -qx 'systemctl_show_all_embedded_collectors=1' \
+    "${temporary}/systemctl-show-all-contract.env"
 
   normalizer="$(cd -- "$(dirname -- "${self_source}")" && pwd -P)/normalize-built-artifact.py"
   [[ -f "${normalizer}" && ! -L "${normalizer}" ]] \
