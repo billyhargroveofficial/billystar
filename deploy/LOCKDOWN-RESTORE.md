@@ -16,6 +16,42 @@ infinite start-limit interval prevents old attempts aging out); exhaustion
 isolates `emergency.target`.
 Manual stop is refused and there is intentionally no `ExecStop`.
 
+## Hardening envelope
+
+Both units retain the real host mount and network namespaces because the
+same-boot WAL adoption proof records those namespace identities. Consequently,
+mount-namespace controls such as `ProtectSystem=`, `PrivateTmp=`,
+`PrivateDevices=`, `ProtectHome=`, and `ReadWritePaths=` are deliberately not
+used. Adding one of them without redesigning the ownership proof can make the
+main client refuse a lockdown created by the early-boot restorer.
+
+The units instead use controls that preserve those two namespace identities:
+
+- a private kernel keyring;
+- a closed device cgroup; the long-running client receives only
+  `/dev/net/tun`, while the restore oneshot receives no additional device;
+- a seccomp deny-list for clock mutation, debugging, keyring, kernel-module,
+  mount, raw-I/O, reboot, swap, and obsolete syscall classes;
+- no core dumps, bounded file descriptors, tasks, memory, swap, and journal
+  rate;
+- the existing address-family, capability, namespace-creation, realtime,
+  setuid/setgid, personality, and writable-executable-memory restrictions.
+
+The client limits are 65,536 descriptors, 512 tasks, a 768 MiB memory-high
+threshold, 1 GiB hard memory ceiling, and 256 MiB swap ceiling. The bounded
+restore operation uses 1,024 descriptors, 64 tasks, 192 MiB memory-high,
+256 MiB memory-max, and 64 MiB swap-max. Treat an OOM or resource-limit
+failure as a deployment fault: the restart policy remains fail-closed, but the
+host may stay behind the lockdown until the capacity/configuration issue is
+fixed from its console. These limits are conservative defaults, not performance
+  claims; change them only with measured workload evidence and preserve finite
+ceilings.
+
+`PrivateIPC=yes` is intentionally absent too. Although it sounds independent,
+systemd also creates a mount namespace for it so `/dev/mqueue` can follow the
+private IPC namespace. That would change the identity recorded by the WAL just
+like the explicit mount-isolation controls above.
+
 Install the files first, without enabling or starting either service:
 
 ```sh
@@ -170,6 +206,7 @@ Before deployment, verify the real boot graph:
 
 ```sh
 sudo systemd-analyze verify /etc/systemd/system/shadowpipe-lockdown-restore.service
+sudo systemd-analyze verify /etc/systemd/system/shadowpipe-client-full-tunnel.service
 systemctl list-dependencies --reverse shadowpipe-lockdown-restore.service
 systemd-analyze critical-chain network-pre.target
 systemctl is-enabled nftables firewalld ufw iptables ip6tables 2>/dev/null || true

@@ -60,4 +60,68 @@ grep -q -- '--kill-switch' examples/connect-client.sh \
 grep -q -- '--dns' examples/connect-client.sh \
   || fail "connect-client: tunnel DNS pin is not enabled"
 
+# 5. The paired Linux units preserve the host mount/network namespace identity
+# required by WAL adoption while bounding every independent privilege/resource
+# surface. This is a static render check; Linux systemd-analyze and VM runtime
+# validation remain deployment gates.
+CLIENT_UNIT=deploy/shadowpipe-client-full-tunnel.service
+RESTORE_UNIT=deploy/shadowpipe-lockdown-restore.service
+
+require_unit_line() {
+  local unit=$1 line=$2
+  grep -Fqx -- "$line" "$unit" \
+    || fail "$unit: missing exact hardening directive: $line"
+}
+
+reject_unit_key() {
+  local unit=$1 key=$2
+  if grep -Eq "^[[:space:]]*${key}=" "$unit"; then
+    fail "$unit: $key would change the WAL-bound mount/network namespace model"
+  fi
+}
+
+for unit in "$CLIENT_UNIT" "$RESTORE_UNIT"; do
+  require_unit_line "$unit" 'LimitCORE=0'
+  require_unit_line "$unit" 'NoNewPrivileges=yes'
+  require_unit_line "$unit" 'DevicePolicy=closed'
+  require_unit_line "$unit" 'KeyringMode=private'
+  require_unit_line "$unit" 'RestrictNamespaces=yes'
+  require_unit_line "$unit" 'RestrictRealtime=yes'
+  require_unit_line "$unit" 'RestrictSUIDSGID=yes'
+  require_unit_line "$unit" 'LockPersonality=yes'
+  require_unit_line "$unit" 'MemoryDenyWriteExecute=yes'
+  require_unit_line "$unit" 'SystemCallArchitectures=native'
+  require_unit_line "$unit" 'SystemCallErrorNumber=EPERM'
+  require_unit_line "$unit" \
+    'SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @raw-io @reboot @swap'
+
+  for key in PrivateMounts PrivateTmp PrivateDevices ProtectSystem ProtectHome \
+    ReadWritePaths ReadOnlyPaths InaccessiblePaths PrivateIPC; do
+    reject_unit_key "$unit" "$key"
+  done
+done
+
+require_unit_line "$CLIENT_UNIT" 'StateDirectory=shadowpipe'
+require_unit_line "$CLIENT_UNIT" 'StateDirectoryMode=0700'
+require_unit_line "$CLIENT_UNIT" 'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER'
+require_unit_line "$CLIENT_UNIT" 'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER'
+require_unit_line "$CLIENT_UNIT" 'DeviceAllow=/dev/net/tun rw'
+require_unit_line "$CLIENT_UNIT" 'RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET'
+require_unit_line "$CLIENT_UNIT" 'LimitNOFILE=65536'
+require_unit_line "$CLIENT_UNIT" 'TasksMax=512'
+require_unit_line "$CLIENT_UNIT" 'MemoryHigh=768M'
+require_unit_line "$CLIENT_UNIT" 'MemoryMax=1G'
+require_unit_line "$CLIENT_UNIT" 'MemorySwapMax=256M'
+
+require_unit_line "$RESTORE_UNIT" 'CapabilityBoundingSet=CAP_NET_ADMIN'
+require_unit_line "$RESTORE_UNIT" 'AmbientCapabilities=CAP_NET_ADMIN'
+require_unit_line "$RESTORE_UNIT" 'RestrictAddressFamilies=AF_UNIX AF_NETLINK'
+require_unit_line "$RESTORE_UNIT" 'LimitNOFILE=1024'
+require_unit_line "$RESTORE_UNIT" 'TasksMax=64'
+require_unit_line "$RESTORE_UNIT" 'MemoryHigh=192M'
+require_unit_line "$RESTORE_UNIT" 'MemoryMax=256M'
+require_unit_line "$RESTORE_UNIT" 'MemorySwapMax=64M'
+grep -Eq '^[[:space:]]*DeviceAllow=' "$RESTORE_UNIT" \
+  && fail "$RESTORE_UNIT: restore oneshot must not receive any extra device"
+
 echo "OK: deploy scripts render mandatory-v3 REALITY + enrollment gates"

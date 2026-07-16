@@ -12,6 +12,8 @@ Type=exec
 User=root
 Group=root
 UMask=0077
+StateDirectory=shadowpipe
+StateDirectoryMode=0700
 EnvironmentFile=/etc/shadowpipe/client.env
 ExecStart=/usr/local/bin/shadowpipe-client $SHADOWPIPE_CLIENT_ARGS
 Restart=always
@@ -19,9 +21,20 @@ RestartSec=1s
 KillSignal=SIGTERM
 TimeoutStopSec=90s
 KillMode=control-group
+LimitCORE=0
+LimitNOFILE=65536
+TasksMax=512
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=256M
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+KeyringMode=private
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -29,10 +42,13 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @raw-io @reboot @swap
 
 # As with the early-boot unit, do not add mount-namespace hardening: the two
 # durable WALs deliberately bind same-boot adoption to the host mount and
-# network namespaces.
+# network namespaces. DevicePolicy, KeyringMode, seccomp and cgroup limits above
+# do not give the process a different mount or network namespace.
 
 [Install]
 WantedBy=multi-user.target
