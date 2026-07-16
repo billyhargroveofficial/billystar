@@ -5,9 +5,10 @@ umask 077
 # Privileged Phase-3 crash/recovery laboratory.
 #
 # Host mode is read-only with respect to macOS networking. It snapshots the
-# live route/DNS/PF/sing-box identity, clones only a stopped OrbStack `arch`,
-# runs the destructive phase in the clone, destroys the clone, then proves the
-# stable host snapshot is unchanged.
+# live route/DNS/PF/sing-box identity, clones only a stopped dedicated isolated
+# OrbStack base, streams one pinned source archive into the clone, runs the
+# destructive phase entirely in guest-local storage, destroys the clone, then
+# proves the stable host snapshot is unchanged.
 #
 # Guest scenarios run in fresh private network+mount+PID namespaces. `/run` is
 # a namespace-private tmpfs, so DNS exchange never targets the clone's real
@@ -17,7 +18,7 @@ umask 077
 readonly EX_USAGE=64
 readonly EX_UNAVAILABLE=69
 readonly EX_NOPERM=77
-readonly SOURCE_DEFAULT=arch
+readonly SOURCE_DEFAULT=shadowpipe-lab-base
 readonly HELPER_NAME=phase3_recovery_lab
 readonly EXPECTED_RECOVERY_STEPS=8
 readonly STATUS_SCHEMA_VERSION=2
@@ -32,9 +33,18 @@ readonly ORB_DELETE_TIMEOUT_SECONDS=300
 readonly ORB_COMMAND_TIMEOUT_SECONDS=120
 readonly ORB_BUILD_TIMEOUT_SECONDS=1800
 readonly ORB_GUEST_TIMEOUT_SECONDS=2400
+readonly SOURCE_TRANSFER_TIMEOUT_SECONDS=300
+readonly EVIDENCE_TRANSFER_TIMEOUT_SECONDS=300
 readonly FILE_CLEANUP_TIMEOUT_SECONDS=180
 readonly CLONE_QUIESCENCE_SAMPLES=60
 readonly CLONE_QUIESCENCE_REQUIRED_STABLE=4
+readonly MAX_SOURCE_ARCHIVE_BYTES=$((64 * 1024 * 1024))
+readonly MAX_SOURCE_EXPANDED_BYTES=$((128 * 1024 * 1024))
+readonly MAX_EVIDENCE_ARCHIVE_BYTES=$((64 * 1024 * 1024))
+readonly MAX_EVIDENCE_BYTES=$((64 * 1024 * 1024))
+readonly MAX_ARCHIVE_MEMBERS=20000
+readonly RECORDED_STDOUT_MAX_BYTES=$((8 * 1024 * 1024))
+readonly RECORDED_STDERR_MAX_BYTES=$((1024 * 1024))
 readonly GUEST_OWNER_DIRECTORY=/var/lib/shadowpipe-phase3-lab
 readonly PARENT_NETNS_FD=7
 readonly PARENT_MNTNS_FD=8
@@ -56,13 +66,22 @@ die() {
 usage() {
   cat <<'EOF'
 Usage (macOS host):
-  SHADOWPIPE_DISPOSABLE_PHASE3=1 tests/host-recovery/run-orbstack-phase3.sh [arch]
+  SHADOWPIPE_DISPOSABLE_PHASE3=1 \
+    tests/host-recovery/run-orbstack-phase3.sh [shadowpipe-lab-base]
 
 Pure, non-privileged runner checks:
   tests/host-recovery/run-orbstack-phase3.sh --self-test
 
-The source VM must exist and be stopped. It is never started or modified; the
-script creates a uniquely named clone, runs the lab there, then deletes it.
+The dedicated source VM must exist and be stopped. Its OrbStack record and every
+clone must prove isolated=true, isolate_network=true, disabled SSH-agent
+forwarding, zero HTTP/HTTPS forwarding ports, and no mounts/port forwards. The
+source is never started or modified; a uniquely named clone is deleted after the
+lab.
+
+The repository must be clean pushed main. A commit-bearing git archive is
+streamed by bounded stdin into guest-local storage. No shared checkout, orb -p,
+orb -w, host target path, /mnt/mac, SSH agent, or working mac command channel is
+accepted. Sealed guest evidence returns through a bounded validated stdout tar.
 
 Safety boundary: one shared lock serializes all Shadowpipe OrbStack lifecycle
 runners, but an unrelated same-host operator must not create, rename, start,
@@ -92,6 +111,10 @@ value = int(text, 16 if text.startswith("0x") else 10)
 if not 0 <= value <= 0xFFFFFFFF:
     raise SystemExit("SHADOWPIPE_MAGIC exceeds u32")
 PY
+}
+
+validate_owner_token() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
 }
 
 run_bounded() {
@@ -187,6 +210,154 @@ raise SystemExit(status if status >= 0 else 128 - status)
 PY
 }
 
+file_size_bytes() {
+  local path="$1" size
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  size="$(LC_ALL=C wc -c <"${path}" | tr -d '[:space:]')" || return 1
+  [[ "${size}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${size}"
+}
+
+scan_owner_token_absent() {
+  local token="$1"
+  shift
+  validate_owner_token "${token}" || return 1
+  (( $# > 0 )) || return 1
+  /usr/bin/python3 -I -S - "${token}" "$@" <<'PY'
+import os
+import stat
+import sys
+
+needle = sys.argv[1].encode("ascii")
+roots = sys.argv[2:]
+paths = []
+for root in roots:
+    info = os.lstat(root)
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink != 1:
+            raise SystemExit("token-scan input is multiply linked")
+        paths.append(root)
+        continue
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise SystemExit("token-scan root is unsafe")
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in directories:
+            path = os.path.join(current, name)
+            if not stat.S_ISDIR(os.lstat(path).st_mode):
+                raise SystemExit("token-scan tree contains a symlinked subtree")
+        for name in files:
+            path = os.path.join(current, name)
+            child = os.lstat(path)
+            if not stat.S_ISREG(child.st_mode) or child.st_nlink != 1:
+                raise SystemExit("token-scan tree contains an unsafe file")
+            paths.append(path)
+for path in paths:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    tail = b""
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            data = tail + chunk
+            if needle in data:
+                raise SystemExit("ownership token leaked into publishable evidence")
+            tail = data[-(len(needle) - 1):]
+    finally:
+        os.close(descriptor)
+PY
+}
+
+run_recorded_limited() {
+  local seconds="$1" output="$2" stdout_limit="$3" stderr_limit="$4"
+  shift 4
+  [[ "${stdout_limit}" =~ ^[1-9][0-9]*$ \
+    && "${stderr_limit}" =~ ^[1-9][0-9]*$ ]] || return 1
+  local pipe_dir status stdout_size stderr_size recorder_stderr
+  pipe_dir="$(mktemp -d "${output}.pipes.XXXXXX")" || return 1
+  recorder_stderr="${pipe_dir}/recorder.stderr"
+  # Positional parameters intentionally expand in the bounded recorder shell.
+  # shellcheck disable=SC2016
+  if run_bounded "${seconds}" /bin/bash -c '
+      set -Eeuo pipefail
+      stdout_fifo="$1"
+      stderr_fifo="$2"
+      stdout_path="$3"
+      stderr_path="$4"
+      stdout_limit="$5"
+      stderr_limit="$6"
+      shift 6
+      mkfifo -m 0600 "${stdout_fifo}" "${stderr_fifo}"
+      head -c "$((stdout_limit + 1))" <"${stdout_fifo}" >"${stdout_path}" &
+      stdout_reader=$!
+      head -c "$((stderr_limit + 1))" <"${stderr_fifo}" >"${stderr_path}" &
+      stderr_reader=$!
+      set +e
+      "$@" >"${stdout_fifo}" 2>"${stderr_fifo}"
+      command_status=$?
+      wait "${stdout_reader}"
+      stdout_status=$?
+      wait "${stderr_reader}"
+      stderr_status=$?
+      set -e
+      (( stdout_status == 0 && stderr_status == 0 )) || exit 125
+      exit "${command_status}"
+    ' recorded-command \
+    "${pipe_dir}/stdout.fifo" "${pipe_dir}/stderr.fifo" \
+    "${output}" "${output}.stderr" "${stdout_limit}" "${stderr_limit}" \
+    "$@" >/dev/null 2>"${recorder_stderr}"; then
+    status=0
+  else
+    status=$?
+  fi
+  [[ -f "${output}" && ! -L "${output}" \
+    && -f "${output}.stderr" && ! -L "${output}.stderr" ]] || status=125
+  stdout_size="$(file_size_bytes "${output}" 2>/dev/null || printf '%s' 0)"
+  stderr_size="$(file_size_bytes "${output}.stderr" 2>/dev/null || printf '%s' 0)"
+  [[ "${stdout_size}" =~ ^[0-9]+$ && "${stderr_size}" =~ ^[0-9]+$ ]] \
+    || status=125
+  if (( stdout_size > stdout_limit || stderr_size > stderr_limit )); then
+    status=125
+  fi
+  if [[ -s "${recorder_stderr}" ]] && (( stderr_size < stderr_limit )); then
+    local remaining wrapper_prefix wrapper_prefix_size wrapper_bytes
+    wrapper_prefix=$'\n[recording wrapper]\n'
+    remaining=$((stderr_limit - stderr_size))
+    wrapper_prefix_size="${#wrapper_prefix}"
+    if (( remaining <= wrapper_prefix_size )); then
+      printf '%s' "${wrapper_prefix:0:remaining}" >>"${output}.stderr"
+    else
+      printf '%s' "${wrapper_prefix}" >>"${output}.stderr"
+      wrapper_bytes=$((remaining - wrapper_prefix_size))
+      head -c "$((wrapper_bytes > 4096 ? 4096 : wrapper_bytes))" \
+        "${recorder_stderr}" >>"${output}.stderr"
+    fi
+  fi
+  rm -r -- "${pipe_dir}" || status=125
+  printf '%s\n' "${status}" >"${output}.status" || return 1
+  return "${status}"
+}
+
+run_recorded() {
+  local seconds="$1" output="$2"
+  shift 2
+  run_recorded_limited "${seconds}" "${output}" \
+    "${RECORDED_STDOUT_MAX_BYTES}" "${RECORDED_STDERR_MAX_BYTES}" "$@"
+}
+
+run_recorded_with_stdin() {
+  local seconds="$1" output="$2" input="$3"
+  shift 3
+  [[ -f "${input}" && ! -L "${input}" ]] || return 1
+  # Positional parameters intentionally expand in the bounded child shell.
+  # shellcheck disable=SC2016
+  run_recorded "${seconds}" "${output}" /bin/sh -c \
+    'input=$1; shift; exec "$@" <"$input"' \
+    shadowpipe-bounded-stream "${input}" "$@"
+}
+
 orb_list_snapshot() {
   local output="$1" status
   if run_bounded "${ORB_LIST_TIMEOUT_SECONDS}" orbctl list \
@@ -245,6 +416,7 @@ parse_orb_info_identity() {
     "${expected_state}" "${normalized}" <<'PY'
 import json
 import os
+import re
 import sys
 
 raw_path, expected_name, expected_id, expected_state, normalized = sys.argv[1:]
@@ -295,11 +467,46 @@ if expected_id and machine_id != expected_id:
     raise SystemExit("orbctl ID mismatch or name reuse")
 if expected_state and state != expected_state:
     raise SystemExit("orbctl state differs from the expected state")
+config = record.get("config")
+if type(config) is not dict:
+    raise SystemExit("orbctl record lacks an exact config object")
+if config.get("isolated") is not True:
+    raise SystemExit("OrbStack machine is not capability-isolated")
+if config.get("isolate_network") is not True:
+    raise SystemExit("OrbStack machine network isolation is not enabled")
+if config.get("forward_ssh_agent") is not False:
+    raise SystemExit("OrbStack SSH-agent forwarding is not disabled")
+for port_name in ("http_port", "https_port"):
+    port = config.get(port_name)
+    if type(port) is not int or port != 0:
+        raise SystemExit(f"OrbStack {port_name} is not exactly zero")
+for container, label in ((record, "record"), (config, "config")):
+    for key in ("mount", "mounts", "ports", "port_forwards"):
+        if key not in container:
+            continue
+        value = container[key]
+        if not (
+            (type(value) is list and not value)
+            or (type(value) is dict and not value)
+        ):
+            raise SystemExit(f"OrbStack {label}.{key} is not empty")
+default_username = config.get("default_username")
+if (
+    type(default_username) is not str
+    or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", default_username) is None
+):
+    raise SystemExit("OrbStack default_username is absent or unsafe")
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 descriptor = os.open(normalized, flags, 0o600)
 with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as stream:
     json.dump(
-        {"schema_version": 1, "id": machine_id, "name": name, "state": state},
+        {
+            "schema_version": 2,
+            "default_username": default_username,
+            "id": machine_id,
+            "name": name,
+            "state": state,
+        },
         stream,
         ensure_ascii=True,
         sort_keys=True,
@@ -309,6 +516,34 @@ with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as stream:
     stream.flush()
     os.fsync(stream.fileno())
 print(machine_id)
+PY
+}
+
+orb_identity_field() {
+  local normalized="$1" field="$2"
+  [[ -f "${normalized}" && ! -L "${normalized}" ]] || return 1
+  /usr/bin/python3 -I -S - "${normalized}" "${field}" <<'PY'
+import json
+import re
+import sys
+
+path, field = sys.argv[1:]
+with open(path, "r", encoding="ascii") as stream:
+    record = json.load(stream)
+expected = {"schema_version", "default_username", "id", "name", "state"}
+if set(record) != expected or record.get("schema_version") != 2:
+    raise SystemExit("normalized OrbStack identity schema differs")
+if field not in expected - {"schema_version"}:
+    raise SystemExit("unknown normalized OrbStack identity field")
+value = record[field]
+if type(value) is not str or not value:
+    raise SystemExit("normalized OrbStack identity field is absent")
+if field == "default_username":
+    if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value) is None:
+        raise SystemExit("normalized OrbStack username is unsafe")
+elif any(ord(character) < 0x21 or ord(character) == 0x7f for character in value):
+    raise SystemExit("normalized OrbStack identity field is unsafe")
+print(value)
 PY
 }
 
@@ -443,6 +678,1040 @@ verify_source_provenance_manifest() {
   create_source_provenance_manifest \
     "${repo_root}" "${observed}" "${runner}" || return 1
   bounded_cmp "${expected}" "${observed}"
+}
+
+validate_git_metadata_safety() {
+  local repo_root="$1" output="$2" revision="${3:-HEAD}"
+  /usr/bin/python3 -I -S - "${repo_root}" "${output}" "${revision}" <<'PY'
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+
+repo = os.path.realpath(sys.argv[1])
+output = sys.argv[2]
+revision = sys.argv[3]
+dangerous_exact = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_ATTR_SOURCE",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+}
+ambient = sorted(
+    key
+    for key in os.environ
+    if key in dangerous_exact or key.startswith("GIT_CONFIG_")
+)
+if ambient:
+    raise SystemExit("ambient Git metadata override variables are not allowed")
+env = os.environ.copy()
+for key in list(env):
+    if key in dangerous_exact or key.startswith("GIT_CONFIG_"):
+        env.pop(key, None)
+env["GIT_NO_REPLACE_OBJECTS"] = "1"
+env["GIT_CONFIG_NOSYSTEM"] = "1"
+env["GIT_CONFIG_GLOBAL"] = os.devnull
+env["GIT_ATTR_NOSYSTEM"] = "1"
+
+def git(*arguments, statuses=(0,), text=True):
+    process = subprocess.run(
+        ["git", "-C", repo, *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+        env=env,
+        text=text,
+    )
+    if process.returncode not in statuses:
+        raise SystemExit(
+            f"Git metadata proof failed for {arguments[0]} "
+            f"with status {process.returncode}"
+        )
+    return process
+
+top = os.path.realpath(git("rev-parse", "--show-toplevel").stdout.strip())
+if top != repo:
+    raise SystemExit("Git metadata proof top-level differs from repository")
+git_dir_text = git("rev-parse", "--absolute-git-dir").stdout.strip()
+if not os.path.isabs(git_dir_text):
+    raise SystemExit("Git directory is not absolute")
+git_dir = os.path.realpath(git_dir_text)
+git_dir_info = os.lstat(git_dir)
+if not stat.S_ISDIR(git_dir_info.st_mode) or stat.S_ISLNK(git_dir_info.st_mode):
+    raise SystemExit("Git directory is not a real directory")
+common_dir_text = git(
+    "rev-parse", "--path-format=absolute", "--git-common-dir"
+).stdout.strip()
+if not os.path.isabs(common_dir_text):
+    raise SystemExit("Git common directory is not absolute")
+common_dir = os.path.realpath(common_dir_text)
+common_dir_info = os.lstat(common_dir)
+if (
+    not stat.S_ISDIR(common_dir_info.st_mode)
+    or stat.S_ISLNK(common_dir_info.st_mode)
+):
+    raise SystemExit("Git common directory is not a real directory")
+metadata_paths = {
+    os.path.join(git_dir, "info/grafts"),
+    os.path.join(git_dir, "info/attributes"),
+    os.path.join(common_dir, "info/grafts"),
+    os.path.join(common_dir, "info/attributes"),
+}
+for relative in ("info/grafts", "info/attributes"):
+    resolved_path = git(
+        "rev-parse", "--path-format=absolute", "--git-path", relative
+    ).stdout.strip()
+    if not os.path.isabs(resolved_path):
+        raise SystemExit(f"Git metadata path is not absolute: {relative}")
+    metadata_paths.add(resolved_path)
+for path in metadata_paths:
+    if os.path.lexists(path):
+        raise SystemExit(
+            f"local Git metadata override exists: {os.path.basename(path)}"
+        )
+replacements = git(
+    "for-each-ref", "--format=%(refname)", "refs/replace"
+).stdout.splitlines()
+if replacements:
+    raise SystemExit("Git replacement refs are not allowed")
+attributes = git(
+    "config", "--get-all", "core.attributesFile", statuses=(0, 1)
+)
+if attributes.returncode == 0 or attributes.stdout:
+    raise SystemExit("local/worktree core.attributesFile is not allowed")
+resolved = git(
+    "rev-parse", "--verify", f"{revision}^{{commit}}"
+).stdout.strip()
+if re.fullmatch(r"[0-9a-f]{40,64}", resolved) is None:
+    raise SystemExit("Git metadata proof revision is not one commit object ID")
+tree_raw = git(
+    "ls-tree", "-rz", "--full-tree", resolved, text=False
+).stdout
+for record in tree_raw.split(b"\0"):
+    if not record:
+        continue
+    metadata, separator, raw_path = record.partition(b"\t")
+    fields = metadata.split()
+    if not separator or len(fields) != 3:
+        raise SystemExit("Git tree record is malformed")
+    mode, kind, object_id = fields
+    if (
+        mode not in (b"100644", b"100755", b"040000")
+        or kind not in (b"blob", b"tree")
+        or len(object_id) not in (40, 64)
+    ):
+        raise SystemExit("Git tree contains a link, gitlink, or special entry")
+    try:
+        path = raw_path.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SystemExit("tracked path is not UTF-8") from error
+    if os.path.basename(path) == ".gitattributes":
+        raise SystemExit("tracked .gitattributes is not allowed in pinned archive input")
+descriptor = os.open(
+    output,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as stream:
+    json.dump(
+        {
+            "git_metadata_safety": "valid",
+            "replace_refs": "absent",
+            "info_grafts": "absent",
+            "info_attributes": "absent",
+            "tracked_gitattributes": "absent",
+            "core_attributes_file": "absent",
+            "system_attributes": "disabled",
+            "tree_entry_types": "regular_only",
+            "validated_commit": resolved,
+        },
+        stream,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    stream.write("\n")
+PY
+}
+
+capture_git_checkout_proof() {
+  local repo_root="$1" output="$2" expected_head="${3:-}"
+  mkdir -m 0700 -- "${output}" || return 1
+  validate_git_metadata_safety "${repo_root}" \
+    "${output}/git-metadata-safety.json" \
+    "${expected_head:-HEAD}" || return 1
+  # Prove cleanliness without materializing dirty filenames in evidence.
+  # shellcheck disable=SC2016
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" "${output}/status.clean" \
+    /bin/bash -c '
+      set -o pipefail
+      repo=$1
+      git -C "${repo}" diff --quiet --no-ext-diff -- || exit 3
+      git -C "${repo}" diff --cached --quiet --no-ext-diff -- || exit 3
+      untracked_bytes="$(
+        git -C "${repo}" ls-files --others --exclude-standard 2>/dev/null \
+          | wc -c
+      )" || exit 2
+      untracked_bytes="${untracked_bytes//[[:space:]]/}"
+      [[ "${untracked_bytes}" =~ ^[0-9]+$ ]] || exit 2
+      (( untracked_bytes == 0 )) || exit 3
+      printf "clean\n"
+    ' quiet-git-status "${repo_root}" || return 1
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" \
+    "${output}/inside-work-tree.txt" \
+    git -C "${repo_root}" rev-parse --is-inside-work-tree || return 1
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" "${output}/top-level.txt" \
+    git -C "${repo_root}" rev-parse --show-toplevel || return 1
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" "${output}/branch.txt" \
+    git -C "${repo_root}" symbolic-ref --quiet --short HEAD || return 1
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" "${output}/head.txt" \
+    git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}' || return 1
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" "${output}/origin-main.txt" \
+    git -C "${repo_root}" rev-parse --verify \
+    'refs/remotes/origin/main^{commit}' || return 1
+  # Never retain remote stderr because it may contain a credential-bearing URL.
+  # shellcheck disable=SC2016
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" \
+    "${output}/origin-main-live.txt" /bin/sh -c \
+    'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -oBatchMode=yes -oConnectionAttempts=1" git -C "$1" ls-remote --refs origin refs/heads/main 2>/dev/null' \
+    live-origin-main "${repo_root}" || return 1
+  /usr/bin/python3 -I -S - \
+    "${repo_root}" "${output}" "${expected_head}" <<'PY'
+import os
+import re
+import stat
+import sys
+
+repo, root, expected = sys.argv[1:]
+
+def one_line(name, allow_tab=False):
+    path = os.path.join(root, name)
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit(f"unsafe Git proof file: {name}")
+    with open(path, "r", encoding="utf-8", newline="") as stream:
+        lines = stream.read().splitlines()
+    if len(lines) != 1 or not lines[0]:
+        raise SystemExit(f"Git proof is not one nonempty line: {name}")
+    if any(
+        (ord(character) < 0x20 and not (allow_tab and character == "\t"))
+        or ord(character) == 0x7f
+        for character in lines[0]
+    ):
+        raise SystemExit(f"Git proof contains a control byte: {name}")
+    return lines[0]
+
+if one_line("status.clean") != "clean":
+    raise SystemExit("repository working tree or index is not clean")
+if one_line("inside-work-tree.txt") != "true":
+    raise SystemExit("repository is not a Git work tree")
+if os.path.realpath(one_line("top-level.txt")) != os.path.realpath(repo):
+    raise SystemExit("Git top-level differs from the bound repository")
+if one_line("branch.txt") != "main":
+    raise SystemExit("repository HEAD is not attached to main")
+head = one_line("head.txt")
+origin = one_line("origin-main.txt")
+if re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
+    raise SystemExit("Git HEAD is not one canonical object ID")
+if origin != head:
+    raise SystemExit("Git HEAD differs from local origin/main")
+if expected and head != expected:
+    raise SystemExit("Git HEAD changed during the lab")
+live = one_line("origin-main-live.txt", allow_tab=True).split("\t")
+if live != [head, "refs/heads/main"]:
+    raise SystemExit("Git HEAD differs from live pushed origin/main")
+with open(os.path.join(root, "checkout.env"), "x", encoding="ascii", newline="\n") as stream:
+    stream.write("git_checkout=clean_pushed_main\n")
+    stream.write(f"pinned_head={head}\n")
+    stream.write("live_origin_main_match=true\n")
+    stream.write("archive_source=git_object_database\n")
+PY
+}
+
+create_pinned_source_archive() {
+  local repo_root="$1" pinned_head="$2" archive="$3" metadata="$4"
+  validate_git_metadata_safety "${repo_root}" \
+    "${metadata}.git-metadata-safety-before.json" \
+    "${pinned_head}" || return 1
+  run_recorded_limited "${HOST_EVIDENCE_TIMEOUT_SECONDS}" "${archive}" \
+    "${MAX_SOURCE_ARCHIVE_BYTES}" "${RECORDED_STDERR_MAX_BYTES}" \
+    /usr/bin/env \
+    -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    -u GIT_ATTR_NOSYSTEM \
+    -u GIT_ATTR_SOURCE \
+    -u GIT_COMMON_DIR \
+    -u GIT_DIR \
+    -u GIT_GRAFT_FILE \
+    -u GIT_INDEX_FILE \
+    -u GIT_NAMESPACE \
+    -u GIT_OBJECT_DIRECTORY \
+    -u GIT_REPLACE_REF_BASE \
+    -u GIT_SHALLOW_FILE \
+    -u GIT_WORK_TREE \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_ATTR_NOSYSTEM=1 \
+    GIT_GRAFT_FILE=/dev/null \
+    GIT_NO_LAZY_FETCH=1 \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    git -c core.attributesFile=/dev/null \
+    -C "${repo_root}" archive --format=tar --prefix=shadowpipe/ \
+    "${pinned_head}" || return 1
+  validate_git_metadata_safety "${repo_root}" \
+    "${metadata}.git-metadata-safety-after.json" \
+    "${pinned_head}" || return 1
+  # shellcheck disable=SC2016
+  run_recorded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" "${metadata}.commit" \
+    /bin/sh -c \
+    'exec /usr/bin/env \
+      -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+      -u GIT_ATTR_NOSYSTEM \
+      -u GIT_ATTR_SOURCE \
+      -u GIT_COMMON_DIR \
+      -u GIT_DIR \
+      -u GIT_GRAFT_FILE \
+      -u GIT_INDEX_FILE \
+      -u GIT_NAMESPACE \
+      -u GIT_OBJECT_DIRECTORY \
+      -u GIT_REPLACE_REF_BASE \
+      -u GIT_SHALLOW_FILE \
+      -u GIT_WORK_TREE \
+      GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_ATTR_NOSYSTEM=1 \
+      GIT_NO_LAZY_FETCH=1 \
+      GIT_NO_REPLACE_OBJECTS=1 \
+      git -c core.attributesFile=/dev/null \
+      -C / get-tar-commit-id <"$1"' \
+    source-archive "${archive}" || return 1
+  /usr/bin/python3 -I -S - \
+    "${archive}" "${metadata}.commit" "${metadata}" "${pinned_head}" \
+    "${MAX_SOURCE_ARCHIVE_BYTES}" "${MAX_SOURCE_EXPANDED_BYTES}" \
+    "${MAX_ARCHIVE_MEMBERS}" <<'PY'
+import hashlib
+import os
+import re
+import stat
+import sys
+import tarfile
+
+(
+    archive,
+    commit_path,
+    output,
+    expected,
+    maximum_text,
+    expanded_max_text,
+    members_max_text,
+) = sys.argv[1:]
+maximum = int(maximum_text, 10)
+expanded_max = int(expanded_max_text, 10)
+members_max = int(members_max_text, 10)
+info = os.lstat(archive)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_size <= 0
+    or info.st_size > maximum
+):
+    raise SystemExit("pinned source archive metadata or size is unsafe")
+with open(commit_path, "r", encoding="ascii", newline="") as stream:
+    lines = stream.read().splitlines()
+if lines != [expected] or re.fullmatch(r"[0-9a-f]{40,64}", expected) is None:
+    raise SystemExit("git archive commit identity differs from pinned HEAD")
+digest = hashlib.sha256()
+with open(archive, "rb", buffering=0) as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+members = 0
+expanded = 0
+seen = set()
+with tarfile.open(archive, "r:") as source:
+    for member in source:
+        members += 1
+        name = member.name.rstrip("/")
+        parts = name.split("/")
+        if (
+            members > members_max
+            or not name
+            or name.startswith("/")
+            or any(part in ("", ".", "..") for part in parts)
+            or parts[0] != "shadowpipe"
+            or any(ord(character) < 0x20 or ord(character) == 0x7f for character in name)
+            or name in seen
+        ):
+            raise SystemExit("pinned source archive member census is unsafe")
+        seen.add(name)
+        if member.isdir():
+            continue
+        if not member.isfile() or member.size < 0:
+            raise SystemExit("pinned source archive contains a link or special member")
+        expanded += member.size
+        if expanded > expanded_max:
+            raise SystemExit("pinned source archive expanded bytes exceeded")
+with open(output, "x", encoding="ascii", newline="\n") as stream:
+    stream.write("source_archive=git_archive\n")
+    stream.write(f"pinned_head={expected}\n")
+    stream.write(f"source_archive_bytes={info.st_size}\n")
+    stream.write(f"source_archive_sha256={digest.hexdigest()}\n")
+    stream.write(f"source_archive_members={members}\n")
+    stream.write(f"source_expanded_bytes={expanded}\n")
+PY
+}
+
+metadata_field() {
+  local metadata="$1" field="$2"
+  awk -F= -v field="${field}" \
+    '$1 == field { count += 1; value = substr($0, index($0, "=") + 1) }
+     END { if (count != 1 || value == "") exit 1; print value }' \
+    "${metadata}"
+}
+
+stream_source_archive_to_guest() {
+  local clone_id="$1" archive="$2" guest_root="$3" guest_archive="$4"
+  local expected_size="$5" expected_hash="$6" output="$7"
+  run_recorded_with_stdin \
+    "${SOURCE_TRANSFER_TIMEOUT_SECONDS}" "${output}" "${archive}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import os
+import stat
+import sys
+
+root, destination, size_text, expected = sys.argv[1:]
+size = int(size_text, 10)
+if size <= 0 or size > 64 * 1024 * 1024:
+    raise SystemExit("invalid bounded source archive size")
+if os.path.dirname(destination) != root or os.path.basename(destination) != "source.tar":
+    raise SystemExit("unsafe guest source archive path")
+if os.path.lexists(root):
+    raise SystemExit("guest source root already exists")
+os.mkdir(root, 0o700)
+flags = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+descriptor = os.open(destination, flags, 0o600)
+digest = hashlib.sha256()
+observed = 0
+try:
+    while observed <= size:
+        chunk = sys.stdin.buffer.read(min(1024 * 1024, size + 1 - observed))
+        if not chunk:
+            break
+        observed += len(chunk)
+        if observed > size:
+            raise SystemExit("source archive stream exceeded its declared size")
+        digest.update(chunk)
+        offset = 0
+        while offset < len(chunk):
+            offset += os.write(descriptor, chunk[offset:])
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+if observed != size or digest.hexdigest() != expected:
+    raise SystemExit("source archive stream size or digest mismatch")
+info = os.lstat(destination)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_uid != 0
+    or info.st_gid != 0
+    or info.st_size != size
+):
+    raise SystemExit("guest source archive metadata differs")
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print(f"source_archive_bytes={size}")
+print(f"source_archive_sha256={expected}")
+' "${guest_root}" "${guest_archive}" "${expected_size}" "${expected_hash}"
+}
+
+capture_guest_isolation_preflight() {
+  local clone_id="$1" guest_user="$2" output="$3"
+  run_recorded "${ORB_COMMAND_TIMEOUT_SECONDS}" "${output}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+
+username = sys.argv[1]
+pwd.getpwnam(username)
+if os.path.lexists("/mnt/mac"):
+    raise SystemExit("isolated guest unexpectedly exposes /mnt/mac")
+if os.environ.get("SSH_AUTH_SOCK"):
+    raise SystemExit("isolated guest unexpectedly received SSH_AUTH_SOCK")
+mac_command = shutil.which("mac")
+known_mac_commands = (
+    "/usr/bin/mac",
+    "/usr/local/bin/mac",
+    "/opt/orbstack/bin/mac",
+    "/opt/orbstack-guest/bin/mac",
+)
+candidates = []
+if mac_command:
+    candidates.append(mac_command)
+for path in known_mac_commands:
+    if os.path.lexists(path) and path not in candidates:
+        candidates.append(path)
+if candidates:
+    for candidate in candidates:
+        probe = subprocess.run(
+            [candidate, "uname", "-s"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+        if (
+            probe.returncode != 1
+            or probe.stdout != b""
+            or probe.stderr != b"dial: no such file or directory\n"
+        ):
+            raise SystemExit("OrbStack mac-command channel is not proved fail-closed")
+    mac_channel = "disabled"
+else:
+    mac_channel = "absent"
+with open("/proc/self/mountinfo", "r", encoding="utf-8") as stream:
+    for raw in stream:
+        fields = raw.split()
+        if len(fields) < 5:
+            raise SystemExit("malformed guest mountinfo")
+        mountpoint = fields[4].replace("\\040", " ")
+        if mountpoint == "/mnt/mac" or mountpoint.startswith("/mnt/mac/"):
+            raise SystemExit("isolated guest mountinfo exposes a Mac share")
+print("guest_runtime_isolation=valid")
+print("mnt_mac=absent")
+print("ssh_auth_sock=absent")
+print(f"mac_command_channel={mac_channel}")
+print(f"default_username={username}")
+' "${guest_user}"
+}
+
+extract_guest_source_archive() {
+  local clone_id="$1" guest_root="$2" guest_archive="$3" guest_repo="$4"
+  local guest_target="$5" guest_result="$6" source_manifest="$7" run_id="$8"
+  local clone_vm="$9" token="${10}" expected_size="${11}"
+  local expected_hash="${12}" output="${13}"
+  validate_owner_token "${token}" || return 1
+  [[ "$(sanitize_component "${run_id}")" == "${run_id}" \
+    && "$(sanitize_component "${clone_vm}")" == "${clone_vm}" ]] || return 1
+  run_recorded "${ORB_COMMAND_TIMEOUT_SECONDS}" "${output}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import os
+import stat
+import sys
+import tarfile
+
+(root, archive, repo, target, result, manifest, run_id, clone_vm, token,
+ size_text, expected_hash, max_expanded_text, max_members_text) = sys.argv[1:]
+size = int(size_text, 10)
+max_expanded = int(max_expanded_text, 10)
+max_members = int(max_members_text, 10)
+if repo != os.path.join(root, "shadowpipe"):
+    raise SystemExit("unsafe guest repository path")
+if target != os.path.join(root, "target"):
+    raise SystemExit("unsafe guest target path")
+if result != os.path.join(root, "result"):
+    raise SystemExit("unsafe guest result path")
+if manifest != os.path.join(root, "source-files.sha256"):
+    raise SystemExit("unsafe guest source manifest path")
+archive_info = os.lstat(archive)
+if (
+    not stat.S_ISREG(archive_info.st_mode)
+    or archive_info.st_nlink != 1
+    or stat.S_IMODE(archive_info.st_mode) != 0o600
+    or archive_info.st_uid != 0
+    or archive_info.st_gid != 0
+    or archive_info.st_size != size
+):
+    raise SystemExit("guest source archive identity changed before extraction")
+digest = hashlib.sha256()
+with open(archive, "rb", buffering=0) as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+if digest.hexdigest() != expected_hash:
+    raise SystemExit("guest source archive digest changed before extraction")
+seen = set()
+members = 0
+total = 0
+with tarfile.open(archive, "r:") as source:
+    for member in source:
+        members += 1
+        name = member.name.rstrip("/")
+        parts = name.split("/")
+        if (
+            members > max_members
+            or not name
+            or name.startswith("/")
+            or any(part in ("", ".", "..") for part in parts)
+            or parts[0] != "shadowpipe"
+            or any(ord(character) < 0x20 or ord(character) == 0x7f for character in name)
+            or name in seen
+        ):
+            raise SystemExit("source archive contains an unsafe or duplicate path")
+        seen.add(name)
+        destination = os.path.join(root, *parts)
+        if os.path.commonpath((root, destination)) != root:
+            raise SystemExit("source archive escaped the guest root")
+        if member.isdir():
+            if os.path.lexists(destination):
+                if not stat.S_ISDIR(os.lstat(destination).st_mode):
+                    raise SystemExit("source archive directory collided with a file")
+            else:
+                os.makedirs(destination, mode=0o700, exist_ok=False)
+            os.chmod(destination, 0o700)
+            continue
+        if not member.isfile() or member.size < 0:
+            raise SystemExit("source archive contains a link or special member")
+        total += member.size
+        if total > max_expanded:
+            raise SystemExit("source archive expanded bytes exceeded")
+        parent = os.path.dirname(destination)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        if os.path.lexists(destination):
+            raise SystemExit("source archive file path already exists")
+        incoming = source.extractfile(member)
+        if incoming is None:
+            raise SystemExit("source archive regular member is unreadable")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(destination, flags, 0o700 if member.mode & 0o111 else 0o600)
+        written = 0
+        try:
+            while written < member.size:
+                chunk = incoming.read(min(1024 * 1024, member.size - written))
+                if not chunk:
+                    raise SystemExit("source archive member ended early")
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(descriptor, chunk[offset:])
+                written += len(chunk)
+            if incoming.read(1):
+                raise SystemExit("source archive member exceeded declared size")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+if not os.path.isfile(os.path.join(repo, "Cargo.lock")):
+    raise SystemExit("extracted source lacks Cargo.lock")
+runner = os.path.join(repo, "tests", "host-recovery", "run-orbstack-phase3.sh")
+if not os.path.isfile(runner):
+    raise SystemExit("extracted source lacks the Phase-3 runner")
+os.mkdir(target, 0o700)
+os.mkdir(result, 0o700)
+owner = os.path.join(result, ".shadowpipe-phase3-result-owner")
+content = (
+    "shadowpipe-phase3-result-owner-v1\n"
+    f"run_id={run_id}\nclone_vm={clone_vm}\ntoken={token}\n"
+).encode("ascii")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(owner, flags, 0o600)
+try:
+    os.write(descriptor, content)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+rows = []
+for current, directories, files in os.walk(repo, followlinks=False):
+    directories.sort()
+    files.sort()
+    for name in directories:
+        path = os.path.join(current, name)
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise SystemExit("extracted source contains a symlinked subtree")
+    for name in files:
+        path = os.path.join(current, name)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SystemExit("extracted source contains an unsafe file")
+        file_digest = hashlib.sha256()
+        with open(path, "rb", buffering=0) as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                file_digest.update(chunk)
+        rows.append((os.path.relpath(path, repo), file_digest.hexdigest()))
+descriptor = os.open(
+    manifest,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as stream:
+    for relative, file_hash in sorted(rows):
+        stream.write(f"{file_hash}  {relative}\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.unlink(archive)
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print(f"guest_repo_root={repo}")
+print(f"source_archive_sha256={expected_hash}")
+print(f"source_archive_members={members}")
+print(f"source_archive_expanded_bytes={total}")
+print(f"source_manifest_entries={len(rows)}")
+' "${guest_root}" "${guest_archive}" "${guest_repo}" "${guest_target}" \
+    "${guest_result}" "${source_manifest}" "${run_id}" "${clone_vm}" \
+    "${token}" "${expected_size}" "${expected_hash}" \
+    "${MAX_SOURCE_EXPANDED_BYTES}" "${MAX_ARCHIVE_MEMBERS}"
+}
+
+verify_guest_source_manifest() {
+  local clone_id="$1" guest_repo="$2" manifest="$3" output="$4"
+  run_recorded "${ORB_COMMAND_TIMEOUT_SECONDS}" "${output}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import os
+import stat
+import sys
+
+root, manifest = sys.argv[1:]
+expected = {}
+with open(manifest, "r", encoding="ascii", newline="") as stream:
+    for line in stream.read().splitlines():
+        if len(line) < 67 or line[64:66] != "  ":
+            raise SystemExit("source manifest is malformed")
+        digest, relative = line[:64], line[66:]
+        if (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not relative
+            or relative.startswith("/")
+            or any(part in ("", ".", "..") for part in relative.split("/"))
+            or relative in expected
+        ):
+            raise SystemExit("source manifest contains an unsafe record")
+        expected[relative] = digest
+observed = {}
+for current, directories, files in os.walk(root, followlinks=False):
+    directories.sort()
+    files.sort()
+    for name in directories:
+        path = os.path.join(current, name)
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise SystemExit("source tree contains a symlinked subtree")
+    for name in files:
+        path = os.path.join(current, name)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SystemExit("source tree contains an unsafe file")
+        digest = hashlib.sha256()
+        with open(path, "rb", buffering=0) as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        observed[os.path.relpath(path, root)] = digest.hexdigest()
+if observed != expected:
+    raise SystemExit("guest source manifest differs")
+print(f"source_manifest_entries={len(observed)}")
+print("guest_source_manifest=valid")
+' "${guest_repo}" "${manifest}"
+}
+
+stream_guest_evidence_archive() {
+  local clone_id="$1" guest_runner="$2" guest_result="$3" run_id="$4"
+  local clone_vm="$5" token="$6" output="$7"
+  validate_owner_token "${token}" || return 1
+  [[ "$(sanitize_component "${run_id}")" == "${run_id}" \
+    && "$(sanitize_component "${clone_vm}")" == "${clone_vm}" ]] || return 1
+  run_recorded_limited \
+    "${EVIDENCE_TRANSFER_TIMEOUT_SECONDS}" "${output}" \
+    "${MAX_EVIDENCE_ARCHIVE_BYTES}" "${RECORDED_STDERR_MAX_BYTES}" \
+    orb -m "${clone_id}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+import tarfile
+
+runner, root, run_id, clone_vm, token, max_bytes_text, max_members_text = sys.argv[1:]
+max_bytes = int(max_bytes_text, 10)
+max_members = int(max_members_text, 10)
+root = os.path.abspath(root)
+if os.path.realpath(root) != root:
+    raise SystemExit("guest evidence root is not canonical")
+info = os.lstat(root)
+if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+    raise SystemExit("guest evidence root is unsafe")
+environment = os.environ.copy()
+environment["SHADOWPIPE_PHASE3_INTERNAL_BUNDLE"] = "1"
+verified = subprocess.run(
+    ["/bin/bash", runner, "--internal-verify-bundle", root],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=300,
+    check=False,
+    env=environment,
+)
+if verified.returncode != 0 or verified.stdout:
+    raise SystemExit(
+        "guest evidence seal verification failed: "
+        + verified.stderr.decode("utf-8", "replace")[:4096]
+    )
+owner_content = (
+    "shadowpipe-phase3-result-owner-v1\n"
+    f"run_id={run_id}\nclone_vm={clone_vm}\ntoken={token}\n"
+).encode("ascii")
+owner_path = os.path.join(root, ".shadowpipe-phase3-result-owner")
+with open(owner_path, "rb", buffering=0) as stream:
+    if stream.read() != owner_content:
+        raise SystemExit("guest evidence owner differs")
+manifest_path = os.path.join(root, "checksums.sha256")
+with open(manifest_path, "r", encoding="ascii", newline="") as stream:
+    manifest_lines = stream.read().splitlines()
+manifest = {}
+for line in manifest_lines:
+    if len(line) < 67 or line[64:66] != "  ":
+        raise SystemExit("guest checksum manifest is malformed")
+    digest, relative = line[:64], line[66:]
+    if (
+        len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or not relative
+        or relative.startswith("/")
+        or any(part in ("", ".", "..") for part in relative.split("/"))
+        or relative == "checksums.sha256"
+        or relative in manifest
+    ):
+        raise SystemExit("guest checksum manifest contains an unsafe record")
+    manifest[relative] = digest
+if list(manifest) != sorted(manifest):
+    raise SystemExit("guest checksum manifest is not sorted")
+directories = set()
+files = {}
+total = 0
+for current, dirnames, filenames in os.walk(root, followlinks=False):
+    dirnames.sort()
+    filenames.sort()
+    relative_current = os.path.relpath(current, root)
+    if relative_current != ".":
+        directories.add(relative_current)
+    for name in dirnames:
+        path = os.path.join(current, name)
+        child = os.lstat(path)
+        if not stat.S_ISDIR(child.st_mode) or stat.S_ISLNK(child.st_mode):
+            raise SystemExit("guest evidence contains a symlinked subtree")
+    for name in filenames:
+        path = os.path.join(current, name)
+        relative = os.path.relpath(path, root)
+        child = os.lstat(path)
+        if not stat.S_ISREG(child.st_mode) or child.st_nlink != 1:
+            raise SystemExit("guest evidence contains a link or special file")
+        total += child.st_size
+        if total > max_bytes or len(files) >= max_members:
+            raise SystemExit("guest evidence exceeds the streaming bound")
+        digest = hashlib.sha256()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (child.st_dev, child.st_ino):
+                raise SystemExit("guest evidence identity raced while opening")
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        ):
+            raise SystemExit("guest evidence changed while hashing")
+        files[relative] = (path, child, digest.hexdigest())
+census = set(files)
+if "checksums.sha256" not in census:
+    raise SystemExit("guest evidence checksum manifest is absent")
+if census - {"checksums.sha256"} != set(manifest):
+    raise SystemExit("guest evidence checksum census differs")
+for relative, expected in manifest.items():
+    if files[relative][2] != expected:
+        raise SystemExit("guest evidence checksum mismatch")
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+    for relative in sorted(directories):
+        item = tarfile.TarInfo(relative)
+        item.type = tarfile.DIRTYPE
+        item.mode = 0o700
+        item.uid = item.gid = 0
+        item.mtime = 0
+        item.uname = item.gname = ""
+        archive.addfile(item)
+    for relative in sorted(files):
+        path, before, _digest = files[relative]
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        ):
+            os.close(descriptor)
+            raise SystemExit("guest evidence changed before streaming")
+        item = tarfile.TarInfo(relative)
+        item.size = opened.st_size
+        item.mode = 0o600
+        item.uid = item.gid = 0
+        item.mtime = 0
+        item.uname = item.gname = ""
+        with os.fdopen(descriptor, "rb", buffering=0) as incoming:
+            archive.addfile(item, incoming)
+            after = os.fstat(incoming.fileno())
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+            ):
+                raise SystemExit("guest evidence changed while streaming")
+' "${guest_runner}" "${guest_result}" "${run_id}" "${clone_vm}" \
+    "${token}" "${MAX_EVIDENCE_BYTES}" "${MAX_ARCHIVE_MEMBERS}"
+}
+
+extract_guest_evidence_archive() {
+  local archive="$1" destination="$2" run_id="$3" clone_vm="$4" token="$5"
+  validate_owner_token "${token}" || return 1
+  [[ "$(sanitize_component "${run_id}")" == "${run_id}" \
+    && "$(sanitize_component "${clone_vm}")" == "${clone_vm}" ]] || return 1
+  /usr/bin/python3 -I -S - \
+    "${archive}" "${destination}" "${run_id}" "${clone_vm}" "${token}" \
+    "${MAX_EVIDENCE_BYTES}" "${MAX_EVIDENCE_ARCHIVE_BYTES}" \
+    "${MAX_ARCHIVE_MEMBERS}" <<'PY'
+import os
+import stat
+import sys
+import tarfile
+
+(archive_path, destination, run_id, clone_vm, token,
+ max_bytes_text, max_archive_text, max_members_text) = sys.argv[1:]
+archive_path = os.path.abspath(archive_path)
+destination = os.path.abspath(destination)
+max_bytes = int(max_bytes_text, 10)
+max_archive = int(max_archive_text, 10)
+max_members = int(max_members_text, 10)
+archive_info = os.lstat(archive_path)
+if (
+    not stat.S_ISREG(archive_info.st_mode)
+    or stat.S_ISLNK(archive_info.st_mode)
+    or archive_info.st_nlink != 1
+    or stat.S_IMODE(archive_info.st_mode) != 0o600
+    or archive_info.st_uid != os.geteuid()
+    or archive_info.st_size <= 0
+    or archive_info.st_size > max_archive
+):
+    raise SystemExit("returned guest evidence archive size or metadata is unsafe")
+if os.path.lexists(destination):
+    raise SystemExit("guest evidence staging destination already exists")
+os.mkdir(destination, 0o700)
+seen = set()
+total = 0
+members = 0
+with tarfile.open(archive_path, "r:") as source:
+    for member in source:
+        members += 1
+        name = member.name.rstrip("/")
+        parts = name.split("/")
+        if (
+            members > max_members
+            or not name
+            or name.startswith("/")
+            or any(part in ("", ".", "..") for part in parts)
+            or any(ord(character) < 0x20 or ord(character) == 0x7f for character in name)
+            or name in seen
+        ):
+            raise SystemExit("returned guest evidence contains an unsafe path/census")
+        seen.add(name)
+        target = os.path.join(destination, *parts)
+        if os.path.commonpath((destination, target)) != destination:
+            raise SystemExit("returned guest evidence escaped staging")
+        if member.isdir():
+            if member.mode != 0o700 or member.uid != 0 or member.gid != 0:
+                raise SystemExit("returned evidence directory metadata differs")
+            if os.path.lexists(target):
+                if not stat.S_ISDIR(os.lstat(target).st_mode):
+                    raise SystemExit("returned evidence directory collided with a file")
+            else:
+                os.makedirs(target, mode=0o700, exist_ok=False)
+            continue
+        if (
+            not member.isfile()
+            or member.mode != 0o600
+            or member.uid != 0
+            or member.gid != 0
+            or member.size < 0
+        ):
+            raise SystemExit("returned evidence contains a link or special member")
+        total += member.size
+        if total > max_bytes:
+            raise SystemExit("returned evidence expanded bytes exceeded")
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        if os.path.lexists(target):
+            raise SystemExit("returned evidence file path already exists")
+        incoming = source.extractfile(member)
+        if incoming is None:
+            raise SystemExit("returned evidence regular member is unreadable")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(target, flags, 0o600)
+        written = 0
+        try:
+            while written < member.size:
+                chunk = incoming.read(min(1024 * 1024, member.size - written))
+                if not chunk:
+                    raise SystemExit("returned evidence member ended early")
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(descriptor, chunk[offset:])
+                written += len(chunk)
+            if incoming.read(1):
+                raise SystemExit("returned evidence member exceeded declared size")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+owner_expected = (
+    "shadowpipe-phase3-result-owner-v1\n"
+    f"run_id={run_id}\nclone_vm={clone_vm}\ntoken={token}\n"
+).encode("ascii")
+owner_path = os.path.join(destination, ".shadowpipe-phase3-result-owner")
+with open(owner_path, "rb", buffering=0) as stream:
+    if stream.read() != owner_expected:
+        raise SystemExit("returned guest evidence owner marker differs")
+PY
+  verify_sealed_bundle "${destination}"
 }
 
 compute_overall_status() {
@@ -1985,10 +3254,10 @@ write_guest_result() {
 }
 
 validate_guest_owner_marker() {
-  local marker="$1" expected="$2" parent mode uid gid nlink parent_nlink
+  local marker="$1" token="$2" parent mode uid gid nlink parent_nlink content
+  validate_owner_token "${token}" || return 1
   [[ "${marker}" == "${GUEST_OWNER_DIRECTORY}"/* \
-    && -f "${marker}" && ! -L "${marker}" \
-    && -f "${expected}" && ! -L "${expected}" ]] || return 1
+    && -f "${marker}" && ! -L "${marker}" ]] || return 1
   parent="$(dirname -- "${marker}")"
   [[ "${parent}" == "${GUEST_OWNER_DIRECTORY}" \
     && -d "${parent}" && ! -L "${parent}" ]] || return 1
@@ -2000,7 +3269,51 @@ validate_guest_owner_marker() {
   read -r mode uid gid nlink < <(stat -c '%a %u %g %h' -- "${marker}") || return 1
   [[ "${mode}" == 600 && "${uid}" == 0 && "${gid}" == 0 && "${nlink}" == 1 ]] \
     || return 1
-  bounded_cmp "${marker}" "${expected}"
+  IFS= read -r content <"${marker}" || return 1
+  [[ "${content}" == "${token}" && "$(wc -l <"${marker}" | tr -d ' ')" == 1 ]]
+}
+
+validate_guest_result_owner() {
+  local root="$1" run_id="$2" clone_vm="$3" token="$4"
+  validate_owner_token "${token}" || return 1
+  [[ -d "${root}" && ! -L "${root}" ]] || return 1
+  /usr/bin/python3 -I -S - \
+    "${root}" "${run_id}" "${clone_vm}" "${token}" <<'PY'
+import os
+import stat
+import sys
+
+root, run_id, clone_vm, token = sys.argv[1:]
+if os.path.realpath(root) != root:
+    raise SystemExit("guest result root is not canonical")
+info = os.lstat(root)
+if (
+    not stat.S_ISDIR(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != 0
+    or info.st_gid != 0
+    or stat.S_IMODE(info.st_mode) != 0o700
+):
+    raise SystemExit("guest result root metadata differs")
+owner = os.path.join(root, ".shadowpipe-phase3-result-owner")
+owner_info = os.lstat(owner)
+if (
+    not stat.S_ISREG(owner_info.st_mode)
+    or owner_info.st_nlink != 1
+    or owner_info.st_uid != 0
+    or owner_info.st_gid != 0
+    or stat.S_IMODE(owner_info.st_mode) != 0o600
+):
+    raise SystemExit("guest result owner metadata differs")
+expected = (
+    "shadowpipe-phase3-result-owner-v1\n"
+    f"run_id={run_id}\nclone_vm={clone_vm}\ntoken={token}\n"
+).encode("ascii")
+descriptor = os.open(owner, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+with os.fdopen(descriptor, "rb", buffering=0) as stream:
+    if stream.read() != expected:
+        raise SystemExit("guest result owner content differs")
+PY
 }
 
 guest_main() {
@@ -2026,8 +3339,8 @@ guest_main() {
   [[ "${owner_basename}" == "${SHADOWPIPE_PHASE3_CLONE_NAME}.owner" ]] \
     || die "${EX_USAGE}" "clone ownership marker basename is not bound to the clone"
   local owner_marker="${GUEST_OWNER_DIRECTORY}/${owner_basename}"
-  local expected_owner_file="${SHADOWPIPE_PHASE3_EXPECTED_OWNER_FILE:-}"
-  validate_guest_owner_marker "${owner_marker}" "${expected_owner_file}" \
+  local owner_token="${SHADOWPIPE_PHASE3_OWNER_TOKEN:-}"
+  validate_guest_owner_marker "${owner_marker}" "${owner_token}" \
     || die "${EX_NOPERM}" "clone ownership marker is absent, unsafe, or mismatched"
 
   local tool missing=''
@@ -2048,15 +3361,23 @@ guest_main() {
   exec 7</proc/thread-self/ns/net
   exec 8</proc/thread-self/ns/mnt
 
-  local script_dir repo_root result_root helper
+  local script_dir repo_root result_root helper expected_helper
   script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
   repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
-  result_root="${script_dir}/results/${run_id}"
+  result_root="${SHADOWPIPE_PHASE3_RESULT_ROOT:-}"
+  [[ "${repo_root}" == /var/tmp/shadowpipe-phase3-*/shadowpipe \
+    && "${result_root}" == "${repo_root%/shadowpipe}/result" ]] \
+    || die "${EX_USAGE}" "guest source/result roots are not isolated guest-local paths"
+  validate_guest_result_owner \
+    "${result_root}" "${run_id}" "${SHADOWPIPE_PHASE3_CLONE_NAME}" "${owner_token}" \
+    || die "${EX_NOPERM}" "guest result ownership proof is absent or mismatched"
   helper="${SHADOWPIPE_PHASE3_HELPER:-}"
-  [[ -x "${helper}" ]] || die "${EX_UNAVAILABLE}" "built Phase-3 helper is absent"
-  [[ ! -e "${result_root}" && ! -L "${result_root}" ]] \
-    || die "${EX_USAGE}" "result directory already exists or is a dangling symlink"
-  mkdir -p -- "${result_root}/scenarios"
+  expected_helper="${repo_root%/shadowpipe}/target/release/examples/${HELPER_NAME}"
+  [[ "${helper}" == "${expected_helper}" && -x "${helper}" ]] \
+    || die "${EX_UNAVAILABLE}" "built guest-local Phase-3 helper is absent"
+  [[ ! -e "${result_root}/scenarios" && ! -L "${result_root}/scenarios" ]] \
+    || die "${EX_USAGE}" "guest scenarios path already exists"
+  mkdir -- "${result_root}/scenarios"
 
   snapshot_guest_root "${result_root}/guest-root-before"
   {
@@ -2115,7 +3436,6 @@ guest_main() {
   done
 
   write_guest_result "${result_root}" "${run_id}"
-  chown -R "${guest_user}:$(id -gn "${guest_user}")" "${result_root}" 2>/dev/null || true
   seal_bundle "${result_root}"
   (( guest_failed == 0 ))
 }
@@ -2139,88 +3459,103 @@ validate_host_owner_file() {
 }
 
 create_guest_owner_marker() {
-  local clone_vm="$1" repo_root="$2" marker="$3" expected="$4" output="$5"
+  local clone_vm="$1" marker="$2" token="$3" output="$4"
   local marker_basename="${marker##*/}"
   [[ "${marker}" == "${GUEST_OWNER_DIRECTORY}/${marker_basename}" ]] || return 1
   marker_basename="$(sanitize_component "${marker_basename}")" || return 1
-  # The single-quoted program is intentionally evaluated inside the guest.
-  # shellcheck disable=SC2016
-  run_bounded "${ORB_COMMAND_TIMEOUT_SECONDS}" \
-    orb -m "${clone_vm}" -u root -p -w "${repo_root}" \
-    bash -ceu '
-      parent=/var/lib/shadowpipe-phase3-lab
-      marker="$parent/$1"
-      expected=$2
-      [[ -f "$expected" && ! -L "$expected" ]]
-      if [[ -e "$parent" || -L "$parent" ]]; then
-        [[ -d "$parent" && ! -L "$parent" ]]
-      else
-        mkdir -m 0700 -- "$parent"
-      fi
-      chown root:root -- "$parent"
-      chmod 0700 -- "$parent"
-      read -r mode uid gid parent_nlink < <(stat -c "%a %u %g %h" -- "$parent")
-      [[ "$mode" == 700 && "$uid" == 0 && "$gid" == 0 ]]
-      [[ "$parent_nlink" =~ ^[1-9][0-9]*$ ]]
-      [[ ! -e "$marker" && ! -L "$marker" ]]
-      temporary="$parent/.owner.$$"
-      [[ ! -e "$temporary" && ! -L "$temporary" ]]
-      umask 077
-      cp -- "$expected" "$temporary"
-      chown root:root -- "$temporary"
-      chmod 0600 -- "$temporary"
-      ln -- "$temporary" "$marker"
-      rm -- "$temporary"
-      read -r mode uid gid nlink < <(stat -c "%a %u %g %h" -- "$marker")
-      [[ "$mode" == 600 && "$uid" == 0 && "$gid" == 0 && "$nlink" == 1 ]]
-      python3 -I -S -c '"'"'
+  validate_owner_token "${token}" || return 1
+  run_recorded "${ORB_COMMAND_TIMEOUT_SECONDS}" "${output}" \
+    orb -m "${clone_vm}" -u root /usr/bin/python3 -I -S -c '
+import os
+import stat
 import sys
-with open(sys.argv[1], "rb") as left, open(sys.argv[2], "rb") as right:
-    while True:
-        a = left.read(1024 * 1024)
-        b = right.read(1024 * 1024)
-        if a != b:
-            raise SystemExit(1)
-        if not a:
-            break
-'"'"' "$marker" "$expected"
-    ' _ "${marker_basename}" "${expected}" >"${output}" 2>"${output}.stderr"
+
+parent, basename, token = sys.argv[1:]
+marker = os.path.join(parent, basename)
+if os.path.lexists(parent):
+    info = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise SystemExit("guest owner directory metadata differs")
+else:
+    os.mkdir(parent, 0o700)
+if os.path.lexists(marker):
+    raise SystemExit("guest owner marker already exists")
+descriptor = os.open(
+    marker,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    os.write(descriptor, (token + "\n").encode("ascii"))
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+info = os.lstat(marker)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_nlink != 1
+    or info.st_uid != 0
+    or info.st_gid != 0
+    or stat.S_IMODE(info.st_mode) != 0o600
+):
+    raise SystemExit("guest owner marker metadata differs")
+print("guest_owner_marker=created")
+print(f"guest_owner_marker_path={marker}")
+' "${GUEST_OWNER_DIRECTORY}" "${marker_basename}" "${token}"
 }
 
 verify_guest_owner_marker_from_host() {
-  local clone_vm="$1" repo_root="$2" marker="$3" expected="$4" output="$5"
+  local clone_vm="$1" marker="$2" token="$3" output="$4"
   local marker_basename="${marker##*/}"
   [[ "${marker}" == "${GUEST_OWNER_DIRECTORY}/${marker_basename}" ]] || return 1
   marker_basename="$(sanitize_component "${marker_basename}")" || return 1
-  # The single-quoted program is intentionally evaluated inside the guest.
-  # shellcheck disable=SC2016
-  run_bounded "${ORB_COMMAND_TIMEOUT_SECONDS}" \
-    orb -m "${clone_vm}" -u root -p -w "${repo_root}" \
-    bash -ceu '
-      parent=/var/lib/shadowpipe-phase3-lab
-      marker="$parent/$1"
-      expected=$2
-      [[ -d "$parent" && ! -L "$parent" ]]
-      [[ -f "$marker" && ! -L "$marker" ]]
-      [[ -f "$expected" && ! -L "$expected" ]]
-      read -r parent_mode parent_uid parent_gid parent_nlink < <(stat -c "%a %u %g %h" -- "$parent")
-      read -r mode uid gid nlink < <(stat -c "%a %u %g %h" -- "$marker")
-      [[ "$parent_mode" == 700 && "$parent_uid" == 0 && "$parent_gid" == 0 ]]
-      [[ "$parent_nlink" =~ ^[1-9][0-9]*$ ]]
-      [[ "$mode" == 600 && "$uid" == 0 && "$gid" == 0 && "$nlink" == 1 ]]
-      python3 -I -S -c '"'"'
+  validate_owner_token "${token}" || return 1
+  run_recorded "${ORB_COMMAND_TIMEOUT_SECONDS}" "${output}" \
+    orb -m "${clone_vm}" -u root /usr/bin/python3 -I -S -c '
+import hashlib
+import os
+import stat
 import sys
-with open(sys.argv[1], "rb") as left, open(sys.argv[2], "rb") as right:
-    while True:
-        a = left.read(1024 * 1024)
-        b = right.read(1024 * 1024)
-        if a != b:
-            raise SystemExit(1)
-        if not a:
-            break
-'"'"' "$marker" "$expected"
-      sha256sum -- "$marker"
-    ' _ "${marker_basename}" "${expected}" >"${output}" 2>"${output}.stderr"
+
+parent, basename, token = sys.argv[1:]
+marker = os.path.join(parent, basename)
+parent_info = os.lstat(parent)
+info = os.lstat(marker)
+if (
+    not stat.S_ISDIR(parent_info.st_mode)
+    or stat.S_ISLNK(parent_info.st_mode)
+    or parent_info.st_uid != 0
+    or parent_info.st_gid != 0
+    or stat.S_IMODE(parent_info.st_mode) != 0o700
+):
+    raise SystemExit("guest owner directory metadata differs")
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_nlink != 1
+    or info.st_uid != 0
+    or info.st_gid != 0
+    or stat.S_IMODE(info.st_mode) != 0o600
+):
+    raise SystemExit("guest owner marker metadata differs")
+descriptor = os.open(marker, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+with os.fdopen(descriptor, "rb", buffering=0) as stream:
+    data = stream.read()
+if data != (token + "\n").encode("ascii"):
+    raise SystemExit("guest owner marker token differs")
+print("guest_owner_marker=valid")
+print(f"guest_owner_marker_sha256={hashlib.sha256(data).hexdigest()}")
+' "${GUEST_OWNER_DIRECTORY}" "${marker_basename}" "${token}"
 }
 
 host_main() {
@@ -2231,7 +3566,8 @@ host_main() {
 
   local tool
   for tool in orb orbctl route netstat scutil pgrep ps mktemp awk sed tr wc \
-    date sha256sum find sort pfctl stat grep /usr/bin/python3; do
+    date sha256sum find sort pfctl stat grep git openssl head mkfifo \
+    /usr/bin/env /usr/bin/python3; do
     command -v "${tool}" >/dev/null \
       || die "${EX_UNAVAILABLE}" "missing host dependency: ${tool}"
   done
@@ -2246,7 +3582,9 @@ host_main() {
   local magic="${SHADOWPIPE_MAGIC:-${MAGIC_DEFAULT}}"
   validate_magic "${magic}" \
     || die "${EX_USAGE}" 'SHADOWPIPE_MAGIC must be one explicit u32 value'
-  local script_dir repo_root result_root run_id clone_vm target_dir helper
+  local script_dir repo_root result_root run_id clone_vm helper
+  local guest_root guest_archive guest_repo guest_target guest_result
+  local guest_source_manifest guest_runner
   script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
   repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
   result_root="${script_dir}/results"
@@ -2255,14 +3593,18 @@ host_main() {
     || die "${EX_NOPERM}" "result root is not a real directory"
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   clone_vm="sphr-$(printf '%s' "${run_id}" | tr '[:upper:]' '[:lower:]')"
-  # Orb command sessions do not guarantee a shared guest /tmp view. Keep the
-  # one-off target under the already shared repository, verify it in the build
-  # session, and remove it during host cleanup.
-  target_dir="${repo_root}/target/phase3-lab-${run_id}"
-  helper="${target_dir}/release/examples/${HELPER_NAME}"
+  guest_root="/var/tmp/shadowpipe-phase3-${run_id}"
+  guest_archive="${guest_root}/source.tar"
+  guest_repo="${guest_root}/shadowpipe"
+  guest_target="${guest_root}/target"
+  guest_result="${guest_root}/result"
+  guest_source_manifest="${guest_root}/source-files.sha256"
+  guest_runner="${guest_repo}/tests/host-recovery/run-orbstack-phase3.sh"
+  helper="${guest_target}/release/examples/${HELPER_NAME}"
 
   local host_tmp before after build_log guest_log build_contract orb_evidence result_dir
-  local private_owner_file shared_owner_file guest_owner_marker host_lock_dir
+  local private_owner_file guest_owner_marker host_lock_dir source_archive
+  local guest_evidence_archive guest_evidence_stage owner_token
   host_tmp="$(mktemp -d "${TMPDIR:-/tmp}/shadowpipe-phase3-host.XXXXXX")"
   before="${host_tmp}/mac-before"
   after="${host_tmp}/mac-after"
@@ -2272,8 +3614,13 @@ host_main() {
   orb_evidence="${host_tmp}/orb-evidence"
   result_dir="${result_root}/${run_id}"
   private_owner_file="${host_tmp}/clone-owner.env"
-  shared_owner_file="${target_dir}/clone-owner.env"
   guest_owner_marker="${GUEST_OWNER_DIRECTORY}/${clone_vm}.owner"
+  source_archive="${host_tmp}/source.tar"
+  guest_evidence_archive="${host_tmp}/guest-evidence.tar"
+  guest_evidence_stage="${host_tmp}/guest-evidence-stage"
+  owner_token="$(openssl rand -hex 32)"
+  validate_owner_token "${owner_token}" \
+    || die "${EX_UNAVAILABLE}" "could not create one ownership token"
   # All privileged Shadowpipe OrbStack runners share this one conservative
   # lifecycle mutex. Different owner-file schemas are intentional: mkdir is
   # the cross-runner exclusion primitive, and each owner removes only its own.
@@ -2282,11 +3629,19 @@ host_main() {
   : >"${build_log}"
   : >"${guest_log}"
   {
-    printf 'schema_version=1\n'
+    printf 'schema_version=2\n'
     printf 'profile=release\n'
     printf 'package=shadowpipe-core\n'
     printf 'example=%s\n' "${HELPER_NAME}"
     printf 'features=no-default-features\n'
+    printf 'cargo_network=offline\n'
+    printf 'source_transport=bounded_git_archive_stdin\n'
+    printf 'evidence_transport=bounded_validated_tar_stdout\n'
+    printf 'guest_storage=guest_local_only\n'
+    printf 'orb_shared_checkout=false\n'
+    printf 'git_system_attributes=disabled\n'
+    printf 'git_common_attributes_grafts=absent_required\n'
+    printf 'git_tree_entry_types=regular_only\n'
     printf 'magic_source=%s\n' "${magic_source}"
     printf 'SHADOWPIPE_MAGIC=%s\n' "${magic}"
   } >"${build_contract}"
@@ -2298,7 +3653,7 @@ host_main() {
   local clone_started=0 guest_marker_attempted=0 guest_marker_valid=0
   local destructive_guest_started=0 baseline_valid=0 lock_acquired=0
   local final_status=0 guest_command_status=1 guest_user=''
-  local cleanup_running=0 target_initialized=0
+  local cleanup_running=0 guest_result_transferred=0
   host_cleanup() {
     local incoming=$?
     (( cleanup_running == 0 )) || exit 1
@@ -2341,8 +3696,7 @@ host_main() {
           "${clone_vm}" "${clone_vm}" "${clone_orb_id}" '' \
           "${orb_evidence}/clone-info-cleanup-before-marker" >/dev/null \
         && validate_host_owner_file "${private_owner_file}" "$(id -u)" \
-        && validate_host_owner_file "${shared_owner_file}" "$(id -u)" \
-        && bounded_cmp "${private_owner_file}" "${shared_owner_file}" \
+        && validate_owner_token "${owner_token}" \
         && (( clone_attempted != 0 && clone_absent_before != 0 )); then
         if (( guest_marker_attempted != 0 )); then
           if [[ "${clone_state}" != running ]]; then
@@ -2359,8 +3713,8 @@ host_main() {
               "${clone_vm}" "${clone_vm}" "${clone_orb_id}" running \
               "${orb_evidence}/clone-info-cleanup-before-owner-verify" >/dev/null \
             && verify_guest_owner_marker_from_host \
-              "${clone_orb_id}" "${repo_root}" "${guest_owner_marker}" \
-              "${shared_owner_file}" "${orb_evidence}/cleanup-owner-verify.log"; then
+              "${clone_orb_id}" "${guest_owner_marker}" "${owner_token}" \
+              "${orb_evidence}/cleanup-owner-verify.log"; then
             delete_authorized=1
             delete_proof=opaque_id_and_host_and_guest_markers
           elif (( destructive_guest_started == 0 )); then
@@ -2461,24 +3815,6 @@ host_main() {
       cleanup_status=failed
     fi
 
-    if (( target_initialized == 0 )); then
-      if [[ -e "${target_dir}" || -L "${target_dir}" ]]; then
-        warn 'uninitialized target path unexpectedly exists; refusing removal'
-        cleanup_status=failed
-      fi
-    elif [[ "${target_dir}" == "${repo_root}/target/phase3-lab-${run_id}" \
-      && -d "${target_dir}" && ! -L "${target_dir}" ]] \
-      && validate_host_owner_file "${shared_owner_file}" "$(id -u)" \
-      && bounded_cmp "${private_owner_file}" "${shared_owner_file}"; then
-      run_bounded "${FILE_CLEANUP_TIMEOUT_SECONDS}" rm -rf -- "${target_dir}" \
-        >"${orb_evidence}/target-cleanup.log" 2>&1 || cleanup_status=failed
-      [[ ! -e "${target_dir}" && ! -L "${target_dir}" ]] || cleanup_status=failed
-      target_initialized=0
-    else
-      warn 'target cleanup path or ownership marker failed its exact proof'
-      cleanup_status=failed
-    fi
-
     if (( baseline_valid != 0 )) && snapshot_macos "${after}" \
       && compare_macos_snapshots "${before}" "${after}"; then
       host_safety_status=valid
@@ -2518,7 +3854,8 @@ host_main() {
     fi
 
     if [[ -e "${result_dir}" || -L "${result_dir}" ]]; then
-      if bounded_bundle_operation validate "${result_dir}"; then
+      if (( guest_result_transferred != 0 )) \
+        && bounded_bundle_operation validate "${result_dir}"; then
         if (( guest_command_status == 0 )) \
           && bounded_bundle_operation verify "${result_dir}" \
           && validate_guest_status_file "${result_dir}/status.env" "${run_id}"; then
@@ -2546,35 +3883,44 @@ host_main() {
     if bounded_bundle_operation validate "${result_dir}"; then
       bounded_file_operation rm -f -- \
         "${result_dir}/checksums.sha256" "${result_dir}/evidence-census.txt" \
+        "${result_dir}/.shadowpipe-phase3-result-owner" \
         || evidence_preflight=failed
-      bounded_file_operation rm -rf -- "${result_dir}/host-evidence" \
-        || evidence_preflight=failed
-      bounded_file_operation mkdir -- "${result_dir}/host-evidence" \
-        || evidence_preflight=failed
-      bounded_file_operation cp -- \
-        "${build_log}" "${result_dir}/host-evidence/host-build.log" \
-        || evidence_preflight=failed
-      bounded_file_operation cp -- \
-        "${guest_log}" "${result_dir}/host-evidence/host-guest.log" \
-        || evidence_preflight=failed
-      bounded_file_operation cp -- \
-        "${build_contract}" "${result_dir}/host-evidence/build-contract.env" \
-        || evidence_preflight=failed
-      bounded_file_operation cp -- \
-        "${private_owner_file}" "${result_dir}/host-evidence/clone-owner.env" \
-        || evidence_preflight=failed
-      bounded_file_operation cp -R -- \
-        "${before}" "${result_dir}/host-evidence/mac-before" \
-        || evidence_preflight=failed
-      bounded_file_operation cp -R -- \
-        "${after}" "${result_dir}/host-evidence/mac-after" \
-        || evidence_preflight=failed
-      bounded_file_operation cp -R -- \
-        "${orb_evidence}" "${result_dir}/host-evidence/orb-lifecycle" \
-        || evidence_preflight=failed
-      printf 'unsafe_guest_quarantine=%s\n' "${quarantine}" \
-        >"${result_dir}/host-evidence/publication.env" \
-        || evidence_preflight=failed
+      if [[ "${evidence_preflight}" == valid ]] \
+        && scan_owner_token_absent "${owner_token}" \
+          "${result_dir}" "${build_log}" "${guest_log}" "${build_contract}" \
+          "${private_owner_file}" "${before}" "${after}" "${orb_evidence}"; then
+        bounded_file_operation rm -rf -- "${result_dir}/host-evidence" \
+          || evidence_preflight=failed
+        bounded_file_operation mkdir -- "${result_dir}/host-evidence" \
+          || evidence_preflight=failed
+        bounded_file_operation cp -- \
+          "${build_log}" "${result_dir}/host-evidence/host-build.log" \
+          || evidence_preflight=failed
+        bounded_file_operation cp -- \
+          "${guest_log}" "${result_dir}/host-evidence/host-guest.log" \
+          || evidence_preflight=failed
+        bounded_file_operation cp -- \
+          "${build_contract}" "${result_dir}/host-evidence/build-contract.env" \
+          || evidence_preflight=failed
+        bounded_file_operation cp -- \
+          "${private_owner_file}" "${result_dir}/host-evidence/clone-owner.env" \
+          || evidence_preflight=failed
+        bounded_file_operation cp -R -- \
+          "${before}" "${result_dir}/host-evidence/mac-before" \
+          || evidence_preflight=failed
+        bounded_file_operation cp -R -- \
+          "${after}" "${result_dir}/host-evidence/mac-after" \
+          || evidence_preflight=failed
+        bounded_file_operation cp -R -- \
+          "${orb_evidence}" "${result_dir}/host-evidence/orb-lifecycle" \
+          || evidence_preflight=failed
+        printf 'unsafe_guest_quarantine=%s\nowner_token_scan=valid\n' \
+          "${quarantine}" \
+          >"${result_dir}/host-evidence/publication.env" \
+          || evidence_preflight=failed
+      else
+        evidence_preflight=failed
+      fi
     else
       evidence_preflight=failed
     fi
@@ -2648,7 +3994,8 @@ host_main() {
       fi
       printf -- '- Host-safety timing: before/after endpoint snapshots, not a continuous mutation monitor.\n'
       printf -- '- Evidence authenticity: relative SHA-256 plus a final census; no external signature or timestamp authority.\n'
-      printf -- '- VM identity: strict duplicate-key-rejecting OrbStack JSON bound opaque source/clone IDs; start/stop/guest operations used the clone ID, while delete-by-name required an immediate name-to-ID revalidation because OrbStack 2.2.1 panicked on delete-by-ID in an observed lab run.\n'
+      printf -- '- VM identity: strict duplicate-key-rejecting OrbStack JSON bound opaque source/clone IDs plus exact isolated/network-isolated/no-mount/no-forward/no-agent capabilities; start/stop/guest operations used the clone ID, while delete-by-name required an immediate name-to-ID revalidation.\n'
+      printf -- '- Source/evidence boundary: clean pushed main was pinned by commit-bearing git archive, streamed by bounded stdin into guest-local storage, and sealed evidence returned by bounded validated stdout tar; no shared checkout or host target mount was used.\n'
       printf '\nAn unrelated same-host OrbStack lifecycle operator is outside this run\047s trust boundary.\n'
     } >"${result_dir}/FINAL-RESULT.md" || evidence_status=failed
     printf 'finalization=complete\nrun_id=%s\n' "${run_id}" \
@@ -2711,9 +4058,26 @@ host_main() {
   cp -- "${private_owner_file}" "${host_lock_dir}/owner.env"
   chmod 0600 "${host_lock_dir}/owner.env"
 
-  create_source_provenance_manifest "${repo_root}" \
-    "${orb_evidence}/source-provenance-before.sha256" \
-    "tests/host-recovery/run-orbstack-phase3.sh"
+  capture_git_checkout_proof \
+    "${repo_root}" "${orb_evidence}/git-checkout-before" \
+    || die "${EX_UNAVAILABLE}" \
+      "repository must be clean pushed main before creating the guest archive"
+  local pinned_head source_archive_size source_archive_hash
+  pinned_head="$(<"${orb_evidence}/git-checkout-before/head.txt")"
+  create_pinned_source_archive "${repo_root}" "${pinned_head}" \
+    "${source_archive}" "${orb_evidence}/source-archive.env" \
+    || die "${EX_UNAVAILABLE}" "could not create a bounded pinned Git archive"
+  source_archive_size="$(metadata_field \
+    "${orb_evidence}/source-archive.env" source_archive_bytes)" \
+    || die "${EX_UNAVAILABLE}" "source archive size proof is malformed"
+  source_archive_hash="$(metadata_field \
+    "${orb_evidence}/source-archive.env" source_archive_sha256)" \
+    || die "${EX_UNAVAILABLE}" "source archive digest proof is malformed"
+  {
+    printf 'pinned_head=%s\n' "${pinned_head}"
+    printf 'source_archive_bytes=%s\n' "${source_archive_size}"
+    printf 'source_archive_sha256=%s\n' "${source_archive_hash}"
+  } >>"${build_contract}"
 
   local source_state clone_state
   source_state="$(orb_exact_state "${source_vm}" "${orb_evidence}/initial.list")" \
@@ -2736,21 +4100,10 @@ host_main() {
     || die "${EX_UNAVAILABLE}" \
       "live macOS baseline collector failed; raw evidence will be preserved"
   baseline_valid=1
-
-  [[ ! -e "${target_dir}" && ! -L "${target_dir}" ]] \
-    || die "${EX_USAGE}" "generated target directory already exists"
-  [[ -d "${repo_root}/target" && ! -L "${repo_root}/target" \
-    && "$(cd -- "${repo_root}/target" && pwd -P)" == "${repo_root}/target" ]] \
-    || die "${EX_NOPERM}" "shared target root is absent, symlinked, or redirected"
-  mkdir -m 0700 -- "${target_dir}"
-  cp -- "${private_owner_file}" "${shared_owner_file}"
-  chmod 0600 "${shared_owner_file}"
-  if ! validate_host_owner_file "${private_owner_file}" "$(id -u)" \
-    || ! validate_host_owner_file "${shared_owner_file}" "$(id -u)" \
-    || ! bounded_cmp "${private_owner_file}" "${shared_owner_file}"; then
-    die "${EX_NOPERM}" "host ownership markers are unsafe"
-  fi
-  target_initialized=1
+  [[ ! -e "${result_dir}" && ! -L "${result_dir}" ]] \
+    || die "${EX_USAGE}" "generated host result directory already exists"
+  validate_host_owner_file "${private_owner_file}" "$(id -u)" \
+    || die "${EX_NOPERM}" "host ownership marker is unsafe"
 
   say "cloning stopped ${source_vm} -> disposable ${clone_vm}"
   clone_attempted=1
@@ -2782,71 +4135,133 @@ host_main() {
     >"${orb_evidence}/start.log" 2>&1 \
     || die 1 "bounded clone start failed"
   clone_started=1
-  run_bounded "${ORB_COMMAND_TIMEOUT_SECONDS}" orb -m "${clone_orb_id}" id -un \
-    >"${orb_evidence}/guest-user.txt" 2>"${orb_evidence}/guest-user.txt.stderr" \
-    || die "${EX_UNAVAILABLE}" "cannot identify guest user"
-  guest_user="$(<"${orb_evidence}/guest-user.txt")"
-  guest_user="$(sanitize_component "${guest_user}")" \
-    || die "${EX_UNAVAILABLE}" "unsafe guest user"
   capture_orb_identity "${HOST_COLLECTOR_TIMEOUT_SECONDS}" \
     "${clone_vm}" "${clone_vm}" "${clone_orb_id}" running \
     "${orb_evidence}/clone-info-before-owner-marker" >/dev/null \
     || die 1 "clone identity changed before ownership marking"
+  guest_user="$(orb_identity_field \
+    "${orb_evidence}/clone-info-before-owner-marker.identity.json" \
+    default_username)" \
+    || die "${EX_UNAVAILABLE}" "isolated clone default_username is absent or unsafe"
 
+  # This is intentionally the first guest command after clone start.
   guest_marker_attempted=1
-  create_guest_owner_marker "${clone_orb_id}" "${repo_root}" \
-    "${guest_owner_marker}" "${shared_owner_file}" \
+  create_guest_owner_marker "${clone_orb_id}" "${guest_owner_marker}" \
+    "${owner_token}" \
     "${orb_evidence}/owner-create.log" \
     || die "${EX_NOPERM}" "cannot create safe guest ownership marker"
-  verify_guest_owner_marker_from_host "${clone_orb_id}" "${repo_root}" \
-    "${guest_owner_marker}" "${shared_owner_file}" \
+  verify_guest_owner_marker_from_host "${clone_orb_id}" \
+    "${guest_owner_marker}" "${owner_token}" \
     "${orb_evidence}/owner-verify.log" \
     || die "${EX_NOPERM}" "cannot verify guest ownership marker"
-  bounded_cmp "${private_owner_file}" "${shared_owner_file}" \
-    || die "${EX_NOPERM}" "shared ownership marker changed"
   guest_marker_valid=1
+  capture_orb_identity "${HOST_COLLECTOR_TIMEOUT_SECONDS}" \
+    "${clone_vm}" "${clone_vm}" "${clone_orb_id}" running \
+    "${orb_evidence}/clone-info-after-owner-marker" >/dev/null \
+    || die 1 "clone identity or isolated capabilities changed after ownership marking"
+  capture_guest_isolation_preflight "${clone_orb_id}" "${guest_user}" \
+    "${orb_evidence}/guest-isolation-preflight.env" \
+    || die "${EX_UNAVAILABLE}" \
+      "clone runtime exposes Mac sharing, SSH agent, or mac-command integration"
+
+  stream_source_archive_to_guest "${clone_orb_id}" "${source_archive}" \
+    "${guest_root}" "${guest_archive}" "${source_archive_size}" \
+    "${source_archive_hash}" "${orb_evidence}/source-transfer.env" \
+    || die 1 "bounded pinned source archive transfer into the clone failed"
+  extract_guest_source_archive \
+    "${clone_orb_id}" "${guest_root}" "${guest_archive}" "${guest_repo}" \
+    "${guest_target}" "${guest_result}" "${guest_source_manifest}" \
+    "${run_id}" "${clone_vm}" "${owner_token}" "${source_archive_size}" \
+    "${source_archive_hash}" "${orb_evidence}/source-extract.env" \
+    || die 1 "guest-local source extraction or ownership setup failed"
+  verify_guest_source_manifest \
+    "${clone_orb_id}" "${guest_repo}" "${guest_source_manifest}" \
+    "${orb_evidence}/source-manifest-before-build.env" \
+    || die 1 "guest source manifest failed before build"
 
   say "building lab-only helper inside ${clone_vm}"
+  # Positional parameters intentionally expand only in the guest Bash.
+  # shellcheck disable=SC2016
   if ! run_bounded "${ORB_BUILD_TIMEOUT_SECONDS}" \
-    orb -m "${clone_orb_id}" -p -w "${repo_root}" bash -lc \
-    "SHADOWPIPE_MAGIC='${magic}' CARGO_TARGET_DIR='${target_dir}' cargo build --release --locked --no-default-features -p shadowpipe-core --example '${HELPER_NAME}' && test -x '${helper}' && printf 'shadowpipe_magic=%s\\n' '${magic}' && sha256sum '${helper}'" \
+    orb -m "${clone_orb_id}" -u root env \
+    SHADOWPIPE_MAGIC="${magic}" CARGO_NET_OFFLINE=true \
+    CARGO_TARGET_DIR="${guest_target}" /bin/bash -ceu '
+      cd -- "$1"
+      cargo build --offline --release --locked --no-default-features \
+        -p shadowpipe-core --example "$2"
+      test -x "$3"
+      printf "shadowpipe_magic=%s\n" "$4"
+      sha256sum "$3"
+    ' phase3-guest-build "${guest_repo}" "${HELPER_NAME}" "${helper}" "${magic}" \
     >"${build_log}" 2>&1; then
     die 1 "guest helper build failed"
   fi
   [[ "$(run_bounded "${HOST_COLLECTOR_TIMEOUT_SECONDS}" \
     grep -Fxc -- "shadowpipe_magic=${magic}" "${build_log}")" == 1 ]] \
     || die 1 "release build log did not bind exactly one validated SHADOWPIPE_MAGIC"
-  verify_source_provenance_manifest "${repo_root}" \
-    "${orb_evidence}/source-provenance-before.sha256" \
-    "${orb_evidence}/source-provenance-after-build.sha256" \
-    "tests/host-recovery/run-orbstack-phase3.sh" \
-    || die 1 "source, runner, manifests, or Cargo.lock changed during the Phase-3 build"
+  verify_guest_source_manifest \
+    "${clone_orb_id}" "${guest_repo}" "${guest_source_manifest}" \
+    "${orb_evidence}/source-manifest-after-build.env" \
+    || die 1 "guest source changed during the Phase-3 build"
+  capture_git_checkout_proof \
+    "${repo_root}" "${orb_evidence}/git-checkout-after-build" "${pinned_head}" \
+    || die 1 "host checkout or pushed origin/main changed during guest-local build"
 
   say "running privileged private-namespace matrix inside ${clone_vm}"
   destructive_guest_started=1
   set +e
   run_bounded "${ORB_GUEST_TIMEOUT_SECONDS}" \
-    orb -m "${clone_orb_id}" -u root -p -w "${repo_root}" env \
+    orb -m "${clone_orb_id}" -u root env \
     SHADOWPIPE_PHASE3_GUEST_ORCHESTRATOR=1 \
     SHADOWPIPE_PHASE3_CLONE_NAME="${clone_vm}" \
     SHADOWPIPE_PHASE3_HELPER="${helper}" \
     SHADOWPIPE_PHASE3_MAGIC="${magic}" \
     SHADOWPIPE_PHASE3_OWNER_BASENAME="${guest_owner_marker##*/}" \
-    SHADOWPIPE_PHASE3_EXPECTED_OWNER_FILE="${shared_owner_file}" \
-    bash tests/host-recovery/run-orbstack-phase3.sh --guest "${run_id}" "${guest_user}" \
+    SHADOWPIPE_PHASE3_OWNER_TOKEN="${owner_token}" \
+    SHADOWPIPE_PHASE3_RESULT_ROOT="${guest_result}" \
+    /bin/bash "${guest_runner}" --guest "${run_id}" "${guest_user}" \
     >"${guest_log}" 2>&1
   guest_command_status=$?
   set -e
   (( guest_command_status == 0 )) || final_status="${guest_command_status}"
-  [[ -d "${result_root}/${run_id}" ]] || {
-    warn 'guest did not publish a result bundle'
+  verify_guest_source_manifest \
+    "${clone_orb_id}" "${guest_repo}" "${guest_source_manifest}" \
+    "${orb_evidence}/source-manifest-final.env" \
+    || die 1 "guest source changed during the Phase-3 experiment"
+  if stream_guest_evidence_archive \
+      "${clone_orb_id}" "${guest_runner}" "${guest_result}" "${run_id}" \
+      "${clone_vm}" "${owner_token}" "${guest_evidence_archive}" \
+    && extract_guest_evidence_archive \
+      "${guest_evidence_archive}" "${guest_evidence_stage}" "${run_id}" \
+      "${clone_vm}" "${owner_token}" \
+    && [[ ! -e "${result_dir}" && ! -L "${result_dir}" ]] \
+    && bounded_file_operation mv -- "${guest_evidence_stage}" "${result_dir}" \
+    && bounded_bundle_operation verify "${result_dir}" \
+    && validate_guest_status_file "${result_dir}/status.env" "${run_id}"; then
+    guest_result_transferred=1
+    {
+      printf 'guest_evidence_transfer=validated_stream\n'
+      printf 'guest_evidence_archive_bytes=%s\n' \
+        "$(file_size_bytes "${guest_evidence_archive}")"
+      printf 'guest_evidence_archive_sha256=%s\n' \
+        "$(sha256sum "${guest_evidence_archive}" | awk '{print $1}')"
+    } >"${orb_evidence}/guest-evidence-transfer.env"
+  else
+    warn 'guest did not return one validated sealed result bundle'
     final_status=1
-  }
-  verify_source_provenance_manifest "${repo_root}" \
-    "${orb_evidence}/source-provenance-before.sha256" \
-    "${orb_evidence}/source-provenance-final.sha256" \
-    "tests/host-recovery/run-orbstack-phase3.sh" \
-    || die 1 "source, runner, manifests, or Cargo.lock changed during the Phase-3 experiment"
+  fi
+  local transfer_file
+  for transfer_file in \
+    "${guest_evidence_archive}.status" "${guest_evidence_archive}.stderr"; do
+    if [[ -f "${transfer_file}" && ! -L "${transfer_file}" ]]; then
+      bounded_file_operation cp -- "${transfer_file}" \
+        "${orb_evidence}/$(basename -- "${transfer_file}")" \
+        || final_status=1
+    fi
+  done
+  capture_git_checkout_proof \
+    "${repo_root}" "${orb_evidence}/git-checkout-final" "${pinned_head}" \
+    || die 1 "host checkout or pushed origin/main changed during the experiment"
   host_cleanup
 }
 
@@ -2884,6 +4299,7 @@ write_selftest_wal() {
 self_test() {
   local temporary status self_uid self_gid repo_root
   command -v jq >/dev/null || return 1
+  command -v git >/dev/null || return 1
   temporary="$(mktemp -d "${TMPDIR:-/tmp}/shadowpipe-phase3-selftest.XXXXXX")"
   SELFTEST_TEMPORARY="${temporary}"
   trap 'rm -rf -- "${SELFTEST_TEMPORARY}"' EXIT
@@ -2896,6 +4312,154 @@ self_test() {
   verify_source_provenance_manifest "${repo_root}" \
     "${temporary}/source-before.sha256" "${temporary}/source-after.sha256" \
     "tests/host-recovery/run-orbstack-phase3.sh"
+
+  printf '%s\n' \
+    'source_archive=git_archive' \
+    'pinned_head=1111111111111111111111111111111111111111' \
+    'source_archive_bytes=4096' \
+    'source_archive_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'source_archive_members=2' \
+    'source_expanded_bytes=32' \
+    >"${temporary}/source-archive.env"
+  [[ "$(metadata_field \
+    "${temporary}/source-archive.env" source_archive_bytes)" == 4096 ]]
+  printf '%s\n' 'source_archive_bytes=1' \
+    >>"${temporary}/source-archive.env"
+  if metadata_field "${temporary}/source-archive.env" \
+    source_archive_bytes >"${temporary}/duplicate-field.out" \
+    2>"${temporary}/duplicate-field.err"; then
+    return 1
+  fi
+
+  mkdir "${temporary}/git-fixture"
+  git -C "${temporary}/git-fixture" init -q
+  git -C "${temporary}/git-fixture" config user.name shadowpipe-selftest
+  git -C "${temporary}/git-fixture" config user.email selftest@invalid
+  git -C "${temporary}/git-fixture" config commit.gpgsign false
+  git -C "${temporary}/git-fixture" config push.gpgSign false
+  git -C "${temporary}/git-fixture" config protocol.file.allow always
+  printf '%s\n' pinned-source-fixture \
+    >"${temporary}/git-fixture/input.txt"
+  git -C "${temporary}/git-fixture" add input.txt
+  git -C "${temporary}/git-fixture" commit -q -m fixture
+  git -C "${temporary}/git-fixture" branch -M main
+  git init -q --bare "${temporary}/git-origin.git"
+  git -C "${temporary}/git-fixture" remote add origin \
+    "${temporary}/git-origin.git"
+  git -C "${temporary}/git-fixture" push -q -u origin main
+  local fixture_head fixture_git_dir replacement_commit
+  fixture_head="$(git -C "${temporary}/git-fixture" rev-parse HEAD)"
+  capture_git_checkout_proof "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-proof"
+  [[ "$(<"${temporary}/git-checkout-proof/head.txt")" == "${fixture_head}" ]]
+  grep -q '"system_attributes":"disabled"' \
+    "${temporary}/git-checkout-proof/git-metadata-safety.json"
+  grep -q '"tree_entry_types":"regular_only"' \
+    "${temporary}/git-checkout-proof/git-metadata-safety.json"
+  fixture_git_dir="$(
+    git -C "${temporary}/git-fixture" rev-parse --absolute-git-dir
+  )"
+  replacement_commit="$(
+    git -C "${temporary}/git-fixture" commit-tree \
+      "${fixture_head}^{tree}" -p "${fixture_head}" -m replacement
+  )"
+  git -C "${temporary}/git-fixture" replace \
+    "${fixture_head}" "${replacement_commit}"
+  if capture_git_checkout_proof "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-replace-ref" \
+    >"${temporary}/git-checkout-replace-ref.out" \
+    2>"${temporary}/git-checkout-replace-ref.err"; then
+    return 1
+  fi
+  git -C "${temporary}/git-fixture" replace -d "${fixture_head}" \
+    >/dev/null
+  printf '%s\n' 'input.txt export-ignore' \
+    >"${fixture_git_dir}/info/attributes"
+  if capture_git_checkout_proof "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-info-attributes" \
+    >"${temporary}/git-checkout-info-attributes.out" \
+    2>"${temporary}/git-checkout-info-attributes.err"; then
+    return 1
+  fi
+  rm -- "${fixture_git_dir}/info/attributes"
+  git -C "${temporary}/git-fixture" worktree add --detach \
+    "${temporary}/git-linked-worktree" "${fixture_head}" \
+    >/dev/null 2>&1
+  printf '%s\n' 'input.txt export-ignore' \
+    >"${fixture_git_dir}/info/attributes"
+  if validate_git_metadata_safety \
+    "${temporary}/git-linked-worktree" \
+    "${temporary}/git-linked-common-attributes.json" \
+    "${fixture_head}" \
+    >"${temporary}/git-linked-common-attributes.out" \
+    2>"${temporary}/git-linked-common-attributes.err"; then
+    return 1
+  fi
+  rm -- "${fixture_git_dir}/info/attributes"
+  git -C "${temporary}/git-fixture" worktree remove --force \
+    "${temporary}/git-linked-worktree"
+  : >"${fixture_git_dir}/info/grafts"
+  if capture_git_checkout_proof "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-info-grafts" \
+    >"${temporary}/git-checkout-info-grafts.out" \
+    2>"${temporary}/git-checkout-info-grafts.err"; then
+    return 1
+  fi
+  rm -- "${fixture_git_dir}/info/grafts"
+  git -C "${temporary}/git-fixture" config \
+    core.attributesFile /dev/null
+  if capture_git_checkout_proof "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-core-attributes" \
+    >"${temporary}/git-checkout-core-attributes.out" \
+    2>"${temporary}/git-checkout-core-attributes.err"; then
+    return 1
+  fi
+  git -C "${temporary}/git-fixture" config --unset-all \
+    core.attributesFile
+  if GIT_CONFIG_COUNT=0 capture_git_checkout_proof \
+    "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-ambient-config" \
+    >"${temporary}/git-checkout-ambient-config.out" \
+    2>"${temporary}/git-checkout-ambient-config.err"; then
+    return 1
+  fi
+  if GIT_ATTR_NOSYSTEM=0 capture_git_checkout_proof \
+    "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-ambient-attributes" \
+    >"${temporary}/git-checkout-ambient-attributes.out" \
+    2>"${temporary}/git-checkout-ambient-attributes.err"; then
+    return 1
+  fi
+  printf '%s\n' dirty >"${temporary}/git-fixture/untracked.txt"
+  if capture_git_checkout_proof "${temporary}/git-fixture" \
+    "${temporary}/git-checkout-dirty" \
+    >"${temporary}/git-checkout-dirty.out" \
+    2>"${temporary}/git-checkout-dirty.err"; then
+    return 1
+  fi
+  rm -- "${temporary}/git-fixture/untracked.txt"
+  set +e
+  run_recorded_limited 5 "${temporary}/git-oversize.tar" 512 512 \
+    git -C "${temporary}/git-fixture" archive --format=tar \
+    --prefix=shadowpipe/ "${fixture_head}"
+  status=$?
+  set -e
+  [[ "${status}" == 125 \
+    && "$(file_size_bytes "${temporary}/git-oversize.tar")" == 513 \
+    && "$(file_size_bytes "${temporary}/git-oversize.tar.stderr")" -le 512 ]] \
+    || return 1
+  create_pinned_source_archive "${temporary}/git-fixture" "${fixture_head}" \
+    "${temporary}/git-fixture.tar" "${temporary}/git-fixture-archive.env"
+  [[ "$(metadata_field \
+    "${temporary}/git-fixture-archive.env" pinned_head)" == "${fixture_head}" ]]
+  [[ "$(metadata_field \
+    "${temporary}/git-fixture-archive.env" source_archive_members)" \
+    =~ ^[1-9][0-9]*$ ]]
+  [[ "$(git -C "${temporary}/git-fixture" get-tar-commit-id \
+    <"${temporary}/git-fixture.tar")" == "${fixture_head}" ]]
+  if find "${temporary}" -name '*.pipes.*' -print -quit | grep -q .; then
+    return 1
+  fi
 
   [[ "$(sanitize_component valid-name_7)" == valid-name_7 ]]
   if sanitize_component '../bad' >/dev/null; then
@@ -3083,16 +4647,18 @@ self_test() {
   fi
 
   printf '%s\n' \
-    '{"record":{"id":"opaque-A","name":"sphr-fixture","state":"stopped","future":true},"future_root":1}' \
+    '{"record":{"id":"opaque-A","name":"sphr-fixture","state":"stopped","config":{"isolated":true,"isolate_network":true,"forward_ssh_agent":false,"http_port":0,"https_port":0,"default_username":"fixture","mounts":[]},"future":true},"future_root":1}' \
     >"${temporary}/orb-info.json"
   [[ "$(parse_orb_info_identity "${temporary}/orb-info.json" \
     sphr-fixture opaque-A stopped "${temporary}/orb-identity.json")" \
     == opaque-A ]]
   grep -qx \
-    '{"id":"opaque-A","name":"sphr-fixture","schema_version":1,"state":"stopped"}' \
+    '{"default_username":"fixture","id":"opaque-A","name":"sphr-fixture","schema_version":2,"state":"stopped"}' \
     "${temporary}/orb-identity.json"
+  [[ "$(orb_identity_field \
+    "${temporary}/orb-identity.json" default_username)" == fixture ]]
   printf '%s\n' \
-    '{"record":{"id":"opaque-A","id":"opaque-B","name":"sphr-fixture","state":"stopped"}}' \
+    '{"record":{"id":"opaque-A","id":"opaque-B","name":"sphr-fixture","state":"stopped","config":{"isolated":true,"isolate_network":true,"forward_ssh_agent":false,"http_port":0,"https_port":0,"default_username":"fixture"}}}' \
     >"${temporary}/orb-info-duplicate.json"
   if parse_orb_info_identity "${temporary}/orb-info-duplicate.json" \
     sphr-fixture '' stopped "${temporary}/orb-identity-duplicate.json" \
@@ -3104,14 +4670,36 @@ self_test() {
     >/dev/null 2>&1; then
     return 1
   fi
+  local invalid_orb_index=0 invalid_orb_filter
+  for invalid_orb_filter in \
+    '.record.config.isolated = false' \
+    '.record.config.isolate_network = false' \
+    '.record.config.forward_ssh_agent = true' \
+    '.record.config.http_port = 8080' \
+    '.record.config.https_port = 8443' \
+    '.record.config.mounts = ["/Users"]' \
+    '.record.config.port_forwards = {"22":"22"}' \
+    '.record.config.default_username = "../root"'; do
+    invalid_orb_index=$((invalid_orb_index + 1))
+    jq "${invalid_orb_filter}" "${temporary}/orb-info.json" \
+      >"${temporary}/orb-info-invalid-${invalid_orb_index}.json"
+    if parse_orb_info_identity \
+      "${temporary}/orb-info-invalid-${invalid_orb_index}.json" \
+      sphr-fixture opaque-A stopped \
+      "${temporary}/orb-identity-invalid-${invalid_orb_index}.json" \
+      >/dev/null 2>&1; then
+      return 1
+    fi
+  done
 
   cat >"${temporary}/orb.list" <<'EOF'
 NAME STATE
-arch stopped
+shadowpipe-lab-base stopped
 sphr-example running
 EOF
   validate_orb_listing "${temporary}/orb.list"
-  [[ "$(orb_exact_state_from_file "${temporary}/orb.list" arch)" == stopped ]]
+  [[ "$(orb_exact_state_from_file \
+    "${temporary}/orb.list" shadowpipe-lab-base)" == stopped ]]
   [[ "$(orb_exact_state_from_file "${temporary}/orb.list" absent-vm)" == absent ]]
   printf 'sphr-example stopped\n' >>"${temporary}/orb.list"
   if orb_exact_state_from_file "${temporary}/orb.list" sphr-example >/dev/null; then
@@ -3120,7 +4708,8 @@ EOF
   if validate_orb_listing "${temporary}/orb.list"; then
     return 1
   fi
-  printf 'NAME STATE\narch running\n' >"${temporary}/orb-invalid.list"
+  printf 'NAME STATE\nshadowpipe-lab-base running\n' \
+    >"${temporary}/orb-invalid.list"
   if validate_orb_listing "${temporary}/orb-invalid.list"; then
     return 1
   fi
@@ -3210,6 +4799,95 @@ EOF
   fi
   mkdir "${temporary}/a/empty-before-seal"
   seal_bundle "${temporary}/a"
+
+  local transfer_token
+  transfer_token="$(printf 'a%.0s' {1..64})"
+  validate_owner_token "${transfer_token}"
+  if validate_owner_token "${transfer_token}0"; then
+    return 1
+  fi
+  printf 'clean evidence\n' >"${temporary}/token-scan-clean"
+  scan_owner_token_absent "${transfer_token}" "${temporary}/token-scan-clean"
+  printf 'prefix-%s-suffix\n' "${transfer_token}" \
+    >"${temporary}/token-scan-leak"
+  if scan_owner_token_absent \
+    "${transfer_token}" "${temporary}/token-scan-leak" 2>/dev/null; then
+    return 1
+  fi
+  mkdir "${temporary}/transfer-source"
+  {
+    printf 'shadowpipe-phase3-result-owner-v1\n'
+    printf 'run_id=selftest-transfer\n'
+    printf 'clone_vm=sphr-selftest\n'
+    printf 'token=%s\n' "${transfer_token}"
+  } >"${temporary}/transfer-source/.shadowpipe-phase3-result-owner"
+  chmod 0600 "${temporary}/transfer-source/.shadowpipe-phase3-result-owner"
+  printf 'sealed transfer payload\n' >"${temporary}/transfer-source/payload.txt"
+  seal_bundle "${temporary}/transfer-source"
+  /usr/bin/python3 -I -S - \
+    "${temporary}/transfer-source" "${temporary}/transfer.tar" <<'PY'
+import os
+import sys
+import tarfile
+
+root, output = sys.argv[1:]
+with tarfile.open(output, "w", format=tarfile.PAX_FORMAT) as archive:
+    for current, directories, files in os.walk(root):
+        directories.sort()
+        files.sort()
+        relative_current = os.path.relpath(current, root)
+        if relative_current != ".":
+            item = tarfile.TarInfo(relative_current)
+            item.type = tarfile.DIRTYPE
+            item.mode = 0o700
+            item.uid = item.gid = 0
+            item.mtime = 0
+            item.uname = item.gname = ""
+            archive.addfile(item)
+        for name in files:
+            path = os.path.join(current, name)
+            relative = os.path.relpath(path, root)
+            info = os.stat(path)
+            item = tarfile.TarInfo(relative)
+            item.size = info.st_size
+            item.mode = 0o600
+            item.uid = item.gid = 0
+            item.mtime = 0
+            item.uname = item.gname = ""
+            with open(path, "rb") as stream:
+                archive.addfile(item, stream)
+PY
+  chmod 0600 "${temporary}/transfer.tar"
+  extract_guest_evidence_archive \
+    "${temporary}/transfer.tar" "${temporary}/transfer-extracted" \
+    selftest-transfer sphr-selftest "${transfer_token}"
+  verify_sealed_bundle "${temporary}/transfer-extracted"
+  bounded_cmp \
+    "${temporary}/transfer-source/payload.txt" \
+    "${temporary}/transfer-extracted/payload.txt"
+  /usr/bin/python3 -I -S - "${temporary}/unsafe-transfer.tar" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as archive:
+    item = tarfile.TarInfo("unsafe-link")
+    item.type = tarfile.SYMTYPE
+    item.linkname = "/etc/passwd"
+    item.mode = 0o600
+    item.uid = item.gid = 0
+    archive.addfile(item)
+PY
+  chmod 0600 "${temporary}/unsafe-transfer.tar"
+  if extract_guest_evidence_archive \
+    "${temporary}/unsafe-transfer.tar" "${temporary}/unsafe-transfer-extracted" \
+    selftest-transfer sphr-selftest "${transfer_token}" 2>/dev/null; then
+    return 1
+  fi
+  if run_recorded_limited 5 "${temporary}/bounded-overflow" 4 4 \
+    /usr/bin/printf 'abcde'; then
+    return 1
+  fi
+  [[ "$(file_size_bytes "${temporary}/bounded-overflow")" == 5 ]]
 
   mkdir "${temporary}/unsafe-symlink"
   ln -s /nonexistent "${temporary}/unsafe-symlink/dangling"
