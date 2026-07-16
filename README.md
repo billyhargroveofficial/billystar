@@ -2,6 +2,19 @@
 
 Проприетарный encrypted tunnel: Rust, ML-KEM-768 + X25519, ChaCha20-Poly1305.
 
+## Целевая топология
+
+- production `shadowpipe-server` запускается только на Linux VPS;
+- общий Rust protocol/crypto/packet core используется всеми сборками;
+- production-клиенты: Linux TUN, macOS Network Extension и Windows
+  Wintun/WFP;
+- переносимый no-TUN server разрешён только как явный loopback/VM
+  development harness и не является поддерживаемым server deployment target.
+
+Сейчас Linux — единственная платформа со scoped full-TUN implementation
+evidence. Windows подтверждён только в no-TUN portability cell, а native
+macOS/Windows system-VPN backends остаются открытыми gates.
+
 ## Что есть
 
 | Phase | Фичи |
@@ -509,3 +522,6 @@ Upstream implementations are reference inputs only. Shadowpipe keeps its own
 protocol, signed-policy, packet-tunnel and WAL architecture; license and
 clean-room rules are defined in
 [`docs/upstream-clean-room-policy.md`](docs/upstream-clean-room-policy.md).
+The pinned sing-box/sing-tun/Xray platform synthesis, exact source references,
+IPv6 staging decision and Linux/macOS/Windows adoption backlog are in
+[`docs/upstream-platform-audit-2026-07-16.md`](docs/upstream-platform-audit-2026-07-16.md).
