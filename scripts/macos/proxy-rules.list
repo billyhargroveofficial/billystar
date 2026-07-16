@@ -1,0 +1,20 @@
+# Proxy rules — evaluated AFTER direct-rules.list (sing-box route order).
+# Download geosite/geoip: ./scripts/macos/update-rules.sh
+# Intentionally NO geosite:ru-blocked-all (junk).
+
+geosite:ru-blocked
+geosite:category-media-ru-blocked
+# geoip:ru-blocked omitted — installs ~50k CIDR routes into utun, hijacks 8.8.8.8
+# and breaks split DNS before the tunnel is up. Domain tags + DNS /32 routes suffice.
+
+geosite:anthropic
+geosite:google-gemini
+geosite:openai
+geosite:category-ai-!cn
+geosite:category-ai-chat-!cn
+geosite:cursor
+geosite:perplexity
+geosite:xai
+geosite:huggingface
+geosite:github-copilot
+geosite:jetbrains-ai

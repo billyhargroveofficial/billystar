@@ -1,0 +1,10 @@
+# Domains pre-resolved at split start (install /32 routes before first app query).
+# One FQDN per line; # comments ok.
+api.anthropic.com
+claude.ai
+api.openai.com
+chatgpt.com
+generativelanguage.googleapis.com
+api2.cursor.sh
+api.perplexity.ai
+huggingface.co

@@ -1,0 +1,10 @@
+# Direct rules — evaluated BEFORE proxy-rules (sing-box route order).
+# LAN/private + RU stay on residential even if a CDN domain overlaps proxy tags.
+# Download geosite/geoip: ./scripts/macos/update-rules.sh
+
+geoip:private
+geosite:ru-available-only-inside
+geoip:ru
+
+# Inline exceptions (optional):
+# direct:domain:localhost
