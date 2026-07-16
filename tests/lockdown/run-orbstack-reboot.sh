@@ -4184,6 +4184,7 @@ fixed = [
     "Cargo.toml",
     "deploy/shadowpipe-client-full-tunnel.service",
     "deploy/shadowpipe-lockdown-restore.service",
+    "tests/lockdown/normalize-built-artifact.py",
     "tests/lockdown/run-orbstack-reboot.sh",
 ]
 paths = []
@@ -4527,6 +4528,97 @@ finally:
 PY
 }
 
+# EXIT may run after an implicit `set -e` failure has unwound main().  Bash
+# function locals no longer exist at that point, so every value needed to
+# identify and clean the owned clone/result/temp state is deliberately
+# process-global.  Helper functions use their own locals and must not mutate
+# this cleanup context.
+source_vm=''
+results_root=''
+clone_vm=''
+result_dir=''
+ownership_token=''
+host_tmp=''
+host_tmp_root=''
+before=''
+after=''
+final_status=1
+clone_attempted=0
+clone_owned=0
+clone_completion_uncertain=0
+guest_status=failed
+client_unit_status=failed
+host_safety=failed
+clone_deleted=not_attempted
+clone_cleanup_status=not_run
+target_deleted=not_applicable
+source_state_status=failed
+host_tmp_deleted=false
+lifecycle_lock=''
+lifecycle_lock_status=not_acquired
+pf_runtime_observed=unknown
+source_orb_id=''
+clone_orb_id=''
+clone_identity_bound=0
+clone_deletion_pending=0
+pinned_head=unavailable
+
+verify_cleanup_context_global_contract() {
+  local source="$1"
+  python3 -I -S - "${source}" \
+    source_vm results_root clone_vm result_dir ownership_token \
+    host_tmp host_tmp_root before after final_status clone_attempted \
+    clone_owned clone_completion_uncertain guest_status client_unit_status \
+    host_safety clone_deleted clone_cleanup_status target_deleted \
+    source_state_status host_tmp_deleted lifecycle_lock \
+    lifecycle_lock_status pf_runtime_observed source_orb_id clone_orb_id \
+    clone_identity_bound clone_deletion_pending pinned_head <<'PY'
+import re
+import sys
+
+source_path, *protected = sys.argv[1:]
+with open(source_path, "r", encoding="utf-8") as stream:
+    source = stream.read()
+start_marker = "\nmain() {\n"
+end_marker = "\nrun_self_test() (\n"
+if source.count(start_marker) != 1 or source.count(end_marker) != 1:
+    raise SystemExit("could not isolate the real main function")
+main = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
+logical_lines = []
+pending = ""
+for physical in main.splitlines():
+    pending += physical
+    if pending.rstrip().endswith("\\"):
+        pending = pending.rstrip()[:-1] + " "
+        continue
+    logical_lines.append(pending)
+    pending = ""
+if pending:
+    logical_lines.append(pending)
+violations = []
+for line_number, line in enumerate(logical_lines, 1):
+    match = re.match(
+        r"^\s*(?:local|declare|typeset)\b(?P<body>.*)$",
+        line,
+    )
+    if match is None:
+        continue
+    body = match.group("body")
+    for name in protected:
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(name)}(?=\s|=|$)",
+            body,
+        ):
+            violations.append(f"{name}@logical-main-line-{line_number}")
+if violations:
+    raise SystemExit(
+        "cleanup context is locally shadowed: " + ",".join(violations)
+    )
+print("cleanup_context_process_global=true")
+print(f"cleanup_context_names={len(protected)}")
+PY
+}
+
 main() {
   [[ "$(uname -s)" == Darwin ]] \
     || die "${EX_USAGE}" 'host mode must run on macOS'
@@ -4539,25 +4631,29 @@ main() {
       || die "${EX_UNAVAILABLE}" "missing host dependency: ${tool}"
   done
 
-  local source_vm="${1:-${SOURCE_DEFAULT}}"
+  source_vm="${1:-${SOURCE_DEFAULT}}"
   [[ "$#" -le 1 ]] || die "${EX_USAGE}" 'expected at most one source VM'
   source_vm="$(sanitize_component "${source_vm}")" \
     || die "${EX_USAGE}" 'unsafe source VM name'
   validate_source_vm "${source_vm}" \
     || die "${EX_USAGE}" "only stopped source VM ${SOURCE_DEFAULT} is allowed"
-  local script_dir repo_root results_root run_id clone_vm magic
-  local result_dir ownership_token host_tmp host_tmp_root before after
-  local source_archive source_archive_size source_archive_hash pinned_head
+  local script_dir repo_root run_id magic
+  local source_archive source_archive_size source_archive_hash
   local vendor_archive vendor_archive_size vendor_archive_hash vendor_stage
   local vendor_archive_members vendor_expanded_bytes
   local vendor_lock_hash vendor_manifest_hash vendor_config_hash
-  local guest_root guest_archive guest_repo guest_target guest_binary guest_unit
+  local guest_root guest_archive guest_repo guest_target
+  local guest_built_binary guest_binary guest_unit
   local guest_client_unit
   local guest_vendor_archive guest_vendor guest_cargo_home
   magic="${SHADOWPIPE_MAGIC:-${MAGIC_DEFAULT}}"
   validate_magic "${magic}" \
     || die "${EX_USAGE}" 'SHADOWPIPE_MAGIC must be one value in the u32 range'
   script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+  verify_cleanup_context_global_contract \
+    "${script_dir}/run-orbstack-reboot.sh" \
+    || die "${EX_UNAVAILABLE}" \
+      'cleanup context is not process-global in the real main function'
   repo_root="$(cd -- "${script_dir}/../.." && pwd -P)"
   results_root="${script_dir}/results"
   [[ ! -L "${results_root}" ]] \
@@ -4584,7 +4680,8 @@ main() {
   guest_archive="${guest_root}/source.tar"
   guest_repo="${guest_root}/shadowpipe"
   guest_target="${guest_root}/target"
-  guest_binary="${guest_target}/release/shadowpipe-client"
+  guest_built_binary="${guest_target}/release/shadowpipe-client"
+  guest_binary="${guest_root}/artifact/shadowpipe-client"
   guest_unit="${guest_repo}/deploy/shadowpipe-lockdown-restore.service"
   guest_client_unit="${guest_repo}/deploy/shadowpipe-client-full-tunnel.service"
   guest_vendor_archive="${guest_root}/cargo-vendor.tar.gz"
@@ -4602,16 +4699,25 @@ main() {
     >"${result_dir}/build-contract.txt"
   before="${host_tmp}/mac-before"
   after="${host_tmp}/mac-after"
-  local final_status=0 clone_attempted=0 clone_owned=0
-  local clone_completion_uncertain=0
-  local guest_status=failed client_unit_status=failed
-  local host_safety=failed clone_deleted=not_attempted
-  local clone_cleanup_status=not_run
-  local target_deleted=not_applicable source_state_status=failed host_tmp_deleted=false
-  local lifecycle_lock='' lifecycle_lock_status=not_acquired
-  local pf_runtime_observed=unknown
-  local source_orb_id='' clone_orb_id='' clone_identity_bound=0
-  local clone_deletion_pending=0
+  final_status=0
+  clone_attempted=0
+  clone_owned=0
+  clone_completion_uncertain=0
+  guest_status=failed
+  client_unit_status=failed
+  host_safety=failed
+  clone_deleted=not_attempted
+  clone_cleanup_status=not_run
+  target_deleted=not_applicable
+  source_state_status=failed
+  host_tmp_deleted=false
+  lifecycle_lock=''
+  lifecycle_lock_status=not_acquired
+  pf_runtime_observed=unknown
+  source_orb_id=''
+  clone_orb_id=''
+  clone_identity_bound=0
+  clone_deletion_pending=0
 
   cleanup() {
     local incoming=$?
@@ -4915,7 +5021,7 @@ main() {
   # shellcheck disable=SC2016
   run_recorded "${HOST_COMMAND_TIMEOUT}" \
     "${result_dir}/critical-provenance.sha256" /bin/sh -c \
-    'cd "$1" && sha256sum .cargo/config.toml Cargo.lock Cargo.toml crates/shadowpipe-core/Cargo.toml crates/shadowpipe-core/build.rs crates/shadowpipe-core/src/lockdown.rs crates/shadowpipe-client/Cargo.toml crates/shadowpipe-client/src/main.rs crates/shadowpipe-reality/Cargo.toml crates/shadowpipe-reality/src/lib.rs crates/shadowpipe-reality/src/auth.rs crates/shadowpipe-reality/src/reality.rs deploy/shadowpipe-client-full-tunnel.service deploy/shadowpipe-lockdown-restore.service tests/lockdown/run-orbstack-reboot.sh' \
+    'cd "$1" && sha256sum .cargo/config.toml Cargo.lock Cargo.toml crates/shadowpipe-core/Cargo.toml crates/shadowpipe-core/build.rs crates/shadowpipe-core/src/lockdown.rs crates/shadowpipe-client/Cargo.toml crates/shadowpipe-client/src/main.rs crates/shadowpipe-reality/Cargo.toml crates/shadowpipe-reality/src/lib.rs crates/shadowpipe-reality/src/auth.rs crates/shadowpipe-reality/src/reality.rs deploy/shadowpipe-client-full-tunnel.service deploy/shadowpipe-lockdown-restore.service tests/lockdown/normalize-built-artifact.py tests/lockdown/run-orbstack-reboot.sh' \
     provenance "${repo_root}"
   say 'creating a pinned, checksum-validated Cargo vendor bundle offline'
   create_cargo_vendor_bundle "${repo_root}" "${source_archive}" \
@@ -5109,27 +5215,9 @@ main() {
         --config net.offline=true \
         build --frozen --release --no-default-features \
         -p shadowpipe-client --manifest-path "${repo}/Cargo.toml"
-    ' shadowpipe-reboot-build "${guest_repo}" "${guest_binary}" \
-    "${guest_cargo_home}" "${guest_target}" "${guest_vendor}" "${magic}"
-  run_recorded "${GUEST_COMMAND_TIMEOUT}" \
-    "${result_dir}/guest-build-boundary-post.env" \
-    orb -m "${clone_orb_id}" -u root python3 -I -S -c '
-import os, stat, sys
-cargo_home, target, binary = sys.argv[1:]
-if not os.path.isdir(target) or os.path.islink(target):
-    raise SystemExit("private guest target was not created")
-info = os.lstat(binary)
-if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not (info.st_mode & 0o111):
-    raise SystemExit("frozen vendor build did not produce one executable")
-entries = sorted(os.listdir(cargo_home))
-if "config.toml" not in entries:
-    raise SystemExit("private guest CARGO_HOME lost its source replacement config")
-print("cargo_build_frozen=true")
-print("cargo_source_replacement_cli=true")
-print("cargo_build_network_namespace=isolated")
-print("cargo_preexisting_cache_used=false")
-print(f"cargo_home_post_entries={len(entries)}")
-' "${guest_cargo_home}" "${guest_target}" "${guest_binary}"
+    ' shadowpipe-reboot-build "${guest_repo}" "${guest_built_binary}" \
+    "${guest_cargo_home}" "${guest_target}" "${guest_vendor}" "${magic}" \
+    || die 1 'frozen build from the bound Cargo vendor tree failed'
   capture_guest_tree_manifest "${clone_orb_id}" "${guest_repo}" source \
     20000 "${MAX_SOURCE_EXPANDED_BYTES}" \
     "${result_dir}/guest-source-manifest-post-build.json"
@@ -5160,6 +5248,14 @@ print(f"cargo_home_post_entries={len(entries)}")
   capture_git_checkout_proof "${repo_root}" \
     "${result_dir}/git-checkout-after-build" "${pinned_head}" \
     || die 1 'host checkout or pushed origin/main changed during guest-local build'
+  run_recorded "${GUEST_COMMAND_TIMEOUT}" \
+    "${result_dir}/guest-build-boundary-post.env" \
+    orb -m "${clone_orb_id}" -u root python3 -I -S \
+    "${guest_repo}/tests/lockdown/normalize-built-artifact.py" \
+    --require-root \
+    "${guest_cargo_home}" "${guest_target}" "${guest_built_binary}" \
+    "${guest_binary}" \
+    || die 1 'built executable could not cross the single-link artifact boundary'
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/built-binary.sha256" \
     orb -m "${clone_orb_id}" -u root sha256sum "${guest_binary}"
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/guest-source-unit.sha256" \
@@ -5648,13 +5744,139 @@ print(f"stable_wait_seconds={time.monotonic() - start:.6f}")
 
 run_self_test() (
   set -Eeuo pipefail
-  local temporary parent token owned table status child_pid child_gone=0
+  local temporary parent token owned table status child_pid scope_probe_path
+  local self_source normalizer normalization_root raw normalized
+  local symlink_root intermediate_symlink_root
+  local child_gone=0
   temporary="$(mktemp -d "${TMPDIR:-/tmp}/shadowpipe-reboot-selftest.XXXXXX")"
   temporary="$(cd -- "${temporary}" && pwd -P)"
   parent="$(cd -- "$(dirname -- "${temporary}")" && pwd -P)"
   token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   write_ownership_marker "${temporary}" "${token}"
   trap 'safe_remove_owned_tree "${temporary}" "${parent}" "${token}" >/dev/null' EXIT
+
+  scope_probe_path="${temporary}/cleanup-scope-probe.txt"
+  set +e
+  (
+    set -Eeuo pipefail
+    result_dir=cleanup-context-survived
+    cleanup_scope_probe_output="${scope_probe_path}"
+    implicit_main_failure() {
+      local result_dir=unwound-main-local
+      # Invoked indirectly by the EXIT trap after this function unwinds.
+      # shellcheck disable=SC2329
+      cleanup_scope_exit() {
+        printf '%s\n' "${result_dir}" >"${cleanup_scope_probe_output}"
+      }
+      trap cleanup_scope_exit EXIT
+      return 23
+    }
+    implicit_main_failure
+  ) >"${temporary}/cleanup-scope-probe.stdout" \
+    2>"${temporary}/cleanup-scope-probe.stderr"
+  status=$?
+  set -e
+  [[ "${status}" == 23 \
+    && "$(<"${scope_probe_path}")" == cleanup-context-survived \
+    && ! -s "${temporary}/cleanup-scope-probe.stderr" ]] \
+    || die 1 'self-test cleanup context did not survive main-scope unwind'
+
+  self_source="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+  verify_cleanup_context_global_contract "${self_source}" \
+    >"${temporary}/cleanup-context-contract.env"
+  grep -qx 'cleanup_context_process_global=true' \
+    "${temporary}/cleanup-context-contract.env"
+  grep -qx 'cleanup_context_names=29' \
+    "${temporary}/cleanup-context-contract.env"
+
+  normalizer="$(cd -- "$(dirname -- "${self_source}")" && pwd -P)/normalize-built-artifact.py"
+  [[ -f "${normalizer}" && ! -L "${normalizer}" ]] \
+    || die 1 'self-test artifact normalizer is absent or symlinked'
+  normalization_root="${temporary}/normalizer-fixture"
+  mkdir -p -- \
+    "${normalization_root}/cargo-home" "${normalization_root}/target"
+  printf '%s\n' '[source.crates-io]' \
+    >"${normalization_root}/cargo-home/config.toml"
+  raw="${normalization_root}/target/shadowpipe-client"
+  normalized="${normalization_root}/artifact/shadowpipe-client"
+  printf '%s\n' '#!/bin/sh' 'exit 0' >"${raw}"
+  chmod 0755 "${raw}"
+  ln "${raw}" "${normalization_root}/target/cargo-hardlink-peer"
+  run_recorded 10 "${temporary}/normalizer-hardlink.env" \
+    python3 -I -S "${normalizer}" \
+    "${normalization_root}/cargo-home" "${normalization_root}/target" \
+    "${raw}" "${normalized}" \
+    || die 1 'self-test normalizer rejected a valid Cargo hardlink'
+  grep -qx 'cargo_artifact_source_nlink=2' \
+    "${temporary}/normalizer-hardlink.env"
+  grep -qx 'normalized_artifact_nlink=1' \
+    "${temporary}/normalizer-hardlink.env"
+  grep -qx 'normalized_artifact_mode=0755' \
+    "${temporary}/normalizer-hardlink.env"
+  python3 -I -S - "${raw}" "${normalized}" <<'PY'
+import os
+import stat
+import sys
+
+raw, normalized = sys.argv[1:]
+with open(raw, "rb") as stream:
+    raw_bytes = stream.read()
+with open(normalized, "rb") as stream:
+    normalized_bytes = stream.read()
+raw_info = os.lstat(raw)
+normalized_info = os.lstat(normalized)
+if raw_bytes != normalized_bytes:
+    raise SystemExit("normalized artifact bytes differ")
+if raw_info.st_nlink != 2:
+    raise SystemExit("self-test did not create a two-link Cargo fixture")
+if (
+    not stat.S_ISREG(normalized_info.st_mode)
+    or normalized_info.st_nlink != 1
+    or stat.S_IMODE(normalized_info.st_mode) != 0o755
+    or normalized_info.st_uid != os.geteuid()
+    or normalized_info.st_gid != os.getegid()
+):
+    raise SystemExit("normalized hardlink fixture metadata differs")
+PY
+  symlink_root="${temporary}/normalizer-symlink-fixture"
+  mkdir -p -- "${symlink_root}/cargo-home" "${symlink_root}/target"
+  printf '%s\n' '[source.crates-io]' \
+    >"${symlink_root}/cargo-home/config.toml"
+  printf '%s\n' '#!/bin/sh' 'exit 0' \
+    >"${symlink_root}/target/shadowpipe-client"
+  chmod 0755 "${symlink_root}/target/shadowpipe-client"
+  ln -s shadowpipe-client "${symlink_root}/target/linked-client"
+  if run_recorded 10 "${temporary}/normalizer-symlink.env" \
+    python3 -I -S "${normalizer}" \
+    "${symlink_root}/cargo-home" "${symlink_root}/target" \
+    "${symlink_root}/target/linked-client" \
+    "${symlink_root}/artifact/linked-client"; then
+    die 1 'self-test normalizer followed a symlinked Cargo artifact'
+  fi
+  [[ "$(<"${temporary}/normalizer-symlink.env.status")" != 124 ]] \
+    || die 1 'self-test normalizer symlink denial timed out'
+
+  intermediate_symlink_root="${temporary}/normalizer-intermediate-symlink-fixture"
+  mkdir -p -- \
+    "${intermediate_symlink_root}/cargo-home" \
+    "${intermediate_symlink_root}/target" \
+    "${intermediate_symlink_root}/outside"
+  printf '%s\n' '[source.crates-io]' \
+    >"${intermediate_symlink_root}/cargo-home/config.toml"
+  printf '%s\n' '#!/bin/sh' 'exit 0' \
+    >"${intermediate_symlink_root}/outside/shadowpipe-client"
+  chmod 0755 "${intermediate_symlink_root}/outside/shadowpipe-client"
+  ln -s ../outside "${intermediate_symlink_root}/target/release"
+  if run_recorded 10 "${temporary}/normalizer-intermediate-symlink.env" \
+    python3 -I -S "${normalizer}" \
+    "${intermediate_symlink_root}/cargo-home" \
+    "${intermediate_symlink_root}/target" \
+    "${intermediate_symlink_root}/target/release/shadowpipe-client" \
+    "${intermediate_symlink_root}/artifact/shadowpipe-client"; then
+    die 1 'self-test normalizer followed an intermediate target symlink'
+  fi
+  [[ "$(<"${temporary}/normalizer-intermediate-symlink.env.status")" != 124 ]] \
+    || die 1 'self-test normalizer intermediate-symlink denial timed out'
 
   [[ "$(sanitize_component arch.test-1)" == arch.test-1 ]]
   if sanitize_component '../arch' >"${temporary}/unsafe-name.out" 2>"${temporary}/unsafe-name.err"; then
