@@ -2652,7 +2652,8 @@ PY
 
 strict_active_main_wal_snapshot() {
   local wal="$1" expected_pid="$2" retained_wrapper_pid="$3"
-  local expected_bypass_iface="$4" evidence_stem="$5"
+  local expected_bypass_iface="$4" expected_bypass_gateway="$5"
+  local evidence_stem="$6"
   [[ -f "${wal}" && ! -L "${wal}" ]] || return 1
   [[ "$(LC_ALL=C stat -c '%a:%u:%g:%h:%F' "${wal}")" \
     == "600:0:0:1:regular file" ]] || return 1
@@ -2664,6 +2665,7 @@ strict_active_main_wal_snapshot() {
   proc_starttime "${expected_pid}" >"${evidence_stem}-pid-start-ticks.txt" \
     || return 1
   python3 -I -S - "${wal}" "${expected_pid}" "${expected_bypass_iface}" \
+    "${expected_bypass_gateway}" \
     "${evidence_stem}-boot-id.txt" "${evidence_stem}-netns.identity" \
     "${evidence_stem}-mntns.identity" \
     "${evidence_stem}-pid-start-ticks.txt" \
@@ -2674,10 +2676,15 @@ import re
 import sys
 
 (
-    wal_path, expected_pid_text, expected_iface, boot_path, net_path,
-    mount_path, start_path, output_path,
+    wal_path, expected_pid_text, expected_iface, expected_gateway, boot_path,
+    net_path, mount_path, start_path, output_path,
 ) = sys.argv[1:]
 expected_pid = int(expected_pid_text)
+if (expected_iface, expected_gateway) not in {
+    ("c0", "10.231.0.1"),
+    ("c1", "10.233.0.1"),
+}:
+    raise SystemExit("unsafe expected underlay identity")
 with open(wal_path, "r", encoding="utf-8") as stream:
     value = json.load(stream)
 if set(value) != {"schema_version", "generation", "phase", "owner", "operations"}:
@@ -2797,11 +2804,11 @@ if any(route["gateway"] is not None
     raise SystemExit("replacement split-default ownership differs")
 bypass = bypass[0]
 if (bypass["destination"] != {"address": "10.232.0.2", "prefix_len": 32}
-        or bypass["gateway"] != "10.233.0.1"
+        or bypass["gateway"] != expected_gateway
         or bypass["output"].get("name") != expected_iface
         or bypass["family"] != "ipv4"
         or bypass["protocol"] != 186):
-    raise SystemExit("replacement bypass is not bound to the c1 underlay")
+    raise SystemExit("main WAL bypass is not bound to the expected underlay")
 
 firewalls = [body for kind, body in resources if kind == "firewall"]
 if {(item["family"], item["expected_rule_count"]) for item in firewalls} \
@@ -5846,7 +5853,8 @@ with os.fdopen(descriptor):
     "${guest_result_dir}/generation-1-active-killswitch-identity.json" \
     || die 1 "generation-1 kill-switch differs from the exact fail-closed contract"
   strict_active_main_wal_snapshot "${main_wal}" "${real_client_pid}" \
-    "${client_pid}" c0 "${guest_result_dir}/generation-1-main-wal-active" \
+    "${client_pid}" c0 10.231.0.1 \
+    "${guest_result_dir}/generation-1-main-wal-active" \
     || die 1 "generation-1 main WAL failed strict Active/c0 proof"
   require_ipv6_canary_state_unchanged generation-1-active \
     || die 1 "generation-1 activation changed the connected IPv6 canary state"
@@ -6051,7 +6059,8 @@ with os.fdopen(descriptor):
     die 1 "generation-2 activation left a foreign restart-lockdown table"
   fi
   strict_active_main_wal_snapshot "${main_wal}" "${real_client_pid}" \
-    "${client_pid}" c1 "${guest_result_dir}/generation-2-main-wal-active" \
+    "${client_pid}" c1 10.233.0.1 \
+    "${guest_result_dir}/generation-2-main-wal-active" \
     || die 1 "generation-2 main WAL failed strict Active/c1 proof"
   ip -n "${ns_client}" route show \
     >"${guest_result_dir}/client-routes-generation-2-active.txt"
