@@ -16,6 +16,7 @@ pub mod mux;
 pub mod netguard;
 pub mod pacing;
 pub mod packet;
+pub mod platform;
 pub mod policy_state;
 pub mod profile;
 pub mod proto;
