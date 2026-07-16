@@ -84,6 +84,14 @@ reject_unit_key() {
   fi
 }
 
+require_unit_singleton_key() {
+  local unit=$1 key=$2 value=$3 count
+  count="$(grep -Ec "^[[:space:]]*${key}=" "$unit" || true)"
+  [[ "$count" == 1 ]] \
+    || fail "$unit: $key must occur exactly once, found $count"
+  require_unit_line "$unit" "${key}=${value}"
+}
+
 for unit in "$CLIENT_UNIT" "$RESTORE_UNIT"; do
   require_unit_line "$unit" 'LimitCORE=0'
   require_unit_line "$unit" 'NoNewPrivileges=yes'
@@ -116,6 +124,8 @@ require_unit_line "$CLIENT_UNIT" 'TasksMax=512'
 require_unit_line "$CLIENT_UNIT" 'MemoryHigh=768M'
 require_unit_line "$CLIENT_UNIT" 'MemoryMax=1G'
 require_unit_line "$CLIENT_UNIT" 'MemorySwapMax=256M'
+require_unit_singleton_key "$CLIENT_UNIT" Restart always
+require_unit_singleton_key "$CLIENT_UNIT" RestartSec 1s
 
 require_unit_line "$RESTORE_UNIT" 'CapabilityBoundingSet=CAP_NET_ADMIN'
 require_unit_line "$RESTORE_UNIT" 'AmbientCapabilities=CAP_NET_ADMIN'

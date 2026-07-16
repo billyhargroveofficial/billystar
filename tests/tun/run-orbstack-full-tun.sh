@@ -9,7 +9,9 @@ umask 077
 # the disposable clone, pulls the result, then destroys the clone.
 #
 # Guest mode owns all privileged network changes. Every veth, route, firewall
-# rule, TUN and listener lives in one of four Linux network namespaces. No lab
+# rule, TUN and listener lives in one of four Linux network namespaces. The
+# client has two isolated IPv4/IPv6 underlay links: IPv4 is tunneled, while
+# connected IPv6 is retained only as a fail-closed OUTPUT-block canary. No lab
 # link is connected to the guest management interface or the public Internet.
 
 readonly EX_USAGE=64
@@ -713,6 +715,36 @@ PY
 
 exact_empty_private_regular_file() {
   exact_private_regular_file "$1" "$2" "$3" 0
+}
+
+create_empty_private_regular_file() {
+  local path="$1"
+  python3 -I -S - "${path}" <<'PY'
+import os
+import sys
+
+path = os.path.abspath(sys.argv[1])
+flags = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+descriptor = os.open(path, flags, 0o600)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+directory = os.open(
+    os.path.dirname(path),
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
 }
 
 create_private_material_scan_canary() {
@@ -1456,7 +1488,7 @@ write_full_status() {
   {
     printf 'test_status=%s\n' "${guest_test}"
     printf 'cleanup_status=%s\n' "${guest_cleanup}"
-    printf 'scope=synthetic_orbstack_ipv4_netns_only\n'
+    printf 'scope=synthetic_orbstack_ipv4_tunnel_ipv6_block_netns_only\n'
     printf 'field_evidence=false\n'
     printf 'host_safety_status=%s\n' "${host_safety}"
     printf 'clone_cleanup_status=%s\n' "${clone_cleanup}"
@@ -1485,7 +1517,8 @@ write_full_result() {
       printf -- '- Verdict: **PASS**\n'
       # shellcheck disable=SC2016
       printf -- '- Disposable clone: `%s` (opaque OrbStack ID bound before start/run, guest marker re-proved, delete-by-name preceded immediately by name-to-ID rebinding, then a late-appearance window plus ID/name absence proved)\n' "${clone_vm}"
-      printf -- '- Scope: synthetic OrbStack Linux IPv4/netns only; field evidence: false\n'
+      printf -- '- Scope: synthetic OrbStack Linux IPv4 tunnel plus connected IPv6 OUTPUT-block/netns only; no IPv6 tunnel or L2 claim; field evidence: false\n'
+      printf -- '- Network-change handoff: real c0-to-c1 default-route replacement, strict intermediate lockdown/main-WAL proof, then generation-2 Active adoption through c1 before workloads\n'
       printf -- '- Carrier/authentication: production REALITY TLS 1.3 URI with X25519 short-id and ML-KEM pin, then mandatory protocol-v3 credential and enrolled allowlist\n'
       printf -- '- Final secret check: guest evidence scanned against stored/raw/hex/base64 variants; all host-added logs scanned against non-reversible fingerprints\n'
       printf -- '- Host safety: exact live sing-box PID/argv/config/executable plus stable routes, DNS and PF config files\n'
@@ -1613,6 +1646,278 @@ for entry in entries(census, "table census"):
         lockdown.append((family, name))
 if lockdown != [("inet", table)]:
     raise SystemExit("global census does not contain exactly the WAL lockdown")
+PY
+}
+
+strict_active_lockdown_snapshot() {
+  local wal="$1" retained_wrapper_pid="$2" evidence_stem="$3"
+  local table handle
+  [[ -f "${wal}" && ! -L "${wal}" ]] || return 1
+  [[ "$(LC_ALL=C stat -c '%a:%u:%g:%h:%F' "${wal}")" \
+    == "600:0:0:1:regular file" ]] || return 1
+  cat /proc/sys/kernel/random/boot_id >"${evidence_stem}-boot-id.txt"
+  stat -Lc '%d %i' "/proc/${retained_wrapper_pid}/ns/net" \
+    >"${evidence_stem}-netns.identity" || return 1
+  stat -Lc '%d %i' "/proc/${retained_wrapper_pid}/ns/mnt" \
+    >"${evidence_stem}-mntns.identity" || return 1
+  if ! read -r table handle < <(
+    python3 -I -S - "${wal}" \
+      "${evidence_stem}-boot-id.txt" \
+      "${evidence_stem}-netns.identity" \
+      "${evidence_stem}-mntns.identity" <<'PY'
+import json
+import re
+import sys
+
+wal_path, boot_path, net_path, mount_path = sys.argv[1:]
+with open(wal_path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+required = {
+    "schema_version", "generation", "identity", "boot_id", "uid",
+    "network_namespace", "mount_namespace", "control_flow", "phase",
+    "table_handle", "release_reason",
+}
+if set(value) != required:
+    raise SystemExit("unexpected lockdown WAL schema")
+identity = value["identity"]
+handle = value["table_handle"]
+if value["schema_version"] != 1 or value["phase"] != "active":
+    raise SystemExit("lockdown WAL is not schema-v1 Active")
+generation = value["generation"]
+if (not isinstance(generation, int) or isinstance(generation, bool)
+        or generation <= 0):
+    raise SystemExit("lockdown WAL generation is invalid")
+if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{32}", identity) is None:
+    raise SystemExit("lockdown identity is not canonical lowercase hex")
+if identity == "0" * 32:
+    raise SystemExit("lockdown identity is zero")
+if (not isinstance(value["boot_id"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["boot_id"]) is None):
+    raise SystemExit("lockdown boot identity is not canonical lowercase hex")
+with open(boot_path, "r", encoding="ascii") as stream:
+    boot_id = stream.read().strip().replace("-", "").lower()
+if value["boot_id"] != boot_id or boot_id == "0" * 32:
+    raise SystemExit("lockdown WAL boot identity differs from the live kernel")
+for label, observed_path in (
+    ("network_namespace", net_path), ("mount_namespace", mount_path)
+):
+    namespace = value[label]
+    if not isinstance(namespace, dict) or set(namespace) != {"device", "inode"}:
+        raise SystemExit(f"{label} has an unexpected schema")
+    if any(not isinstance(namespace[field], int)
+           or isinstance(namespace[field], bool)
+           or namespace[field] <= 0 for field in ("device", "inode")):
+        raise SystemExit(f"{label} has an invalid identity")
+    with open(observed_path, "r", encoding="ascii") as stream:
+        fields = stream.read().split()
+    if len(fields) != 2 or any(not field.isdigit() for field in fields):
+        raise SystemExit(f"live {label} identity is malformed")
+    if namespace != {"device": int(fields[0]), "inode": int(fields[1])}:
+        raise SystemExit(f"{label} differs from the retained wrapper namespace")
+if not isinstance(handle, int) or isinstance(handle, bool) or handle <= 0:
+    raise SystemExit("lockdown table handle is invalid")
+if value["uid"] != 0 or value["control_flow"] is not None:
+    raise SystemExit("lockdown owner/control-flow scope is unexpected")
+if value["release_reason"] is not None:
+    raise SystemExit("Active lockdown unexpectedly has a release reason")
+print(f"sp_lock_{identity} {handle}")
+PY
+  ); then
+    return 1
+  fi
+  [[ "${table}" =~ ^sp_lock_[0-9a-f]{32}$ \
+    && "${handle}" =~ ^[1-9][0-9]*$ ]] || return 1
+  ip netns exec "${ns_client}" nft -j -a list table inet "${table}" \
+    >"${evidence_stem}-active.json" || return 1
+  ip netns exec "${ns_client}" nft -j -a list tables \
+    >"${evidence_stem}-census-active.json" || return 1
+  verify_no_control_lockdown_snapshot "${wal}" \
+    "${evidence_stem}-active.json" "${evidence_stem}-census-active.json" \
+    || return 1
+  printf '%s %s\n' "${table}" "${handle}"
+}
+
+strict_active_main_wal_snapshot() {
+  local wal="$1" expected_pid="$2" retained_wrapper_pid="$3"
+  local expected_bypass_iface="$4" evidence_stem="$5"
+  [[ -f "${wal}" && ! -L "${wal}" ]] || return 1
+  [[ "$(LC_ALL=C stat -c '%a:%u:%g:%h:%F' "${wal}")" \
+    == "600:0:0:1:regular file" ]] || return 1
+  cat /proc/sys/kernel/random/boot_id >"${evidence_stem}-boot-id.txt"
+  stat -Lc '%d %i' "/proc/${retained_wrapper_pid}/ns/net" \
+    >"${evidence_stem}-netns.identity" || return 1
+  stat -Lc '%d %i' "/proc/${retained_wrapper_pid}/ns/mnt" \
+    >"${evidence_stem}-mntns.identity" || return 1
+  proc_starttime "${expected_pid}" >"${evidence_stem}-pid-start-ticks.txt" \
+    || return 1
+  python3 -I -S - "${wal}" "${expected_pid}" "${expected_bypass_iface}" \
+    "${evidence_stem}-boot-id.txt" "${evidence_stem}-netns.identity" \
+    "${evidence_stem}-mntns.identity" \
+    "${evidence_stem}-pid-start-ticks.txt" \
+    "${evidence_stem}-summary.json" <<'PY'
+import collections
+import json
+import re
+import sys
+
+(
+    wal_path, expected_pid_text, expected_iface, boot_path, net_path,
+    mount_path, start_path, output_path,
+) = sys.argv[1:]
+expected_pid = int(expected_pid_text)
+with open(wal_path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+if set(value) != {"schema_version", "generation", "phase", "owner", "operations"}:
+    raise SystemExit("unexpected main WAL schema")
+if value["schema_version"] != 3 or value["phase"] != "active":
+    raise SystemExit("main WAL is not schema-v3 Active")
+if (not isinstance(value["generation"], int)
+        or isinstance(value["generation"], bool)
+        or value["generation"] <= 0):
+    raise SystemExit("main WAL generation is invalid")
+
+owner = value["owner"]
+owner_fields = {
+    "session_id", "boot_id", "uid", "pid", "pid_start_ticks",
+    "network_namespace", "mount_namespace",
+}
+if not isinstance(owner, dict) or set(owner) != owner_fields:
+    raise SystemExit("main WAL owner schema is unexpected")
+for key in ("session_id", "boot_id"):
+    if (not isinstance(owner[key], str)
+            or re.fullmatch(r"[0-9a-f]{32}", owner[key]) is None
+            or owner[key] == "0" * 32):
+        raise SystemExit(f"main WAL {key} is invalid")
+with open(boot_path, "r", encoding="ascii") as stream:
+    boot_id = stream.read().strip().replace("-", "").lower()
+if owner["boot_id"] != boot_id:
+    raise SystemExit("main WAL boot identity differs from the live kernel")
+with open(start_path, "r", encoding="ascii") as stream:
+    start_ticks = int(stream.read().strip())
+if owner["uid"] != 0 or owner["pid"] != expected_pid:
+    raise SystemExit("main WAL process owner differs from replacement")
+if owner["pid_start_ticks"] != start_ticks or start_ticks <= 0:
+    raise SystemExit("main WAL process start identity differs from replacement")
+for label, observed_path in (
+    ("network_namespace", net_path), ("mount_namespace", mount_path)
+):
+    namespace = owner[label]
+    if not isinstance(namespace, dict) or set(namespace) != {"device", "inode"}:
+        raise SystemExit(f"main WAL {label} schema is unexpected")
+    with open(observed_path, "r", encoding="ascii") as stream:
+        fields = stream.read().split()
+    if len(fields) != 2 or any(not field.isdigit() for field in fields):
+        raise SystemExit(f"live {label} identity is malformed")
+    expected = {"device": int(fields[0]), "inode": int(fields[1])}
+    if namespace != expected or min(namespace.values()) <= 0:
+        raise SystemExit(f"main WAL {label} differs from retained wrapper")
+
+operations = value["operations"]
+if not isinstance(operations, list) or len(operations) != 8:
+    raise SystemExit("replacement main WAL operation census differs from eight")
+if [entry.get("id") for entry in operations] != list(range(1, 9)):
+    raise SystemExit("replacement main WAL operation IDs are not contiguous")
+if any(not isinstance(entry, dict)
+       or set(entry) != {"id", "state", "resource"}
+       or entry["state"] != "applied" for entry in operations):
+    raise SystemExit("replacement main WAL contains a non-Applied operation")
+
+expected_resource_fields = {
+    "tun": {"interface"},
+    "route": {
+        "purpose", "family", "table", "destination", "gateway", "output",
+        "protocol", "metric",
+    },
+    "dns": {
+        "target", "original", "original_sha256", "pinned", "pinned_sha256",
+    },
+    "firewall": {
+        "family", "backend", "chain_token", "filter_table_origin",
+        "output_chain_origin", "expected_rule_count",
+    },
+    "firewall_endpoint": {
+        "family", "backend", "chain_token", "address", "transport", "port",
+    },
+}
+kinds = collections.Counter()
+resources = []
+for entry in operations:
+    wrapped = entry["resource"]
+    if not isinstance(wrapped, dict) or set(wrapped) != {"kind", "resource"}:
+        raise SystemExit("replacement main WAL resource wrapper is unexpected")
+    kind = wrapped["kind"]
+    body = wrapped["resource"]
+    if kind not in expected_resource_fields:
+        raise SystemExit("replacement main WAL resource kind is foreign")
+    if not isinstance(body, dict) or set(body) != expected_resource_fields[kind]:
+        raise SystemExit(f"replacement main WAL {kind} schema is unexpected")
+    kinds[kind] += 1
+    resources.append((kind, body))
+if kinds != {
+    "tun": 1, "route": 3, "dns": 1, "firewall": 2,
+    "firewall_endpoint": 1,
+}:
+    raise SystemExit("replacement main WAL resource census is unexpected")
+
+tun = next(body for kind, body in resources if kind == "tun")
+if (not isinstance(tun["interface"], dict)
+        or set(tun["interface"]) != {"name", "ifindex"}
+        or tun["interface"]["name"] != "sptunc"
+        or not isinstance(tun["interface"]["ifindex"], int)
+        or tun["interface"]["ifindex"] <= 0):
+    raise SystemExit("replacement main WAL TUN identity is invalid")
+
+routes = [body for kind, body in resources if kind == "route"]
+split = [route for route in routes if route["purpose"] == "split_default"]
+bypass = [route for route in routes if route["purpose"] == "endpoint_bypass"]
+if len(split) != 2 or len(bypass) != 1:
+    raise SystemExit("replacement main WAL route purpose census is unexpected")
+if {
+    (route["destination"].get("address"), route["destination"].get("prefix_len"))
+    for route in split
+} != {("0.0.0.0", 1), ("128.0.0.0", 1)}:
+    raise SystemExit("replacement split-default resources are unexpected")
+if any(route["gateway"] is not None
+       or route["output"].get("name") != "sptunc"
+       or route["family"] != "ipv4"
+       or route["protocol"] != 186 for route in split):
+    raise SystemExit("replacement split-default ownership differs")
+bypass = bypass[0]
+if (bypass["destination"] != {"address": "10.232.0.2", "prefix_len": 32}
+        or bypass["gateway"] != "10.233.0.1"
+        or bypass["output"].get("name") != expected_iface
+        or bypass["family"] != "ipv4"
+        or bypass["protocol"] != 186):
+    raise SystemExit("replacement bypass is not bound to the c1 underlay")
+
+firewalls = [body for kind, body in resources if kind == "firewall"]
+if {(item["family"], item["expected_rule_count"]) for item in firewalls} \
+        != {("ipv4", 4), ("ipv6", 3)}:
+    raise SystemExit("replacement firewall family/rule census is unexpected")
+endpoint = next(body for kind, body in resources if kind == "firewall_endpoint")
+if (endpoint["family"], endpoint["address"], endpoint["transport"], endpoint["port"]) \
+        != ("ipv4", "10.232.0.2", "tcp", 47843):
+    raise SystemExit("replacement firewall endpoint differs")
+dns = next(body for kind, body in resources if kind == "dns")
+if dns["target"] != "etc_resolv_conf":
+    raise SystemExit("replacement DNS resource target differs")
+
+with open(output_path, "x", encoding="ascii", newline="\n") as stream:
+    json.dump(
+        {
+            "schema_version": value["schema_version"],
+            "generation": value["generation"],
+            "phase": value["phase"],
+            "operation_count": len(operations),
+            "resource_census": dict(sorted(kinds.items())),
+            "bypass_interface": expected_iface,
+            "bypass_gateway": bypass["gateway"],
+        },
+        stream,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    stream.write("\n")
 PY
 }
 
@@ -2260,7 +2565,7 @@ PY
   fi
   if (( guest_status == 0 )) \
     && [[ -f "${run_dir}/status.env" && ! -L "${run_dir}/status.env" ]]; then
-    printf 'test_status=valid\ncleanup_status=valid\nscope=synthetic_orbstack_ipv4_netns_only\nfield_evidence=false\n' \
+    printf 'test_status=valid\ncleanup_status=valid\nscope=synthetic_orbstack_ipv4_tunnel_ipv6_block_netns_only\nfield_evidence=false\n' \
       >"${host_tmp}/expected-guest-status"
     if cmp -s -- "${run_dir}/status.env" "${host_tmp}/expected-guest-status" \
       && (cd -- "${run_dir}" && sha256sum -c checksums.sha256 >/dev/null); then
@@ -2667,14 +2972,15 @@ write_guest_result() {
     printf -- "- Run: \`%s\`\n" "${guest_run_id}"
     printf -- '- Scope: disposable OrbStack Linux clone, private netns only\n'
     printf -- '- Guest phase: **%s** (not a final host verdict)\n' "${status_word}"
-    printf -- '- IPv6: disabled inside the client namespace; this result is IPv4-only\n'
+    printf -- '- IPv6: connected c0/c1 canaries stayed enabled and were blocked at OUTPUT; IPv6 is not tunneled and no L2/ARP/ND claim is made\n'
     printf -- '- macOS host safety: evaluated after guest teardown; see status.env and mac-before/mac-after\n'
     printf -- '- Loaded macOS PF runtime rules: guest does not inspect them; host records either exact read-only state or exact permission-denied scope\n'
     printf -- '- Carrier/authentication: production REALITY TLS 1.3 exact URI + X25519 short-id + ML-KEM pin, then protocol-v3 credential and enrolled allowlist\n'
     printf -- '- Active probe: bounded stock-TLS forward-on-fail to a synthetic local cover, with zero inner sessions before authenticated-client start; no wider indistinguishability claim\n'
     printf -- '- Secret handling: credentials, allowlist, ML-KEM/REALITY identities and synthetic-cover private key stayed in the owned /run work tree and were excluded from evidence\n'
-    printf -- '- Shutdown: durable L3/OUTPUT restart barrier proved after SIGTERM, then explicit release and direct-route restoration\n'
-    printf -- '- Workload gates: foreign persistent named-TUN exclusion, ICMP, TCP, UDP, DNS, 64 MiB SHA, cut/recovery, leak and bounded carrier-marker captures\n'
+    printf -- '- Handoff: a real c0-to-c1 default-route replacement forced process generation 1 into a strictly verified durable L3/OUTPUT lockdown, then generation 2 adopted it and activated through c1 before release\n'
+    printf -- '- Shutdown: generation 2 SIGTERM armed the durable L3/OUTPUT restart barrier, followed by explicit release and c1 direct-route restoration\n'
+    printf -- '- Workload gates: foreign persistent named-TUN exclusion, two-generation handoff, ICMP, TCP, UDP, DNS, 64 MiB SHA, cut/recovery, active IPv4/IPv6 leak probes and c0/c1 packet captures\n'
     printf "\n## Test failures\n\n\`\`\`text\n%s\n\`\`\`\n" \
       "${guest_failures:-<none>}"
     printf "\n## Cleanup failures\n\n\`\`\`text\n%s\n\`\`\`\n" \
@@ -2688,7 +2994,7 @@ write_guest_result() {
     else
       printf 'cleanup_status=failed\n'
     fi
-    printf 'scope=synthetic_orbstack_ipv4_netns_only\n'
+    printf 'scope=synthetic_orbstack_ipv4_tunnel_ipv6_block_netns_only\n'
     printf 'field_evidence=false\n'
   } >"${guest_result_dir}/status.env"
 }
@@ -2795,9 +3101,199 @@ pcap_has() {
   tcpdump -nn -r "${pcap}" -c 1 "${filter}" 2>/dev/null | grep -q .
 }
 
+validate_pcap_file() {
+  local pcap="$1"
+  [[ -f "${pcap}" && ! -L "${pcap}" && -s "${pcap}" ]] || return 1
+  tcpdump -nn -r "${pcap}" -w /dev/null >/dev/null 2>&1
+}
+
 capture_has_zero_kernel_drops() {
   local log="$1"
   grep -Eq '^[[:space:]]*0 packets dropped by kernel$' "${log}"
+}
+
+start_direct_canary_loop() {
+  local role="$1" interface="$2" family="$3" address="$4" log="$5"
+  [[ "${family}" == 4 || "${family}" == 6 ]] || return 1
+  # Positional parameters intentionally expand in the namespace-local shell.
+  # shellcheck disable=SC2016
+  start_owned "${role}" "${log}" \
+    ip netns exec "${ns_client}" bash -c '
+      set -Eeuo pipefail
+      interface="$1"
+      family="$2"
+      address="$3"
+      sequence=0
+      trap "exit 0" TERM INT HUP
+      while :; do
+        sequence=$((sequence + 1))
+        printf "attempt sequence=%s realtime_ns=%s interface=%s family=%s address=%s\n" \
+          "${sequence}" "$(date +%s%N)" "${interface}" "${family}" "${address}"
+        status=blocked
+        if [[ "${family}" == 6 ]]; then
+          if ping -6 -I "${interface}" -c 1 -W 1 "${address}" \
+            >/dev/null 2>&1; then
+            status=success
+          fi
+        elif ping -I "${interface}" -c 1 -W 1 "${address}" \
+          >/dev/null 2>&1; then
+          status=success
+        fi
+        printf "result sequence=%s realtime_ns=%s interface=%s family=%s address=%s status=%s\n" \
+          "${sequence}" "$(date +%s%N)" "${interface}" "${family}" \
+          "${address}" "${status}"
+        sleep 0.05
+      done
+    ' bash "${interface}" "${family}" "${address}"
+}
+
+direct_canary_result_count() {
+  local log="$1"
+  awk '/^result / { count += 1 } END { print count + 0 }' "${log}"
+}
+
+direct_canary_count_exceeds() {
+  local log="$1" baseline="$2" current
+  current="$(direct_canary_result_count "${log}")" || return 1
+  [[ "${current}" =~ ^[0-9]+$ ]] || return 1
+  (( current > baseline ))
+}
+
+capture_ipv6_canary_state() {
+  local phase="$1"
+  local output="${guest_result_dir}/ipv6-canary-state-${phase}"
+  mkdir -m 0700 -- "${output}"
+  ip -n "${ns_client}" -j link show dev c0 \
+    | jq -S 'map({
+        ifindex,
+        ifname,
+        flags: ((.flags // []) | sort),
+        mtu,
+        operstate,
+        link_type,
+        address,
+        broadcast
+      })' >"${output}/c0-link.json"
+  ip -n "${ns_client}" -j link show dev c1 \
+    | jq -S 'map({
+        ifindex,
+        ifname,
+        flags: ((.flags // []) | sort),
+        mtu,
+        operstate,
+        link_type,
+        address,
+        broadcast
+      })' >"${output}/c1-link.json"
+  ip -n "${ns_client}" -j -6 address show dev c0 \
+    | jq -S 'map({
+        ifindex,
+        ifname,
+        flags: ((.flags // []) | sort),
+        mtu,
+        operstate,
+        addr_info: [
+          (.addr_info // [])[] | {
+            family,
+            local,
+            prefixlen,
+            scope,
+            label,
+            flags: ((.flags // []) | sort)
+          }
+        ] | sort_by([.family, .local, .prefixlen, .scope, (.label // "")])
+      })' >"${output}/c0-address.json"
+  ip -n "${ns_client}" -j -6 address show dev c1 \
+    | jq -S 'map({
+        ifindex,
+        ifname,
+        flags: ((.flags // []) | sort),
+        mtu,
+        operstate,
+        addr_info: [
+          (.addr_info // [])[] | {
+            family,
+            local,
+            prefixlen,
+            scope,
+            label,
+            flags: ((.flags // []) | sort)
+          }
+        ] | sort_by([.family, .local, .prefixlen, .scope, (.label // "")])
+      })' >"${output}/c1-address.json"
+  ip -n "${ns_client}" -j -6 route show table main \
+    | jq -S '[
+        .[] | select(.dev == "c0" or .dev == "c1") | {
+          dst,
+          dev,
+          protocol,
+          scope,
+          metric,
+          pref,
+          flags: ((.flags // []) | sort)
+        }
+      ] | sort_by([.dev, .dst, (.protocol // ""), (.scope // "")])' \
+    >"${output}/routes.json"
+}
+
+require_ipv6_canary_state_unchanged() {
+  local phase="$1" name
+  capture_ipv6_canary_state "${phase}" || return 1
+  for name in c0-link.json c1-link.json c0-address.json c1-address.json routes.json; do
+    cmp -s -- \
+      "${guest_result_dir}/ipv6-canary-state-preflight/${name}" \
+      "${guest_result_dir}/ipv6-canary-state-${phase}/${name}" \
+      || return 1
+  done
+}
+
+validate_client_private_uri_argv() {
+  local pid="$1" uri_file="$2" short_id_file="$3"
+  python3 -I -S - "${pid}" "${uri_file}" "${short_id_file}" <<'PY'
+import os
+import sys
+
+pid, uri_file, short_id_file = sys.argv[1:]
+with open(short_id_file, "r", encoding="ascii") as stream:
+    short_id = stream.read().strip()
+with open(f"/proc/{pid}/cmdline", "rb") as stream:
+    argv = [
+        item.decode("utf-8", "strict")
+        for item in stream.read().split(b"\0")
+        if item
+    ]
+if any("shadowpipe://" in item or short_id in item for item in argv):
+    raise SystemExit("client argv contains a REALITY URI or short_id")
+if argv.count("--uri-file") != 1 or "--uri" in argv:
+    raise SystemExit("client argv does not use exactly one --uri-file")
+index = argv.index("--uri-file")
+if index + 1 >= len(argv) or argv[index + 1] != uri_file:
+    raise SystemExit("client argv does not bind the expected private URI path")
+PY
+}
+
+probe_direct_canaries_blocked() {
+  local phase="$1" address evidence_name
+  local ipv4_blocked=true ipv6_blocked=true
+  for address in 10.231.0.1 10.233.0.1; do
+    if timeout 3 ip netns exec "${ns_client}" ping -c 1 -W 1 \
+      "${address}" >/dev/null 2>&1; then
+      ipv4_blocked=false
+      record_failure "${phase}: direct IPv4 canary ${address} escaped"
+    fi
+  done
+  for address in 2001:db8:231::1 2001:db8:233::1; do
+    if timeout 3 ip netns exec "${ns_client}" ping -6 -c 1 -W 1 \
+      "${address}" >/dev/null 2>&1; then
+      ipv6_blocked=false
+      record_failure "${phase}: direct IPv6 canary ${address} escaped"
+    fi
+  done
+  # Preserve the phase in evidence without allowing it to become a path.
+  evidence_name="${phase//[^a-zA-Z0-9._-]/_}"
+  printf 'ipv4_canaries_blocked=%s\nipv6_canaries_blocked=%s\n' \
+    "${ipv4_blocked}" "${ipv6_blocked}" \
+    >"${guest_result_dir}/direct-canaries-${evidence_name}.env"
 }
 
 exclusive_tun_collision_failure() {
@@ -3468,6 +3964,7 @@ PY
   ns_server="spts-${tag}"
   ns_sink="spti-${tag}"
   local lc="zc${tag}a" lr="zc${tag}b"
+  local lc1="zd${tag}a" lr2="zd${tag}b"
   local rs="zs${tag}a" ls="zs${tag}b"
   local se="ze${tag}a" si="ze${tag}b"
 
@@ -3478,10 +3975,12 @@ PY
   done
 
   ip link add "${lc}" type veth peer name "${lr}"
+  ip link add "${lc1}" type veth peer name "${lr2}"
   ip link add "${rs}" type veth peer name "${ls}"
   ip link add "${se}" type veth peer name "${si}"
   local link
-  for link in "${lc}" "${lr}" "${rs}" "${ls}" "${se}" "${si}"; do
+  for link in "${lc}" "${lr}" "${lc1}" "${lr2}" \
+    "${rs}" "${ls}" "${se}" "${si}"; do
     owner_alias="shadowpipe-tun:${guest_run_id}:${link}"
     ip link set dev "${link}" alias "${owner_alias}"
     capture_root_link_identity "${link}" "${owner_alias}" \
@@ -3490,12 +3989,16 @@ PY
 
   ip link set "${lc}" netns "${ns_client}"
   ip link set "${lr}" netns "${ns_router}"
+  ip link set "${lc1}" netns "${ns_client}"
+  ip link set "${lr2}" netns "${ns_router}"
   ip link set "${rs}" netns "${ns_router}"
   ip link set "${ls}" netns "${ns_server}"
   ip link set "${se}" netns "${ns_server}"
   ip link set "${si}" netns "${ns_sink}"
   ip -n "${ns_client}" link set "${lc}" name c0
   ip -n "${ns_router}" link set "${lr}" name r0
+  ip -n "${ns_client}" link set "${lc1}" name c1
+  ip -n "${ns_router}" link set "${lr2}" name r2
   ip -n "${ns_router}" link set "${rs}" name r1
   ip -n "${ns_server}" link set "${ls}" name s0
   ip -n "${ns_server}" link set "${se}" name e0
@@ -3505,11 +4008,19 @@ PY
     ip -n "${ns}" link set lo up
   done
   ip -n "${ns_client}" addr add 10.231.0.2/30 dev c0
+  ip -n "${ns_client}" addr add 2001:db8:231::2/64 dev c0 nodad
   ip -n "${ns_client}" link set c0 up
+  ip -n "${ns_client}" addr add 10.233.0.2/30 dev c1
+  ip -n "${ns_client}" addr add 2001:db8:233::2/64 dev c1 nodad
+  ip -n "${ns_client}" link set c1 up
   ip -n "${ns_client}" route add default via 10.231.0.1
   ip -n "${ns_router}" addr add 10.231.0.1/30 dev r0
+  ip -n "${ns_router}" addr add 2001:db8:231::1/64 dev r0 nodad
+  ip -n "${ns_router}" addr add 10.233.0.1/30 dev r2
+  ip -n "${ns_router}" addr add 2001:db8:233::1/64 dev r2 nodad
   ip -n "${ns_router}" addr add 10.232.0.1/30 dev r1
   ip -n "${ns_router}" link set r0 up
+  ip -n "${ns_router}" link set r2 up
   ip -n "${ns_router}" link set r1 up
   ip netns exec "${ns_router}" sysctl -qw net.ipv4.ip_forward=1
   ip -n "${ns_server}" addr add 10.232.0.2/30 dev s0
@@ -3522,15 +4033,26 @@ PY
   ip -n "${ns_sink}" link set i0 up
   ip -n "${ns_sink}" route add 10.8.0.0/24 via 198.18.0.1
 
-  # Current Shadowpipe full-tunnel and kill-switch are IPv4-only. Clamp IPv6 in
-  # this namespace so the result cannot accidentally claim IPv6 leak safety.
-  ip netns exec "${ns_client}" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
-  ip netns exec "${ns_client}" sysctl -qw net.ipv6.conf.default.disable_ipv6=1
-  [[ -z "$(ip -n "${ns_client}" -6 route show)" ]] \
-    || die 1 "client namespace still has an IPv6 route"
-
   ip netns exec "${ns_client}" ping -c 2 -W 1 10.232.0.2 \
     >"${guest_result_dir}/underlay-preflight.txt"
+  ip netns exec "${ns_client}" ping -c 1 -W 1 10.231.0.1 \
+    >"${guest_result_dir}/c0-ipv4-canary-preflight.txt"
+  ip netns exec "${ns_client}" ping -c 1 -W 1 10.233.0.1 \
+    >"${guest_result_dir}/c1-ipv4-canary-preflight.txt"
+  ip netns exec "${ns_client}" ping -6 -c 1 -W 1 2001:db8:231::1 \
+    >"${guest_result_dir}/c0-ipv6-canary-preflight.txt"
+  ip netns exec "${ns_client}" ping -6 -c 1 -W 1 2001:db8:233::1 \
+    >"${guest_result_dir}/c1-ipv6-canary-preflight.txt"
+  ip -n "${ns_client}" -6 route show \
+    >"${guest_result_dir}/client-ipv6-connected-routes.txt"
+  grep -q '^2001:db8:231::/64 dev c0' \
+    "${guest_result_dir}/client-ipv6-connected-routes.txt" \
+    || die 1 "c0 connected IPv6 canary route is absent"
+  grep -q '^2001:db8:233::/64 dev c1' \
+    "${guest_result_dir}/client-ipv6-connected-routes.txt" \
+    || die 1 "c1 connected IPv6 canary route is absent"
+  capture_ipv6_canary_state preflight \
+    || die 1 "could not capture the preflight IPv6 canary state"
   if ip netns exec "${ns_client}" ping -c 1 -W 1 198.18.0.2 >/dev/null 2>&1; then
     die 1 "sink is reachable before the tunnel; topology is invalid"
   fi
@@ -3662,6 +4184,8 @@ PY
   local missing_credential_status=$?
   set -e
   stop_role_record "${missing_credential_capture_record}" || true
+  validate_pcap_file "${guest_result_dir}/missing-credential-underlay.pcap" \
+    || die 1 "missing-credential pcap is missing, unreadable, or malformed"
   (( missing_credential_status != 0 )) \
     || die 1 "missing client credential invocation unexpectedly succeeded"
   grep -Fq 'load mandatory root-owned client credential before startup' \
@@ -3699,6 +4223,8 @@ PY
   local missing_status=$?
   set -e
   stop_role_record "${missing_capture_record}" || true
+  validate_pcap_file "${guest_result_dir}/missing-pin-underlay.pcap" \
+    || die 1 "missing-pin pcap is missing, unreadable, or malformed"
   (( missing_status != 0 )) || die 1 "missing pin invocation unexpectedly succeeded"
   grep -Fq 'manual REALITY URI requires fp=<64-hex ML-KEM server fingerprint>' \
     "${guest_result_dir}/missing-pin.stderr" \
@@ -3806,6 +4332,8 @@ PY
   collision_end_ns="$(date +%s%N)"
   collision_elapsed_ms=$(((collision_end_ns - collision_start_ns) / 1000000))
   stop_role_record "${collision_capture_record}" || true
+  validate_pcap_file "${guest_result_dir}/preexisting-tun-underlay.pcap" \
+    || die 1 "preexisting-TUN pcap is missing, unreadable, or malformed"
 
   exclusive_tun_collision_failure \
     "${collision_status}" "${guest_result_dir}/preexisting-tun.stderr" \
@@ -4016,11 +4544,17 @@ while True:
     printf 'claim_scope=bounded_synthetic_forward_on_fail_oracle\n'
   } >"${guest_result_dir}/reality-forward-on-fail.env"
 
-  start_owned underlay-capture "${guest_result_dir}/underlay-capture.log" \
+  start_owned underlay-c0-ipv4-capture \
+    "${guest_result_dir}/underlay-c0-ipv4-capture.log" \
     ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c0 \
-    -w "${guest_result_dir}/client-underlay.pcap" \
-    'ip and not (host 10.232.0.2 and tcp port 47843)'
-  local underlay_capture_record="${LAST_RECORD}"
+    -w "${guest_result_dir}/client-c0-ipv4.pcap" ip
+  local underlay_c0_ipv4_capture_record="${LAST_RECORD}"
+  start_owned underlay-c1-ipv4-capture \
+    "${guest_result_dir}/underlay-c1-ipv4-capture.log" \
+    ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c1 \
+    -w "${guest_result_dir}/client-c1-ipv4.pcap" ip
+  local underlay_c1_ipv4_capture_record="${LAST_RECORD}"
+  local underlay_c0_ipv6_capture_record underlay_c1_ipv6_capture_record
   start_owned sink-capture "${guest_result_dir}/sink-capture.log" \
     ip netns exec "${ns_sink}" tcpdump -U -nn -s 192 -i i0 \
     -w "${guest_result_dir}/sink-inner.pcap" \
@@ -4032,8 +4566,10 @@ while True:
   # The wrapper constructs an overlay copy of /etc inside its private mount
   # namespace. DnsGuard may unlink/replace resolv.conf without touching the
   # guest root filesystem. SIGTERM reaches the wrapper through a pidfd; the
-  # wrapper forwards it to the actual client, waits for ordered teardown, then
-  # records resolver type/target/content equality before its mount dies.
+  # wrapper forwards it to the current client generation and retains the exact
+  # mount+network namespaces across one controlled process replacement. The
+  # generation-2 gate lets the orchestrator strictly inspect the intermediate
+  # restart barrier before emulating systemd Restart=always/RestartSec=1s.
   # Positional parameters intentionally expand in the inner shell.
   # shellcheck disable=SC2016
   start_owned shadowpipe-client "${guest_result_dir}/client.log" \
@@ -4051,41 +4587,135 @@ while True:
       snapshot_resolver() {
         local prefix="$1"
         stat -Lc "%F" /etc/resolv.conf >"${work}/${prefix}.type"
+        stat -c "%F %a %u %g %h %s" /etc/resolv.conf \
+          >"${work}/${prefix}.lstat"
+        stat -Lc "%F %a %u %g %h %s" /etc/resolv.conf \
+          >"${work}/${prefix}.target-stat"
         readlink /etc/resolv.conf >"${work}/${prefix}.target" 2>/dev/null || :
         sha256sum /etc/resolv.conf >"${work}/${prefix}.sha256"
       }
+      child_start_ticks() {
+        local pid="$1" line rest
+        local -a fields
+        [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+        IFS= read -r line <"/proc/${pid}/stat" || return 1
+        rest="${line##*) }"
+        read -r -a fields <<<"${rest}"
+        [[ "${#fields[@]}" -ge 20 && "${fields[19]}" =~ ^[0-9]+$ ]] \
+          || return 1
+        printf "%s\n" "${fields[19]}"
+      }
+      signal_child() {
+        local signal_name="$1"
+        [[ "${child:-}" =~ ^[1-9][0-9]*$ \
+          && "${child_start:-}" =~ ^[0-9]+$ ]] || return 0
+        python3 -I -S -c "
+import os
+import signal
+import sys
+
+pid = int(sys.argv[1])
+expected = sys.argv[2]
+sig = getattr(signal, sys.argv[3])
+try:
+    descriptor = os.pidfd_open(pid)
+except ProcessLookupError:
+    raise SystemExit(0)
+with os.fdopen(descriptor):
+    try:
+        line = open(f\"/proc/{pid}/stat\", \"r\", encoding=\"ascii\").read()
+    except FileNotFoundError:
+        raise SystemExit(0)
+    fields = line[line.rfind(\") \") + 2:].split()
+    if len(fields) < 20 or fields[19] != expected:
+        raise SystemExit(3)
+    try:
+        signal.pidfd_send_signal(descriptor, sig)
+    except ProcessLookupError:
+        pass
+" "${child}" "${child_start}" "${signal_name}"
+      }
       snapshot_resolver resolver-before
-      env -u SSH_CONNECTION -u SSH_CLIENT RUST_LOG=info "${client}" \
-        --uri-file "${endpoint_file}" \
-        --client-credential "${credential}" --host-state-dir "${host_state}" \
-        --tunnel --tun-name sptunc --tun-addr 10.8.0.2 --tun-peer 10.8.0.1 \
-        --mtu 1280 --ipv6-mode block --auto-route --kill-switch \
-        --dns 198.18.0.2 --no-guard &
-      child=$!
-      printf "%s\n" "${child}" >"${work}/client.pid"
       wrapper_stop=0
+      child=""
+      child_start=""
       forward_term() {
-        kill -TERM "${child}" 2>/dev/null || :
         wrapper_stop=1
+        signal_child SIGTERM || :
       }
       trap forward_term TERM INT HUP
-      child_status=0
-      while true; do
-        set +e
-        wait "${child}"
-        child_status=$?
-        set -e
-        kill -0 "${child}" 2>/dev/null || break
+      child_status=1
+      completed_generations=0
+      generation=1
+      while :; do
+        if (( generation > 1 )); then
+          while [[ ! -e "${work}/start-generation-${generation}" \
+            && ! -e "${work}/manager-stop" \
+            && "${wrapper_stop}" == 0 ]]; do
+            sleep 0.1
+          done
+          [[ ! -e "${work}/manager-stop" && "${wrapper_stop}" == 0 ]] || break
+          sleep 1
+          [[ ! -e "${work}/manager-stop" && "${wrapper_stop}" == 0 ]] || break
+        fi
+        env -u SSH_CONNECTION -u SSH_CLIENT RUST_LOG=info "${client}" \
+          --uri-file "${endpoint_file}" \
+          --client-credential "${credential}" --host-state-dir "${host_state}" \
+          --tunnel --tun-name sptunc --tun-addr 10.8.0.2 --tun-peer 10.8.0.1 \
+          --mtu 1280 --ipv6-mode block --auto-route --kill-switch \
+          --dns 198.18.0.2 --no-guard &
+        child=$!
+        child_start="$(child_start_ticks "${child}")" || {
+          wait "${child}" 2>/dev/null || :
+          child=""
+          break
+        }
+        if [[ -e "${work}/manager-stop" || "${wrapper_stop}" != 0 ]]; then
+          signal_child SIGTERM || :
+        fi
+        printf "%s\n" "${child}" >"${work}/client.pid"
+        printf "%s\n" "${child}" >"${work}/client-generation-${generation}.pid"
+        printf "%s\n" "${child_start}" \
+          >"${work}/client-generation-${generation}.start-ticks"
+        child_status=0
+        while true; do
+          set +e
+          wait "${child}"
+          child_status=$?
+          set -e
+          current_child_start="$(child_start_ticks "${child}" 2>/dev/null)" \
+            || break
+          [[ "${current_child_start}" == "${child_start}" ]] || break
+        done
+        snapshot_resolver "resolver-after-generation-${generation}"
+        if [[ "$(<"${work}/resolver-before.type")" \
+          == "$(<"${work}/resolver-after-generation-${generation}.type")" \
+          && "$(<"${work}/resolver-before.lstat")" \
+          == "$(<"${work}/resolver-after-generation-${generation}.lstat")" \
+          && "$(<"${work}/resolver-before.target-stat")" \
+          == "$(<"${work}/resolver-after-generation-${generation}.target-stat")" \
+          && "$(<"${work}/resolver-before.target")" \
+          == "$(<"${work}/resolver-after-generation-${generation}.target")" \
+          && "$(<"${work}/resolver-before.sha256")" \
+          == "$(<"${work}/resolver-after-generation-${generation}.sha256")" ]]; then
+          : >"${work}/resolver-restored-generation-${generation}.ok"
+        else
+          : >"${work}/resolver-restored-generation-${generation}.failed"
+        fi
+        printf "%s\n" "${child_status}" \
+          >"${work}/client-generation-${generation}-exit-status"
+        : >"${work}/client-generation-${generation}-stopped.ready"
+        completed_generations="${generation}"
+        child=""
+        child_start=""
+        if [[ -e "${work}/manager-stop" || "${wrapper_stop}" != 0 ]]; then
+          break
+        fi
+        generation=$((generation + 1))
       done
-      snapshot_resolver resolver-after
-      if [[ "$(<"${work}/resolver-before.type")" == "$(<"${work}/resolver-after.type")" \
-        && "$(<"${work}/resolver-before.target")" == "$(<"${work}/resolver-after.target")" \
-        && "$(<"${work}/resolver-before.sha256")" == "$(<"${work}/resolver-after.sha256")" ]]; then
-        : >"${work}/resolver-restored.ok"
-      else
-        : >"${work}/resolver-restored.failed"
-      fi
       printf "%s\n" "${child_status}" >"${work}/client-exit-status"
+      printf "%s\n" "${completed_generations}" \
+        >"${work}/client-completed-generations"
       : >"${work}/client-stopped.ready"
       # Keep this exact mount+network namespace alive so the orchestrator can
       # inspect the durable barrier and invoke --release-lockdown against the
@@ -4101,32 +4731,17 @@ while True:
   local real_client_pid real_client_starttime
 
   wait_until 15 ip netns exec "${ns_client}" ip link show sptunc \
-    || die 1 "client OS TUN did not appear"
-  wait_until 5 test -s "${guest_work_dir}/client.pid" \
-    || die 1 "client wrapper did not publish the real client PID"
-  real_client_pid="$(<"${guest_work_dir}/client.pid")"
+    || die 1 "generation-1 client OS TUN did not appear"
+  wait_until 5 test -s "${guest_work_dir}/client-generation-1.pid" \
+    || die 1 "client wrapper did not publish the generation-1 client PID"
+  real_client_pid="$(<"${guest_work_dir}/client-generation-1.pid")"
   [[ "${real_client_pid}" =~ ^[0-9]+$ ]] \
-    || die 1 "client wrapper published a malformed PID"
+    || die 1 "client wrapper published a malformed generation-1 PID"
   real_client_starttime="$(proc_starttime "${real_client_pid}")" \
-    || die 1 "could not bind the real client PID to its start time"
-  python3 -I -S - "${real_client_pid}" "${reality_uri_file}" \
-    "${reality_short_id_file}" <<'PY'
-import os
-import sys
-
-pid, uri_file, short_id_file = sys.argv[1:]
-with open(short_id_file, "r", encoding="ascii") as stream:
-    short_id = stream.read().strip()
-with open(f"/proc/{pid}/cmdline", "rb") as stream:
-    argv = [item.decode("utf-8", "strict") for item in stream.read().split(b"\0") if item]
-if any("shadowpipe://" in item or short_id in item for item in argv):
-    raise SystemExit("client argv contains a REALITY URI or short_id")
-if argv.count("--uri-file") != 1 or "--uri" in argv:
-    raise SystemExit("client argv does not use exactly one --uri-file")
-index = argv.index("--uri-file")
-if index + 1 >= len(argv) or argv[index + 1] != uri_file:
-    raise SystemExit("client argv does not bind the expected private URI path")
-PY
+    || die 1 "could not bind the generation-1 client PID to its start time"
+  validate_client_private_uri_argv "${real_client_pid}" \
+    "${reality_uri_file}" "${reality_short_id_file}" \
+    || die 1 "generation-1 client argv did not preserve the private URI boundary"
   wait_until 15 grep -q 'session established' "${guest_result_dir}/server.log" \
     || die 1 "authenticated session did not establish"
   grep -q 'reality token accepted; carrier established; awaiting v3 device proof' \
@@ -4134,23 +4749,281 @@ PY
     || die 1 "authenticated client did not traverse the accepted REALITY path"
   nsenter -t "${client_pid}" -m -n -- grep -q '^nameserver 198.18.0.2$' \
     /etc/resolv.conf || die 1 "mount-private resolver was not pinned"
-  ip -n "${ns_client}" route show >"${guest_result_dir}/client-routes-active.txt"
+  ip -n "${ns_client}" route show \
+    >"${guest_result_dir}/client-routes-generation-1-active.txt"
   ip netns exec "${ns_client}" iptables-save \
-    >"${guest_result_dir}/client-iptables-active.txt"
+    >"${guest_result_dir}/client-iptables-generation-1-active.txt"
   ip netns exec "${ns_client}" ip6tables-save \
-    >"${guest_result_dir}/client-ip6tables-active.txt"
-  grep -q '^0.0.0.0/1 dev sptunc' "${guest_result_dir}/client-routes-active.txt" \
-    || die 1 "lower split-default route missing"
-  grep -q '^128.0.0.0/1 dev sptunc' "${guest_result_dir}/client-routes-active.txt" \
-    || die 1 "upper split-default route missing"
+    >"${guest_result_dir}/client-ip6tables-generation-1-active.txt"
+  grep -q '^0.0.0.0/1 dev sptunc' \
+    "${guest_result_dir}/client-routes-generation-1-active.txt" \
+    || die 1 "generation-1 lower split-default route missing"
+  grep -q '^128.0.0.0/1 dev sptunc' \
+    "${guest_result_dir}/client-routes-generation-1-active.txt" \
+    || die 1 "generation-1 upper split-default route missing"
   grep -Eq '^10.232.0.2(/32)? via 10.231.0.1 dev c0' \
-    "${guest_result_dir}/client-routes-active.txt" \
-    || die 1 "carrier bypass route missing"
+    "${guest_result_dir}/client-routes-generation-1-active.txt" \
+    || die 1 "generation-1 c0 carrier bypass route missing"
   validate_active_killswitch_saves \
-    "${guest_result_dir}/client-iptables-active.txt" \
-    "${guest_result_dir}/client-ip6tables-active.txt" \
-    "${guest_result_dir}/active-killswitch-identity.json" \
-    || die 1 "active kill-switch differs from the exact fail-closed contract"
+    "${guest_result_dir}/client-iptables-generation-1-active.txt" \
+    "${guest_result_dir}/client-ip6tables-generation-1-active.txt" \
+    "${guest_result_dir}/generation-1-active-killswitch-identity.json" \
+    || die 1 "generation-1 kill-switch differs from the exact fail-closed contract"
+  require_ipv6_canary_state_unchanged generation-1-active \
+    || die 1 "generation-1 activation changed the connected IPv6 canary state"
+
+  # IPv6 policy captures start only after the exact block policy is active, so
+  # pre-policy ND/MLD/RS traffic cannot be mislabeled as a Shadowpipe leak.
+  start_owned underlay-c0-ipv6-capture \
+    "${guest_result_dir}/underlay-c0-ipv6-capture.log" \
+    ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c0 \
+    -w "${guest_result_dir}/client-c0-ipv6.pcap" ip6
+  underlay_c0_ipv6_capture_record="${LAST_RECORD}"
+  start_owned underlay-c1-ipv6-capture \
+    "${guest_result_dir}/underlay-c1-ipv6-capture.log" \
+    ip netns exec "${ns_client}" tcpdump -U -nn -s 192 -i c1 \
+    -w "${guest_result_dir}/client-c1-ipv6.pcap" ip6
+  underlay_c1_ipv6_capture_record="${LAST_RECORD}"
+
+  local canary_c0_ipv4_log="${guest_result_dir}/continuous-c0-ipv4-canary.log"
+  local canary_c1_ipv4_log="${guest_result_dir}/continuous-c1-ipv4-canary.log"
+  local canary_c0_ipv6_log="${guest_result_dir}/continuous-c0-ipv6-canary.log"
+  local canary_c1_ipv6_log="${guest_result_dir}/continuous-c1-ipv6-canary.log"
+  start_direct_canary_loop direct-c0-ipv4 c0 4 10.231.0.1 \
+    "${canary_c0_ipv4_log}"
+  local canary_c0_ipv4_record="${LAST_RECORD}"
+  start_direct_canary_loop direct-c1-ipv4 c1 4 10.233.0.1 \
+    "${canary_c1_ipv4_log}"
+  local canary_c1_ipv4_record="${LAST_RECORD}"
+  start_direct_canary_loop direct-c0-ipv6 c0 6 2001:db8:231::1 \
+    "${canary_c0_ipv6_log}"
+  local canary_c0_ipv6_record="${LAST_RECORD}"
+  start_direct_canary_loop direct-c1-ipv6 c1 6 2001:db8:233::1 \
+    "${canary_c1_ipv6_log}"
+  local canary_c1_ipv6_record="${LAST_RECORD}"
+  local canary_log
+  for canary_log in \
+    "${canary_c0_ipv4_log}" "${canary_c1_ipv4_log}" \
+    "${canary_c0_ipv6_log}" "${canary_c1_ipv6_log}"; do
+    wait_until 5 direct_canary_count_exceeds "${canary_log}" 0 \
+      || die 1 "continuous direct-canary workload did not start: ${canary_log##*/}"
+  done
+
+  # Force a real underlay topology change while generation 1 is healthy. The
+  # endpoint /32 still pins its live carrier to c0 until the client observes the
+  # RTM route notification, arms the independent barrier, and removes its own
+  # state. Generation 2 is deliberately gated so the exact intermediate state
+  # can be inspected before the retained wrapper emulates systemd restart.
+  probe_direct_canaries_blocked "generation-1-active"
+  local generation_one_pid="${real_client_pid}"
+  local generation_one_starttime="${real_client_starttime}"
+  local generation_one_session_count
+  generation_one_session_count="$(grep -c 'session established' \
+    "${guest_result_dir}/server.log")"
+  [[ "${generation_one_session_count}" =~ ^[1-9][0-9]*$ ]] \
+    || die 1 "generation-1 authenticated session count is invalid"
+  local handoff_c0_ipv4_before handoff_c1_ipv4_before
+  local handoff_c0_ipv6_before handoff_c1_ipv6_before
+  handoff_c0_ipv4_before="$(direct_canary_result_count "${canary_c0_ipv4_log}")"
+  handoff_c1_ipv4_before="$(direct_canary_result_count "${canary_c1_ipv4_log}")"
+  handoff_c0_ipv6_before="$(direct_canary_result_count "${canary_c0_ipv6_log}")"
+  handoff_c1_ipv6_before="$(direct_canary_result_count "${canary_c1_ipv6_log}")"
+  ip -n "${ns_client}" route replace default via 10.233.0.1 dev c1
+  ip -n "${ns_client}" route show \
+    >"${guest_result_dir}/client-routes-after-default-replacement.txt"
+  grep -q '^default via 10.233.0.1 dev c1' \
+    "${guest_result_dir}/client-routes-after-default-replacement.txt" \
+    || die 1 "real default-route replacement did not select c1"
+  wait_until 20 test -f \
+    "${guest_work_dir}/client-generation-1-stopped.ready" \
+    || die 1 "generation 1 did not complete controlled network restart"
+  if proc_starttime "${generation_one_pid}" >/dev/null 2>&1; then
+    die 1 "generation-1 client remained after network invalidation"
+  fi
+  local generation_one_status
+  generation_one_status="$(<"${guest_work_dir}/client-generation-1-exit-status")"
+  [[ "${generation_one_status}" =~ ^[1-9][0-9]*$ \
+    && "${generation_one_status}" != 124 \
+    && "${generation_one_status}" != 137 \
+    && "${generation_one_status}" != 143 ]] \
+    || die 1 "generation-1 network restart did not return a bounded non-zero status"
+  grep -q \
+    'network topology invalidated the captured underlay; replacing this process under durable lockdown' \
+    "${guest_result_dir}/client.log" \
+    || die 1 "generation 1 did not log topology-driven replacement"
+  grep -q 'durable restart lockdown active before main host-state teardown' \
+    "${guest_result_dir}/client.log" \
+    || die 1 "generation 1 did not log strict restart-lockdown activation"
+  if grep -Eq 'Conflict journal|journal.*Conflict|sealed.*Conflict' \
+    "${guest_result_dir}/client.log"; then
+    die 1 "ordinary network handoff was incorrectly sealed as Conflict"
+  fi
+  if ip -n "${ns_client}" link show sptunc >/dev/null 2>&1; then
+    die 1 "generation-1 TUN remained under the intermediate lockdown"
+  fi
+  if ip -n "${ns_client}" route show \
+    | grep -Eq '^(0\.0\.0\.0/1|128\.0\.0\.0/1) '; then
+    die 1 "generation-1 split-default route remained during handoff"
+  fi
+  if ip -n "${ns_client}" route show 10.232.0.2/32 | grep -q .; then
+    die 1 "generation-1 carrier bypass remained during handoff"
+  fi
+  if ip netns exec "${ns_client}" iptables-save \
+    | grep -Eq 'SP4_[0-9a-f]{20}|-j SP4_[0-9a-f]{20}'; then
+    die 1 "generation-1 IPv4 kill-switch remained during handoff"
+  fi
+  if ip netns exec "${ns_client}" ip6tables-save \
+    | grep -Eq 'SP6_[0-9a-f]{20}|-j SP6_[0-9a-f]{20}'; then
+    die 1 "generation-1 IPv6 kill-switch remained during handoff"
+  fi
+  [[ -f "${guest_work_dir}/resolver-restored-generation-1.ok" \
+    && ! -e "${guest_work_dir}/resolver-restored-generation-1.failed" ]] \
+    || die 1 "generation-1 mount-private resolver was not restored"
+
+  local lockdown_wal="${client_host_state}/handoff-lockdown-v1.json"
+  local main_wal="${client_host_state}/host-state-v2.json"
+  [[ ! -e "${main_wal}" && ! -L "${main_wal}" ]] \
+    || die 1 "complete network handoff retained a main host-state WAL"
+  local handoff_lockdown_table handoff_lockdown_handle
+  if ! read -r handoff_lockdown_table handoff_lockdown_handle < <(
+    strict_active_lockdown_snapshot "${lockdown_wal}" "${client_pid}" \
+      "${guest_result_dir}/network-handoff-lockdown"
+  ); then
+    die 1 "intermediate network-handoff lockdown failed strict WAL/kernel proof"
+  fi
+  find "${client_host_state}" -mindepth 1 -maxdepth 1 -printf '%f\n' \
+    | LC_ALL=C sort >"${guest_result_dir}/network-handoff-state-census.txt"
+  [[ "$(<"${guest_result_dir}/network-handoff-state-census.txt")" \
+    == $'handoff-lockdown-v1.json\nhost.lock' ]] \
+    || die 1 "intermediate handoff state directory contains a foreign artifact"
+  exact_empty_private_regular_file \
+    "${client_host_state}/host.lock" 0 0 \
+    || die 1 "intermediate host lock lacks exact root-private regular-file safety"
+  require_ipv6_canary_state_unchanged network-handoff-lockdown \
+    || die 1 "network handoff changed the connected IPv6 canary state"
+  probe_direct_canaries_blocked "network-handoff-lockdown"
+
+  create_empty_private_regular_file "${guest_work_dir}/start-generation-2" \
+    || die 1 "could not publish the generation-2 restart gate"
+  wait_until 20 test -s "${guest_work_dir}/client-generation-2.pid" \
+    || die 1 "retained wrapper did not launch generation 2"
+  real_client_pid="$(<"${guest_work_dir}/client-generation-2.pid")"
+  [[ "${real_client_pid}" =~ ^[0-9]+$ \
+    && "${real_client_pid}" != "${generation_one_pid}" ]] \
+    || die 1 "client wrapper did not publish a distinct generation-2 PID"
+  real_client_starttime="$(proc_starttime "${real_client_pid}")" \
+    || die 1 "could not bind the generation-2 client PID to its start time"
+  validate_client_private_uri_argv "${real_client_pid}" \
+    "${reality_uri_file}" "${reality_short_id_file}" \
+    || die 1 "generation-2 client argv did not preserve the private URI boundary"
+  wait_until 20 ip netns exec "${ns_client}" ip link show sptunc \
+    || die 1 "generation-2 client OS TUN did not appear"
+  wait_until 20 awk -v baseline="${generation_one_session_count}" '
+    /session established/ { count += 1 }
+    END { exit count <= baseline }
+  ' "${guest_result_dir}/server.log" \
+    || die 1 "generation-2 authenticated session did not establish"
+  local generation_two_session_count
+  generation_two_session_count="$(grep -c 'session established' \
+    "${guest_result_dir}/server.log")"
+  (( generation_two_session_count > generation_one_session_count )) \
+    || die 1 "generation-2 session count did not increase"
+  wait_until 15 grep -q \
+    'restart lockdown released after durable replacement Active proof' \
+    "${guest_result_dir}/client.log" \
+    || die 1 "generation 2 did not release lockdown after replacement Active proof"
+  [[ ! -e "${lockdown_wal}" && ! -L "${lockdown_wal}" ]] \
+    || die 1 "generation-2 activation retained the restart-lockdown WAL"
+  if ip netns exec "${ns_client}" nft list table inet \
+    "${handoff_lockdown_table}" >/dev/null 2>&1; then
+    die 1 "generation-2 activation retained the intermediate lockdown table"
+  fi
+  if ip netns exec "${ns_client}" nft list tables \
+    | grep -Eq '^table inet sp_lock_[0-9a-f]{32}$'; then
+    die 1 "generation-2 activation left a foreign restart-lockdown table"
+  fi
+  strict_active_main_wal_snapshot "${main_wal}" "${real_client_pid}" \
+    "${client_pid}" c1 "${guest_result_dir}/generation-2-main-wal-active" \
+    || die 1 "generation-2 main WAL failed strict Active/c1 proof"
+  ip -n "${ns_client}" route show \
+    >"${guest_result_dir}/client-routes-generation-2-active.txt"
+  grep -q '^default via 10.233.0.1 dev c1' \
+    "${guest_result_dir}/client-routes-generation-2-active.txt" \
+    || die 1 "generation-2 default route is not c1"
+  grep -q '^0.0.0.0/1 dev sptunc' \
+    "${guest_result_dir}/client-routes-generation-2-active.txt" \
+    || die 1 "generation-2 lower split-default route missing"
+  grep -q '^128.0.0.0/1 dev sptunc' \
+    "${guest_result_dir}/client-routes-generation-2-active.txt" \
+    || die 1 "generation-2 upper split-default route missing"
+  grep -Eq '^10.232.0.2(/32)? via 10.233.0.1 dev c1' \
+    "${guest_result_dir}/client-routes-generation-2-active.txt" \
+    || die 1 "generation-2 c1 carrier bypass route missing"
+  ip netns exec "${ns_client}" iptables-save \
+    >"${guest_result_dir}/client-iptables-generation-2-active.txt"
+  ip netns exec "${ns_client}" ip6tables-save \
+    >"${guest_result_dir}/client-ip6tables-generation-2-active.txt"
+  validate_active_killswitch_saves \
+    "${guest_result_dir}/client-iptables-generation-2-active.txt" \
+    "${guest_result_dir}/client-ip6tables-generation-2-active.txt" \
+    "${guest_result_dir}/generation-2-active-killswitch-identity.json" \
+    || die 1 "generation-2 kill-switch differs from the exact fail-closed contract"
+  require_ipv6_canary_state_unchanged generation-2-active \
+    || die 1 "generation-2 activation changed the connected IPv6 canary state"
+  nsenter -t "${client_pid}" -m -n -- grep -q '^nameserver 198.18.0.2$' \
+    /etc/resolv.conf || die 1 "generation-2 mount-private resolver was not pinned"
+  probe_direct_canaries_blocked "generation-2-active"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c0_ipv4_log}" "${handoff_c0_ipv4_before}" \
+    || die 1 "c0 IPv4 canary attempts did not span the network handoff"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c1_ipv4_log}" "${handoff_c1_ipv4_before}" \
+    || die 1 "c1 IPv4 canary attempts did not span the network handoff"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c0_ipv6_log}" "${handoff_c0_ipv6_before}" \
+    || die 1 "c0 IPv6 canary attempts did not span the network handoff"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c1_ipv6_log}" "${handoff_c1_ipv6_before}" \
+    || die 1 "c1 IPv6 canary attempts did not span the network handoff"
+  local handoff_c0_ipv4_after handoff_c1_ipv4_after
+  local handoff_c0_ipv6_after handoff_c1_ipv6_after
+  handoff_c0_ipv4_after="$(direct_canary_result_count "${canary_c0_ipv4_log}")"
+  handoff_c1_ipv4_after="$(direct_canary_result_count "${canary_c1_ipv4_log}")"
+  handoff_c0_ipv6_after="$(direct_canary_result_count "${canary_c0_ipv6_log}")"
+  handoff_c1_ipv6_after="$(direct_canary_result_count "${canary_c1_ipv6_log}")"
+  {
+    printf 'generation_1_pid=%s\n' "${generation_one_pid}"
+    printf 'generation_1_start_ticks=%s\n' "${generation_one_starttime}"
+    printf 'generation_1_exit_status=%s\n' "${generation_one_status}"
+    printf 'default_route_transition=c0_to_c1\n'
+    printf 'intermediate_main_wal=absent\n'
+    printf 'intermediate_lockdown=active_strict\n'
+    printf 'intermediate_lockdown_table=%s\n' "${handoff_lockdown_table}"
+    printf 'intermediate_lockdown_handle=%s\n' "${handoff_lockdown_handle}"
+    printf 'generation_2_pid=%s\n' "${real_client_pid}"
+    printf 'generation_2_start_ticks=%s\n' "${real_client_starttime}"
+    printf 'generation_1_session_count=%s\n' "${generation_one_session_count}"
+    printf 'generation_2_session_count=%s\n' "${generation_two_session_count}"
+    printf 'generation_2_bypass_interface=c1\n'
+    printf 'generation_2_main_wal=active_strict\n'
+    printf 'generation_2_lockdown=absent_after_active_proof\n'
+    printf 'c0_ipv4_canary_results_before_handoff=%s\n' \
+      "${handoff_c0_ipv4_before}"
+    printf 'c0_ipv4_canary_results_after_handoff=%s\n' \
+      "${handoff_c0_ipv4_after}"
+    printf 'c1_ipv4_canary_results_before_handoff=%s\n' \
+      "${handoff_c1_ipv4_before}"
+    printf 'c1_ipv4_canary_results_after_handoff=%s\n' \
+      "${handoff_c1_ipv4_after}"
+    printf 'c0_ipv6_canary_results_before_handoff=%s\n' \
+      "${handoff_c0_ipv6_before}"
+    printf 'c0_ipv6_canary_results_after_handoff=%s\n' \
+      "${handoff_c0_ipv6_after}"
+    printf 'c1_ipv6_canary_results_before_handoff=%s\n' \
+      "${handoff_c1_ipv6_before}"
+    printf 'c1_ipv6_canary_results_after_handoff=%s\n' \
+      "${handoff_c1_ipv6_after}"
+  } >"${guest_result_dir}/network-handoff.env"
 
   # Keep confidentiality evidence separate from the negative leak BPF. This
   # bounded capture must contain the allowed carrier tuple, must not drop any
@@ -4158,7 +5031,7 @@ PY
   # It is a regression heuristic, not a substitute for AEAD security analysis.
   start_owned carrier-marker-capture \
     "${guest_result_dir}/carrier-marker-capture.log" \
-    ip netns exec "${ns_client}" tcpdump --immediate-mode -U -nn -s 0 -i c0 \
+    ip netns exec "${ns_client}" tcpdump --immediate-mode -U -nn -s 0 -i c1 \
     -w "${guest_result_dir}/carrier-marker.pcap" \
     'host 10.232.0.2 and tcp port 47843'
   local marker_capture_record="${LAST_RECORD}"
@@ -4169,6 +5042,8 @@ PY
     || record_failure "bounded marker workload failed"
   sleep 0.25
   stop_role_record "${marker_capture_record}" || true
+  validate_pcap_file "${guest_result_dir}/carrier-marker.pcap" \
+    || record_failure "carrier-marker pcap is missing, unreadable, or malformed"
   grep -qxF "${marker}" "${guest_result_dir}/marker-through-tunnel.txt" 2>/dev/null \
     || record_failure "bounded marker response mismatch"
   capture_has_zero_kernel_drops \
@@ -4268,17 +5143,14 @@ EOF
   grep -qxF "${marker}" "${guest_result_dir}/recovery-health.txt" 2>/dev/null \
     || record_failure "recovery payload mismatch"
 
-  # Close captures before reading their pcap files.
-  stop_role_record "${underlay_capture_record}" || true
+  # The positive inner capture may close after the workload. Underlay captures
+  # and continuous direct canaries deliberately remain active through the final
+  # manager-stop/SIGTERM transition and strict lockdown proof.
   stop_role_record "${sink_capture_record}" || true
-  capture_has_zero_kernel_drops "${guest_result_dir}/underlay-capture.log" \
-    || record_failure "negative underlay capture dropped packets"
   capture_has_zero_kernel_drops "${guest_result_dir}/sink-capture.log" \
     || record_failure "positive sink capture dropped packets"
-  if pcap_has "${guest_result_dir}/client-underlay.pcap" \
-    'not (host 10.232.0.2 and tcp port 47843)'; then
-    record_failure "client underlay carried non-carrier IPv4 traffic"
-  fi
+  validate_pcap_file "${guest_result_dir}/sink-inner.pcap" \
+    || record_failure "positive sink pcap is missing, unreadable, or malformed"
   pcap_has "${guest_result_dir}/sink-inner.pcap" 'src host 10.8.0.2 and icmp' \
     || record_failure "sink capture lacks inner ICMP"
   pcap_has "${guest_result_dir}/sink-inner.pcap" \
@@ -4291,10 +5163,23 @@ EOF
     'src host 10.8.0.2 and udp dst port 53' \
     || record_failure "sink capture lacks tunneled DNS"
 
-  # Explicit graceful teardown checks. Signal the exact real client through a
-  # pidfd while leaving its wrapper alive. The wrapper pins the same mount and
-  # network namespaces recorded by the independent lockdown WAL, which lets us
-  # prove the post-SIGTERM barrier before the explicit operator release.
+  # Model `systemctl stop`: the manager-level no-restart gate is durably
+  # published before the exact child receives SIGTERM. The namespace holder
+  # remains alive for strict lockdown inspection and explicit release, but the
+  # restart supervisor may not create a generation 3.
+  create_empty_private_regular_file "${guest_work_dir}/manager-stop" \
+    || die 1 "could not publish the manager no-restart gate"
+  [[ -f "${guest_work_dir}/manager-stop" \
+    && ! -L "${guest_work_dir}/manager-stop" ]] \
+    || die 1 "manager no-restart gate was not published"
+  printf 'manager_stop_gate=present_before_generation_2_sigterm\n' \
+    >"${guest_result_dir}/manager-stop.env"
+  local shutdown_c0_ipv4_before shutdown_c1_ipv4_before
+  local shutdown_c0_ipv6_before shutdown_c1_ipv6_before
+  shutdown_c0_ipv4_before="$(direct_canary_result_count "${canary_c0_ipv4_log}")"
+  shutdown_c1_ipv4_before="$(direct_canary_result_count "${canary_c1_ipv4_log}")"
+  shutdown_c0_ipv6_before="$(direct_canary_result_count "${canary_c0_ipv6_log}")"
+  shutdown_c1_ipv6_before="$(direct_canary_result_count "${canary_c1_ipv6_log}")"
   pidfd_signal "${real_client_pid}" "${real_client_starttime}" SIGTERM \
     || die 1 "could not signal the exact real client process"
   wait_until 20 test -f "${guest_work_dir}/client-stopped.ready" \
@@ -4302,6 +5187,12 @@ EOF
   if proc_starttime "${real_client_pid}" >/dev/null 2>&1; then
     record_failure "real client process remained after forwarded SIGTERM"
   fi
+  if [[ -e "${guest_work_dir}/client-generation-3.pid" \
+    || -L "${guest_work_dir}/client-generation-3.pid" ]]; then
+    record_failure "manager-stop gate allowed an unexpected generation 3"
+  fi
+  proc_starttime "${client_pid}" >/dev/null 2>&1 \
+    || die 1 "namespace holder did not remain alive after manager stop"
   grep -qx '0' "${guest_work_dir}/client-exit-status" \
     || record_failure "client returned a non-zero status after graceful SIGTERM"
   grep -q 'shutdown requested; restoring routes, DNS and firewall' \
@@ -4327,106 +5218,127 @@ EOF
   if ip -n "${ns_client}" route show 10.232.0.2/32 | grep -q .; then
     record_failure "carrier bypass /32 remained after graceful stop"
   fi
-  [[ -f "${guest_work_dir}/resolver-restored.ok" \
-    && ! -e "${guest_work_dir}/resolver-restored.failed" ]] \
-    || record_failure "mount-private resolv.conf was not restored"
+  [[ -f "${guest_work_dir}/resolver-restored-generation-2.ok" \
+    && ! -e "${guest_work_dir}/resolver-restored-generation-2.failed" ]] \
+    || record_failure "generation-2 mount-private resolv.conf was not restored"
 
-  local lockdown_wal lockdown_table lockdown_handle
-  lockdown_wal="${client_host_state}/handoff-lockdown-v1.json"
+  local lockdown_table lockdown_handle
   [[ ! -e "${client_host_state}/host-state-v2.json" \
     && ! -L "${client_host_state}/host-state-v2.json" ]] \
     || record_failure "main host-state WAL remained after graceful teardown"
-  [[ -f "${lockdown_wal}" && ! -L "${lockdown_wal}" ]] \
-    || die 1 "durable restart-lockdown WAL is absent or unsafe after SIGTERM"
-  [[ "$(LC_ALL=C stat -c '%a:%u:%g:%h:%F' "${lockdown_wal}")" \
-    == "600:0:0:1:regular file" ]] \
-    || die 1 "restart-lockdown WAL lacks exact root:root 0600 single-link safety"
   [[ "$(LC_ALL=C stat -c '%a:%u:%g:%F' "${client_host_state}")" \
     == "700:0:0:directory" ]] \
     || die 1 "host-state directory lacks exact root:root 0700 real-directory safety"
-  cat /proc/sys/kernel/random/boot_id \
-    >"${guest_result_dir}/restart-lockdown-boot-id.txt"
-  stat -Lc '%d %i' "/proc/${client_pid}/ns/net" \
-    >"${guest_result_dir}/restart-lockdown-netns.identity"
-  stat -Lc '%d %i' "/proc/${client_pid}/ns/mnt" \
-    >"${guest_result_dir}/restart-lockdown-mntns.identity"
   if ! read -r lockdown_table lockdown_handle < <(
-    python3 -I -S - "${lockdown_wal}" \
-      "${guest_result_dir}/restart-lockdown-boot-id.txt" \
-      "${guest_result_dir}/restart-lockdown-netns.identity" \
-      "${guest_result_dir}/restart-lockdown-mntns.identity" <<'PY'
-import json
-import re
-import sys
-
-wal_path, boot_path, net_path, mount_path = sys.argv[1:]
-with open(wal_path, "r", encoding="utf-8") as stream:
-    value = json.load(stream)
-required = {
-    "schema_version", "generation", "identity", "boot_id", "uid",
-    "network_namespace", "mount_namespace", "control_flow", "phase",
-    "table_handle", "release_reason",
-}
-if set(value) != required:
-    raise SystemExit("unexpected lockdown WAL schema")
-identity = value["identity"]
-handle = value["table_handle"]
-if value["schema_version"] != 1 or value["phase"] != "active":
-    raise SystemExit("lockdown WAL is not schema-v1 Active")
-generation = value["generation"]
-if (not isinstance(generation, int) or isinstance(generation, bool)
-        or generation <= 0):
-    raise SystemExit("lockdown WAL generation is invalid")
-if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{32}", identity) is None:
-    raise SystemExit("lockdown identity is not canonical lowercase hex")
-if identity == "0" * 32:
-    raise SystemExit("lockdown identity is zero")
-if (not isinstance(value["boot_id"], str)
-        or re.fullmatch(r"[0-9a-f]{32}", value["boot_id"]) is None):
-    raise SystemExit("lockdown boot identity is not canonical lowercase hex")
-with open(boot_path, "r", encoding="ascii") as stream:
-    boot_id = stream.read().strip().replace("-", "").lower()
-if value["boot_id"] != boot_id or boot_id == "0" * 32:
-    raise SystemExit("lockdown WAL boot identity differs from the live kernel")
-for label, observed_path in (
-    ("network_namespace", net_path), ("mount_namespace", mount_path)
-):
-    namespace = value[label]
-    if not isinstance(namespace, dict) or set(namespace) != {"device", "inode"}:
-        raise SystemExit(f"{label} has an unexpected schema")
-    if any(not isinstance(namespace[field], int)
-           or isinstance(namespace[field], bool)
-           or namespace[field] <= 0 for field in ("device", "inode")):
-        raise SystemExit(f"{label} has an invalid identity")
-    with open(observed_path, "r", encoding="ascii") as stream:
-        fields = stream.read().split()
-    if len(fields) != 2 or any(not field.isdigit() for field in fields):
-        raise SystemExit(f"live {label} identity is malformed")
-    if namespace != {"device": int(fields[0]), "inode": int(fields[1])}:
-        raise SystemExit(f"{label} differs from the retained wrapper namespace")
-if not isinstance(handle, int) or isinstance(handle, bool) or handle <= 0:
-    raise SystemExit("lockdown table handle is invalid")
-if value["uid"] != 0 or value["control_flow"] is not None:
-    raise SystemExit("lockdown owner/control-flow scope is unexpected")
-if value["release_reason"] is not None:
-    raise SystemExit("Active lockdown unexpectedly has a release reason")
-print(f"sp_lock_{identity} {handle}")
-PY
+    strict_active_lockdown_snapshot "${lockdown_wal}" "${client_pid}" \
+      "${guest_result_dir}/restart-lockdown"
   ); then
-    die 1 "could not strictly parse the Active restart-lockdown WAL"
+    die 1 "post-SIGTERM restart lockdown failed strict WAL/kernel proof"
   fi
-  [[ "${lockdown_table}" =~ ^sp_lock_[0-9a-f]{32}$ \
-    && "${lockdown_handle}" =~ ^[1-9][0-9]*$ ]] \
-    || die 1 "parsed restart-lockdown identity is malformed"
-  ip netns exec "${ns_client}" nft -j -a list table inet "${lockdown_table}" \
-    >"${guest_result_dir}/restart-lockdown-active.json" \
-    || die 1 "journaled restart-lockdown table is not active"
-  ip netns exec "${ns_client}" nft -j -a list tables \
-    >"${guest_result_dir}/restart-lockdown-census-active.json"
-  verify_no_control_lockdown_snapshot "${lockdown_wal}" \
-    "${guest_result_dir}/restart-lockdown-active.json" \
-    "${guest_result_dir}/restart-lockdown-census-active.json" \
-    || die 1 "active nft table/rules/census do not exactly match the lockdown WAL"
+  exact_empty_private_regular_file \
+    "${client_host_state}/host.lock" 0 0 \
+    || die 1 "final host lock lacks exact root-private regular-file safety"
+  exact_empty_private_regular_file "${guest_work_dir}/manager-stop" 0 0 \
+    || die 1 "manager no-restart gate lacks exact root-private safety"
+  require_ipv6_canary_state_unchanged generation-2-final-lockdown \
+    || die 1 "final lockdown changed the connected IPv6 canary state"
+  probe_direct_canaries_blocked "generation-2-final-lockdown"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c0_ipv4_log}" "${shutdown_c0_ipv4_before}" \
+    || die 1 "c0 IPv4 canary attempts did not span final shutdown"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c1_ipv4_log}" "${shutdown_c1_ipv4_before}" \
+    || die 1 "c1 IPv4 canary attempts did not span final shutdown"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c0_ipv6_log}" "${shutdown_c0_ipv6_before}" \
+    || die 1 "c0 IPv6 canary attempts did not span final shutdown"
+  wait_until 5 direct_canary_count_exceeds \
+    "${canary_c1_ipv6_log}" "${shutdown_c1_ipv6_before}" \
+    || die 1 "c1 IPv6 canary attempts did not span final shutdown"
+  local shutdown_c0_ipv4_after shutdown_c1_ipv4_after
+  local shutdown_c0_ipv6_after shutdown_c1_ipv6_after
+  shutdown_c0_ipv4_after="$(direct_canary_result_count "${canary_c0_ipv4_log}")"
+  shutdown_c1_ipv4_after="$(direct_canary_result_count "${canary_c1_ipv4_log}")"
+  shutdown_c0_ipv6_after="$(direct_canary_result_count "${canary_c0_ipv6_log}")"
+  shutdown_c1_ipv6_after="$(direct_canary_result_count "${canary_c1_ipv6_log}")"
+  {
+    printf 'manager_stop_gate=present_before_generation_2_sigterm\n'
+    printf 'generation_3=absent\n'
+    printf 'c0_ipv4_canary_results_before_shutdown=%s\n' \
+      "${shutdown_c0_ipv4_before}"
+    printf 'c0_ipv4_canary_results_after_lockdown=%s\n' \
+      "${shutdown_c0_ipv4_after}"
+    printf 'c1_ipv4_canary_results_before_shutdown=%s\n' \
+      "${shutdown_c1_ipv4_before}"
+    printf 'c1_ipv4_canary_results_after_lockdown=%s\n' \
+      "${shutdown_c1_ipv4_after}"
+    printf 'c0_ipv6_canary_results_before_shutdown=%s\n' \
+      "${shutdown_c0_ipv6_before}"
+    printf 'c0_ipv6_canary_results_after_lockdown=%s\n' \
+      "${shutdown_c0_ipv6_after}"
+    printf 'c1_ipv6_canary_results_before_shutdown=%s\n' \
+      "${shutdown_c1_ipv6_before}"
+    printf 'c1_ipv6_canary_results_after_lockdown=%s\n' \
+      "${shutdown_c1_ipv6_after}"
+  } >"${guest_result_dir}/manager-stop.env"
+
+  stop_role_record "${canary_c0_ipv4_record}" || true
+  stop_role_record "${canary_c1_ipv4_record}" || true
+  stop_role_record "${canary_c0_ipv6_record}" || true
+  stop_role_record "${canary_c1_ipv6_record}" || true
+  for canary_log in \
+    "${canary_c0_ipv4_log}" "${canary_c1_ipv4_log}" \
+    "${canary_c0_ipv6_log}" "${canary_c1_ipv6_log}"; do
+    if grep -q ' status=success$' "${canary_log}"; then
+      record_failure "continuous direct canary escaped: ${canary_log##*/}"
+    fi
+  done
+
+  stop_role_record "${underlay_c0_ipv4_capture_record}" || true
+  stop_role_record "${underlay_c0_ipv6_capture_record}" || true
+  stop_role_record "${underlay_c1_ipv4_capture_record}" || true
+  stop_role_record "${underlay_c1_ipv6_capture_record}" || true
+  capture_has_zero_kernel_drops \
+    "${guest_result_dir}/underlay-c0-ipv4-capture.log" \
+    || record_failure "c0 IPv4 underlay capture dropped packets"
+  capture_has_zero_kernel_drops \
+    "${guest_result_dir}/underlay-c0-ipv6-capture.log" \
+    || record_failure "c0 IPv6 underlay capture dropped packets"
+  capture_has_zero_kernel_drops \
+    "${guest_result_dir}/underlay-c1-ipv4-capture.log" \
+    || record_failure "c1 IPv4 underlay capture dropped packets"
+  capture_has_zero_kernel_drops \
+    "${guest_result_dir}/underlay-c1-ipv6-capture.log" \
+    || record_failure "c1 IPv6 underlay capture dropped packets"
+  local underlay_pcap
+  for underlay_pcap in \
+    "${guest_result_dir}/client-c0-ipv4.pcap" \
+    "${guest_result_dir}/client-c1-ipv4.pcap" \
+    "${guest_result_dir}/client-c0-ipv6.pcap" \
+    "${guest_result_dir}/client-c1-ipv6.pcap"; do
+    validate_pcap_file "${underlay_pcap}" \
+      || record_failure "underlay pcap is missing, unreadable, or malformed: ${underlay_pcap##*/}"
+  done
+  pcap_has "${guest_result_dir}/client-c0-ipv4.pcap" \
+    'host 10.232.0.2 and tcp port 47843' \
+    || record_failure "c0 capture lacks generation-1 carrier traffic"
+  pcap_has "${guest_result_dir}/client-c1-ipv4.pcap" \
+    'host 10.232.0.2 and tcp port 47843' \
+    || record_failure "c1 capture lacks generation-2 carrier traffic"
+  if pcap_has "${guest_result_dir}/client-c0-ipv4.pcap" \
+    'not (host 10.232.0.2 and tcp port 47843)'; then
+    record_failure "c0 underlay carried non-carrier IPv4 traffic"
+  fi
+  if pcap_has "${guest_result_dir}/client-c1-ipv4.pcap" \
+    'not (host 10.232.0.2 and tcp port 47843)'; then
+    record_failure "c1 underlay carried non-carrier IPv4 traffic"
+  fi
+  if pcap_has "${guest_result_dir}/client-c0-ipv6.pcap" ip6; then
+    record_failure "c0 emitted IPv6 while ipv6-mode=block was active"
+  fi
+  if pcap_has "${guest_result_dir}/client-c1-ipv6.pcap" ip6; then
+    record_failure "c1 emitted IPv6 while ipv6-mode=block was active"
+  fi
 
   # The barrier is L3/OUTPUT scoped. A blocked HTTP attempt must produce no IP
   # packet on the client underlay; this is deliberately not an L2/ARP claim.
@@ -4442,6 +5354,8 @@ PY
     record_failure "direct underlay escaped the durable post-SIGTERM barrier"
   fi
   stop_role_record "${restart_lockdown_capture_record}" || true
+  validate_pcap_file "${guest_result_dir}/restart-lockdown-underlay.pcap" \
+    || record_failure "restart-lockdown pcap is missing, unreadable, or malformed"
   if pcap_has "${guest_result_dir}/restart-lockdown-underlay.pcap" \
     'ip and host 10.231.0.1 and tcp port 18081'; then
     record_failure "post-SIGTERM barrier emitted direct underlay IPv4"
@@ -4495,11 +5409,22 @@ PY
   grep -qxF "${marker}" \
     "${guest_result_dir}/direct-underlay-after-release.txt" 2>/dev/null \
     || record_failure "direct underlay payload mismatched after explicit release"
+  ip netns exec "${ns_client}" ping -c 1 -W 1 10.233.0.1 \
+    >"${guest_result_dir}/c1-ipv4-canary-after-release.txt" \
+    || record_failure "c1 IPv4 canary was not restored after explicit release"
+  ip netns exec "${ns_client}" ping -6 -c 1 -W 1 2001:db8:231::1 \
+    >"${guest_result_dir}/c0-ipv6-canary-after-release.txt" \
+    || record_failure "c0 IPv6 canary was not restored after explicit release"
+  ip netns exec "${ns_client}" ping -6 -c 1 -W 1 2001:db8:233::1 \
+    >"${guest_result_dir}/c1-ipv6-canary-after-release.txt" \
+    || record_failure "c1 IPv6 canary was not restored after explicit release"
+  require_ipv6_canary_state_unchanged after-release \
+    || record_failure "explicit release changed the connected IPv6 canary state"
   ip -n "${ns_client}" route show \
     >"${guest_result_dir}/client-routes-after-release.txt"
-  grep -q '^default via 10.231.0.1 dev c0' \
+  grep -q '^default via 10.233.0.1 dev c1' \
     "${guest_result_dir}/client-routes-after-release.txt" \
-    || record_failure "original client default route was not restored"
+    || record_failure "generation-2 c1 direct-route baseline was not restored"
 
   : >"${guest_work_dir}/wrapper-exit"
   stop_role_record "${client_record}" || true
@@ -4679,6 +5604,31 @@ EOF
   exact_empty_private_regular_file \
     "${temporary}/private-empty" "${self_uid}" "${self_gid}" \
     || die 1 "self-test numeric validator did not recover after hardlink removal"
+
+  python3 -I -S - "${temporary}/valid-empty.pcap" \
+    "${temporary}/truncated.pcap" <<'PY'
+import os
+import struct
+import sys
+
+valid, truncated = sys.argv[1:]
+header = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+for path, value in ((valid, header), (truncated, header[:11])):
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.write(descriptor, value)
+    finally:
+        os.close(descriptor)
+PY
+  validate_pcap_file "${temporary}/valid-empty.pcap" \
+    || die 1 "self-test rejected a valid empty pcap"
+  if validate_pcap_file "${temporary}/truncated.pcap" 2>/dev/null; then
+    die 1 "self-test accepted a truncated pcap"
+  fi
 
   ln -s target "${temporary}/readlink-ok"
   [[ "$(read_proc_symlink "${temporary}/readlink-ok")" == target ]] \
