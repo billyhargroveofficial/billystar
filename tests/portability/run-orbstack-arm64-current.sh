@@ -10,7 +10,7 @@ readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 readonly REPO_ROOT
 readonly RESULT_ROOT="${SCRIPT_DIR}/results"
-readonly SOURCE_DEFAULT="arch"
+readonly SOURCE_DEFAULT="shadowpipe-lab-base"
 readonly WINDOWS_DEFAULT="Windows 11"
 readonly MAGIC_DEFAULT="0x50334852"
 readonly EXPECTED_SINGBOX_CONFIG="${SHADOWPIPE_HOST_SINGBOX_CONFIG:-${HOME}/sing-box/config.json}"
@@ -73,7 +73,7 @@ usage() {
   cat <<'EOF'
 Usage:
   SHADOWPIPE_DISPOSABLE_ARM64_CURRENT=1 \
-    tests/portability/run-orbstack-arm64-current.sh [arch]
+    tests/portability/run-orbstack-arm64-current.sh [shadowpipe-lab-base]
   tests/portability/run-orbstack-arm64-current.sh --self-test
 
 The host performs filesystem/build-input preparation, ShellCheck against the
@@ -623,6 +623,28 @@ if expected_id and machine_id != expected_id:
     raise SystemExit("OrbStack opaque ID mismatch or name reuse")
 if expected_state and record["state"] != expected_state:
     raise SystemExit("OrbStack state mismatch")
+config = record.get("config")
+if type(config) is not dict:
+    raise SystemExit("OrbStack record lacks a config object")
+if config.get("isolated") is not True:
+    raise SystemExit("OrbStack machine is not capability-isolated")
+if config.get("isolate_network") is not True:
+    raise SystemExit("OrbStack machine network isolation is not enabled")
+if config.get("forward_ssh_agent") is not False:
+    raise SystemExit("OrbStack SSH-agent forwarding is not disabled")
+for port_name in ("http_port", "https_port"):
+    if type(config.get(port_name)) is not int or config[port_name] != 0:
+        raise SystemExit(f"OrbStack {port_name} is not exactly zero")
+for container, label in ((record, "record"), (config, "config")):
+    for key in ("mount", "mounts", "ports", "port_forwards"):
+        if key not in container:
+            continue
+        value = container[key]
+        if not (
+            (type(value) is list and not value)
+            or (type(value) is dict and not value)
+        ):
+            raise SystemExit(f"OrbStack {label}.{key} is not empty")
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 descriptor = os.open(normalized, flags, 0o600)
 with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as stream:
@@ -1606,8 +1628,8 @@ host_cleanup() {
     printf -- '- Scope: unprivileged CPU/filesystem portability only; no route, DNS, firewall, TUN, netns, qdisc, sysctl, or service mutation.\n'
     # Backticks are literal Markdown, while printf substitutes the argument.
     # shellcheck disable=SC2016
-    printf -- '- Cleanup: clone ID/name absent for %d seconds, source `arch` stopped, Windows remained suspended, shared lifecycle lock released.\n' \
-      "${QUIESCENCE_SECONDS}"
+    printf -- '- Cleanup: clone ID/name absent for %d seconds, source `%s` stopped, Windows remained suspended, shared lifecycle lock released.\n' \
+      "${QUIESCENCE_SECONDS}" "${source_vm}"
     printf -- '- macOS: live sing-box PID/start/argv/config/binary observed read-only and unchanged; no Mac network command executed.\n'
     printf -- '- Field evidence: false. This is native ARM64 portability evidence, not privileged networking or censorship evidence.\n'
     # Backticks are literal Markdown, while printf substitutes the argument.
