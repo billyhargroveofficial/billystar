@@ -1,0 +1,18 @@
+/target/
+**/*.rs.bk
+.DS_Store
+*.env
+.env.*
+
+# Secrets — never commit
+.shadowpipe/
+keys.json
+**/keys.json
+
+# Disposable VM/netns evidence (large pcaps, logs, host snapshots).
+# Keep raw bundles local by default; explicitly force-add only reviewed,
+# checksum-sealed release evidence.
+/tests/**/results/
+
+# Local Claude Code state (loop prompts etc.)
+.claude/*.local.*

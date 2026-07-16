@@ -1,0 +1,50 @@
+[Unit]
+Description=Restore Shadowpipe fail-closed restart lockdown before networking
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target network-pre.target systemd-networkd.service NetworkManager.service networking.service iwd.service wpa_supplicant.service dhcpcd.service
+Wants=network-pre.target
+RequiresMountsFor=/var/lib/shadowpipe
+OnFailure=emergency.target
+OnFailureJobMode=isolate
+RefuseManualStop=yes
+StartLimitIntervalSec=infinity
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+StateDirectory=shadowpipe
+StateDirectoryMode=0700
+# systemd >=254 RestartMode=direct keeps Requires+After dependents waiting
+# across bounded retries. Start-limit exhaustion isolates emergency.target.
+ExecStart=/usr/local/bin/shadowpipe-client --restore-lockdown --host-state-dir /var/lib/shadowpipe
+RemainAfterExit=yes
+Restart=on-failure
+RestartMode=direct
+RestartSec=1s
+TimeoutStartSec=20s
+TimeoutStartFailureMode=kill
+KillMode=control-group
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+# Deliberately do not use PrivateMounts, PrivateTmp, ProtectSystem,
+# ProtectHome, PrivateDevices, or other mount-namespace hardening here. The
+# lockdown WAL binds same-boot writers to the host mount namespace; placing
+# this oneshot in a private mount namespace would make the later client refuse
+# adoption. There is intentionally no ExecStop: stopping this unit never
+# authorizes deletion of the nft barrier.
+
+[Install]
+RequiredBy=sysinit.target systemd-networkd.service NetworkManager.service networking.service iwd.service wpa_supplicant.service dhcpcd.service

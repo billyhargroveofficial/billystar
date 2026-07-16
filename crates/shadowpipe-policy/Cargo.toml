@@ -1,0 +1,27 @@
+[package]
+name = "shadowpipe-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "shadowpipe-policy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+rand.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shadowpipe-core = { path = "../shadowpipe-core", default-features = false }
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+sha2.workspace = true

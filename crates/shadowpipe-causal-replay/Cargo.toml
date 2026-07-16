@@ -1,0 +1,17 @@
+[package]
+name = "shadowpipe-causal-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline deterministic replay of closed-schema ZATMENIE carrier measurements"
+
+[[bin]]
+name = "sp-causal-replay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shadowpipe-core = { path = "../shadowpipe-core", default-features = false }

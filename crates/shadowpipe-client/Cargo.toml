@@ -1,0 +1,29 @@
+[package]
+name = "shadowpipe-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shadowpipe-client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+shadowpipe-core = { path = "../shadowpipe-core", default-features = false }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+libc = "0.2"
+
+[features]
+default = ["tls-chrome"]
+# Chrome-JA4 TLS carrier (BoringSSL). Off for musl static builds.
+tls-chrome = ["shadowpipe-core/tls-chrome"]
+# Off-by-default QUIC carrier (--quic). Forwards to the core `quic` feature
+# (pulls quinn/rustls). Build with: cargo build -p shadowpipe-client --features quic
+quic = ["shadowpipe-core/quic"]

@@ -1,0 +1,421 @@
+{
+  "replay_schema_version": 2,
+  "expected_experiment_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "expected_artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "requirements": {
+    "access_regime": "unknown_restricted",
+    "topology": { "kind": "any" },
+    "excluded_failure_domains": [],
+    "now_unix_ms": 1800000100000
+  },
+  "probe_direction": "receive",
+  "minimum_evidence_scope": "virtual_machine",
+  "carriers": [
+    {
+      "capabilities": {
+        "carrier_id": "direct",
+        "topology": "direct",
+        "access_regimes": ["unknown_restricted"],
+        "features": ["cover_path_probe"],
+        "failure_domains": [],
+        "max_parallel_streams": 4
+      },
+      "active_failure_domains": [],
+      "expected_window_refs": [1, 2, 3],
+      "runs": [
+        {
+          "window_ref": 1,
+          "trace": {
+            "schema_version": 1,
+            "metadata": {
+              "run_id": "01010101010101010101010101010101",
+              "experiment_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "started_unix_ms": 1800000090000,
+              "software_version": { "major": 0, "minor": 1, "patch": 0 },
+              "role": "client",
+              "environment": "virtual_machine"
+            },
+            "evidence": { "scope": "virtual_machine", "outcome": "supported" },
+            "events": [
+              {
+                "sequence": 1,
+                "elapsed_us": 10000,
+                "event": {
+                  "kind": "dial",
+                  "endpoint_ref": 0,
+                  "transport": "tcp",
+                  "attempt": 1,
+                  "duration_us": 10000,
+                  "outcome": "connected"
+                }
+              },
+              {
+                "sequence": 2,
+                "elapsed_us": 20000,
+                "event": {
+                  "kind": "path",
+                  "path_ref": 0,
+                  "endpoint_ref": 0,
+                  "state": "selected",
+                  "metrics": null
+                }
+              },
+              {
+                "sequence": 3,
+                "elapsed_us": 3900000,
+                "event": {
+                  "kind": "transfer",
+                  "path_ref": 0,
+                  "direction": "receive",
+                  "payload_bytes": 2097152,
+                  "wire_bytes": 2097152,
+                  "interval_us": 3880000
+                }
+              },
+              {
+                "sequence": 4,
+                "elapsed_us": 4000000,
+                "event": {
+                  "kind": "close",
+                  "outcome": "clean",
+                  "transmitted_payload_bytes": 1024,
+                  "received_payload_bytes": 2097152
+                }
+              }
+            ]
+          }
+        },
+        {
+          "window_ref": 2,
+          "trace": {
+            "schema_version": 1,
+            "metadata": {
+              "run_id": "02020202020202020202020202020202",
+              "experiment_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "started_unix_ms": 1800000091000,
+              "software_version": { "major": 0, "minor": 1, "patch": 0 },
+              "role": "client",
+              "environment": "virtual_machine"
+            },
+            "evidence": { "scope": "virtual_machine", "outcome": "supported" },
+            "events": [
+              {
+                "sequence": 1,
+                "elapsed_us": 10000,
+                "event": {
+                  "kind": "dial",
+                  "endpoint_ref": 0,
+                  "transport": "tcp",
+                  "attempt": 1,
+                  "duration_us": 10000,
+                  "outcome": "connected"
+                }
+              },
+              {
+                "sequence": 2,
+                "elapsed_us": 20000,
+                "event": {
+                  "kind": "path",
+                  "path_ref": 0,
+                  "endpoint_ref": 0,
+                  "state": "selected",
+                  "metrics": null
+                }
+              },
+              {
+                "sequence": 3,
+                "elapsed_us": 3900000,
+                "event": {
+                  "kind": "transfer",
+                  "path_ref": 0,
+                  "direction": "receive",
+                  "payload_bytes": 2097152,
+                  "wire_bytes": 2097152,
+                  "interval_us": 3880000
+                }
+              },
+              {
+                "sequence": 4,
+                "elapsed_us": 4000000,
+                "event": {
+                  "kind": "close",
+                  "outcome": "clean",
+                  "transmitted_payload_bytes": 1024,
+                  "received_payload_bytes": 2097152
+                }
+              }
+            ]
+          }
+        },
+        {
+          "window_ref": 3,
+          "trace": {
+            "schema_version": 1,
+            "metadata": {
+              "run_id": "03030303030303030303030303030303",
+              "experiment_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "started_unix_ms": 1800000092000,
+              "software_version": { "major": 0, "minor": 1, "patch": 0 },
+              "role": "client",
+              "environment": "virtual_machine"
+            },
+            "evidence": { "scope": "virtual_machine", "outcome": "supported" },
+            "events": [
+              {
+                "sequence": 1,
+                "elapsed_us": 10000,
+                "event": {
+                  "kind": "dial",
+                  "endpoint_ref": 0,
+                  "transport": "tcp",
+                  "attempt": 1,
+                  "duration_us": 10000,
+                  "outcome": "connected"
+                }
+              },
+              {
+                "sequence": 2,
+                "elapsed_us": 20000,
+                "event": {
+                  "kind": "path",
+                  "path_ref": 0,
+                  "endpoint_ref": 0,
+                  "state": "selected",
+                  "metrics": null
+                }
+              },
+              {
+                "sequence": 3,
+                "elapsed_us": 3900000,
+                "event": {
+                  "kind": "transfer",
+                  "path_ref": 0,
+                  "direction": "receive",
+                  "payload_bytes": 2097152,
+                  "wire_bytes": 2097152,
+                  "interval_us": 3880000
+                }
+              },
+              {
+                "sequence": 4,
+                "elapsed_us": 4000000,
+                "event": {
+                  "kind": "close",
+                  "outcome": "clean",
+                  "transmitted_payload_bytes": 1024,
+                  "received_payload_bytes": 2097152
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "capabilities": {
+        "carrier_id": "relay",
+        "topology": "domestic_cloud_relay",
+        "access_regimes": ["unknown_restricted"],
+        "features": ["cover_path_probe"],
+        "failure_domains": [],
+        "max_parallel_streams": 4
+      },
+      "active_failure_domains": [],
+      "expected_window_refs": [1, 2, 3],
+      "runs": [
+        {
+          "window_ref": 1,
+          "trace": {
+            "schema_version": 1,
+            "metadata": {
+              "run_id": "11111111111111111111111111111111",
+              "experiment_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "started_unix_ms": 1800000093000,
+              "software_version": { "major": 0, "minor": 1, "patch": 0 },
+              "role": "client",
+              "environment": "virtual_machine"
+            },
+            "evidence": { "scope": "virtual_machine", "outcome": "supported" },
+            "events": [
+              {
+                "sequence": 1,
+                "elapsed_us": 10000,
+                "event": {
+                  "kind": "dial",
+                  "endpoint_ref": 0,
+                  "transport": "tcp",
+                  "attempt": 1,
+                  "duration_us": 10000,
+                  "outcome": "connected"
+                }
+              },
+              {
+                "sequence": 2,
+                "elapsed_us": 20000,
+                "event": {
+                  "kind": "path",
+                  "path_ref": 0,
+                  "endpoint_ref": 0,
+                  "state": "selected",
+                  "metrics": null
+                }
+              },
+              {
+                "sequence": 3,
+                "elapsed_us": 1900000,
+                "event": {
+                  "kind": "transfer",
+                  "path_ref": 0,
+                  "direction": "receive",
+                  "payload_bytes": 2097152,
+                  "wire_bytes": 2097152,
+                  "interval_us": 1880000
+                }
+              },
+              {
+                "sequence": 4,
+                "elapsed_us": 2000000,
+                "event": {
+                  "kind": "close",
+                  "outcome": "clean",
+                  "transmitted_payload_bytes": 1024,
+                  "received_payload_bytes": 2097152
+                }
+              }
+            ]
+          }
+        },
+        {
+          "window_ref": 2,
+          "trace": {
+            "schema_version": 1,
+            "metadata": {
+              "run_id": "12121212121212121212121212121212",
+              "experiment_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "started_unix_ms": 1800000094000,
+              "software_version": { "major": 0, "minor": 1, "patch": 0 },
+              "role": "client",
+              "environment": "virtual_machine"
+            },
+            "evidence": { "scope": "virtual_machine", "outcome": "supported" },
+            "events": [
+              {
+                "sequence": 1,
+                "elapsed_us": 10000,
+                "event": {
+                  "kind": "dial",
+                  "endpoint_ref": 0,
+                  "transport": "tcp",
+                  "attempt": 1,
+                  "duration_us": 10000,
+                  "outcome": "connected"
+                }
+              },
+              {
+                "sequence": 2,
+                "elapsed_us": 20000,
+                "event": {
+                  "kind": "path",
+                  "path_ref": 0,
+                  "endpoint_ref": 0,
+                  "state": "selected",
+                  "metrics": null
+                }
+              },
+              {
+                "sequence": 3,
+                "elapsed_us": 1900000,
+                "event": {
+                  "kind": "transfer",
+                  "path_ref": 0,
+                  "direction": "receive",
+                  "payload_bytes": 2097152,
+                  "wire_bytes": 2097152,
+                  "interval_us": 1880000
+                }
+              },
+              {
+                "sequence": 4,
+                "elapsed_us": 2000000,
+                "event": {
+                  "kind": "close",
+                  "outcome": "clean",
+                  "transmitted_payload_bytes": 1024,
+                  "received_payload_bytes": 2097152
+                }
+              }
+            ]
+          }
+        },
+        {
+          "window_ref": 3,
+          "trace": {
+            "schema_version": 1,
+            "metadata": {
+              "run_id": "13131313131313131313131313131313",
+              "experiment_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "started_unix_ms": 1800000095000,
+              "software_version": { "major": 0, "minor": 1, "patch": 0 },
+              "role": "client",
+              "environment": "virtual_machine"
+            },
+            "evidence": { "scope": "virtual_machine", "outcome": "supported" },
+            "events": [
+              {
+                "sequence": 1,
+                "elapsed_us": 10000,
+                "event": {
+                  "kind": "dial",
+                  "endpoint_ref": 0,
+                  "transport": "tcp",
+                  "attempt": 1,
+                  "duration_us": 10000,
+                  "outcome": "connected"
+                }
+              },
+              {
+                "sequence": 2,
+                "elapsed_us": 20000,
+                "event": {
+                  "kind": "path",
+                  "path_ref": 0,
+                  "endpoint_ref": 0,
+                  "state": "selected",
+                  "metrics": null
+                }
+              },
+              {
+                "sequence": 3,
+                "elapsed_us": 1900000,
+                "event": {
+                  "kind": "transfer",
+                  "path_ref": 0,
+                  "direction": "receive",
+                  "payload_bytes": 2097152,
+                  "wire_bytes": 2097152,
+                  "interval_us": 1880000
+                }
+              },
+              {
+                "sequence": 4,
+                "elapsed_us": 2000000,
+                "event": {
+                  "kind": "close",
+                  "outcome": "clean",
+                  "transmitted_payload_bytes": 1024,
+                  "received_payload_bytes": 2097152
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

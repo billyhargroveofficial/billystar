@@ -1,0 +1,19 @@
+# shadowpipe example — Phase 1 tunnel
+
+[server]
+listen = "0.0.0.0:47843"
+tun_name = "shadowpipe0"
+tun_addr = "10.8.0.1"
+tun_peer = "10.8.0.2"
+mtu = 1280
+mux_streams = 24
+mux_chunk = 4096
+egress_iface = "eth0"
+
+[client]
+server = "203.0.113.10:47843"
+tun_addr = "10.8.0.2"
+tun_peer = "10.8.0.1"
+mtu = 1280
+mux_streams = 24
+mux_chunk = 4096

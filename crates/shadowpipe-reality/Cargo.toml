@@ -1,0 +1,19 @@
+[package]
+name = "shadowpipe-reality"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rand.workspace = true
+x25519-dalek.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+tokio = { workspace = true }
+subtle.workspace = true
+libc = "0.2"
+zeroize.workspace = true
