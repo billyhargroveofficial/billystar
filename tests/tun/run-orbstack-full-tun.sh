@@ -989,12 +989,10 @@ for path in known_mac_commands:
     if os.path.lexists(path) and path not in candidates:
         candidates.append(path)
 if candidates:
-    probe_candidates = []
+    # Preserve each original argv[0]. The OrbStack multi-call binary changes
+    # behavior when invoked through its mac symlink versus the resolved
+    # macctl path, so realpath-based execution is not an equivalent probe.
     for candidate in candidates:
-        resolved = os.path.realpath(candidate)
-        if resolved not in probe_candidates:
-            probe_candidates.append(resolved)
-    for candidate in probe_candidates:
         probe = subprocess.run(
             [candidate, "uname", "-s"],
             stdin=subprocess.DEVNULL,
