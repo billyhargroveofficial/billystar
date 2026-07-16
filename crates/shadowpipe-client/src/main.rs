@@ -34,6 +34,7 @@ use shadowpipe_core::netguard::{
     AllowedEndpoint, DnsGuard, EndpointProtocol, KillSwitch, KillSwitchIdentity,
     KillSwitchInstallToken, KillSwitchPrepareError, PreparedKillSwitchRecovery,
 };
+use shadowpipe_core::platform::Ipv6Mode;
 use shadowpipe_core::policy_state::{PolicyExpiryCheckpoint, PolicyStateStore};
 use shadowpipe_core::profile::{profile_from_env, TunnelProfile};
 use shadowpipe_core::proto::{CamouflageMode, FrameFlags, PaddingProfile};
@@ -114,6 +115,34 @@ impl From<MeasurementEnvironmentArg> for ExecutionEnvironment {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum Ipv6ModeArg {
+    Block,
+    OuterOnly,
+    Tunnel,
+}
+
+impl Ipv6ModeArg {
+    const fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::OuterOnly => "outer-only",
+            Self::Tunnel => "tunnel",
+        }
+    }
+}
+
+impl From<Ipv6ModeArg> for Ipv6Mode {
+    fn from(value: Ipv6ModeArg) -> Self {
+        match value {
+            Ipv6ModeArg::Block => Self::Block,
+            Ipv6ModeArg::OuterOnly => Self::OuterOnly,
+            Ipv6ModeArg::Tunnel => Self::Tunnel,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "shadowpipe-client",
@@ -133,6 +162,11 @@ struct Args {
     /// Auto-add split-default routes (0.0.0.0/1 + 128.0.0.0/1) — needs root.
     #[arg(long)]
     auto_route: bool,
+
+    /// Explicit IPv6 policy. Only fail-closed blocking is implemented today;
+    /// outer transport and inner IPv6 tunneling remain unavailable.
+    #[arg(long, value_enum, default_value = "block")]
+    ipv6_mode: Ipv6ModeArg,
 
     #[arg(long)]
     tun_name: Option<String>,
@@ -1735,6 +1769,7 @@ fn validate_restore_lockdown_mode(args: &Args) -> Result<()> {
 }
 
 fn validate_runtime_safety(args: &Args) -> Result<()> {
+    validate_ipv6_mode(args)?;
     if args.release_lockdown {
         return validate_release_lockdown_mode(args);
     }
@@ -1786,6 +1821,16 @@ fn validate_runtime_safety(args: &Args) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("fail-closed --auto-route is currently Linux-only; use an isolated Linux VM");
     }
+    Ok(())
+}
+
+fn validate_ipv6_mode(args: &Args) -> Result<()> {
+    let requested = Ipv6Mode::from(args.ipv6_mode);
+    anyhow::ensure!(
+        requested == Ipv6Mode::Block,
+        "--ipv6-mode {} is not implemented; only --ipv6-mode block has a proven fail-closed client backend",
+        args.ipv6_mode.as_cli_value()
+    );
     Ok(())
 }
 
@@ -2003,6 +2048,9 @@ async fn main() -> Result<()> {
         .init();
 
     let mut args = Args::parse();
+    // Keep this policy check ahead of credential provisioning as well as every
+    // network/runtime path. Unsupported IPv6 modes must be inert CLI requests.
+    validate_ipv6_mode(&args)?;
     if args.generate_client_credential || args.write_client_enrollment.is_some() {
         #[cfg(not(unix))]
         anyhow::ensure!(
@@ -6798,6 +6846,68 @@ mod tests {
         let split_without_tun =
             Args::try_parse_from(["shadowpipe-client", "--server-fp", &fp, "--split"]).unwrap();
         assert!(validate_runtime_safety(&split_without_tun).is_err());
+    }
+
+    #[test]
+    fn runtime_safety_defaults_to_explicit_fail_closed_ipv6_blocking() {
+        let fp = "11".repeat(32);
+        let default =
+            Args::try_parse_from(["shadowpipe-client", "--server-fp", &fp, "--message", "ok"])
+                .unwrap();
+        assert_eq!(default.ipv6_mode, Ipv6ModeArg::Block);
+        assert_eq!(Ipv6Mode::from(default.ipv6_mode), Ipv6Mode::Block);
+        validate_runtime_safety(&default).unwrap();
+
+        let explicit = Args::try_parse_from([
+            "shadowpipe-client",
+            "--server-fp",
+            &fp,
+            "--message",
+            "ok",
+            "--ipv6-mode",
+            "block",
+        ])
+        .unwrap();
+        assert_eq!(explicit.ipv6_mode, Ipv6ModeArg::Block);
+        validate_runtime_safety(&explicit).unwrap();
+
+        #[cfg(target_os = "linux")]
+        {
+            let full_tunnel = Args::try_parse_from([
+                "shadowpipe-client",
+                "--server-fp",
+                &fp,
+                "--tunnel",
+                "--auto-route",
+                "--kill-switch",
+                "--dns",
+                "10.8.0.1",
+                "--ipv6-mode",
+                "block",
+            ])
+            .unwrap();
+            validate_runtime_safety(&full_tunnel).unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_safety_rejects_unimplemented_ipv6_modes_before_other_preflight() {
+        for mode in ["outer-only", "tunnel"] {
+            let args = Args::try_parse_from([
+                "shadowpipe-client",
+                "--server-fp",
+                "malformed",
+                "--kill-switch",
+                "--ipv6-mode",
+                mode,
+            ])
+            .unwrap();
+            let error = validate_runtime_safety(&args).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("--ipv6-mode {mode} is not implemented")),
+                "unexpected error for {mode}: {error}"
+            );
+        }
     }
 
     #[test]

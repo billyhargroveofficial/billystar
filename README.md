@@ -246,6 +246,7 @@ sudo shadowpipe-client \
   --client-credential /etc/shadowpipe/client-credential.json \
   --uri-file /etc/shadowpipe/endpoint.uri \
   --tunnel \
+  --ipv6-mode block \
   --auto-route \
   --kill-switch \
   --dns 1.1.1.1 \
@@ -261,6 +262,10 @@ unit-test evidence. В disposable OrbStack Linux clone этот порядок �
 privileged synthetic IPv4 OS-TUN/leak/failure/recovery/cleanup proof; точный scope
 и ограничения записаны ниже и в
 [`20260716T123535Z-91294-70zWb7`](tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md).
+`--ipv6-mode block` является default и явно указан в production examples:
+текущий Linux kill-switch блокирует non-loopback IPv6 до публикации IPv4
+маршрутов. `outer-only` и `tunnel` fail closed до credential, DNS, socket, TUN
+или host-state операций, пока соответствующие backends не реализованы.
 
 ## REALITY carrier (TLS 1.3 + forward-on-fail probe handling)
 
@@ -309,7 +314,7 @@ sudo install -o root -g root -m 0600 \
   /securely-delivered/shadowpipe.uri /etc/shadowpipe/endpoint.uri
 sudo shadowpipe-client --uri-file /etc/shadowpipe/endpoint.uri \
   --client-credential /etc/shadowpipe/client-credential.json \
-  --tunnel --auto-route --kill-switch --dns 1.1.1.1
+  --tunnel --ipv6-mode block --auto-route --kill-switch --dns 1.1.1.1
 ```
 
 `--uri-file` — production client path: он убирает `sid` и URI из

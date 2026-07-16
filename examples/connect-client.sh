@@ -32,4 +32,4 @@ if [[ -z "$BIN" ]]; then
 fi
 
 exec "$BIN" --uri "$URI" --client-credential "$CREDENTIAL" \
-  --tunnel --auto-route --kill-switch --dns "$TUN_DNS" "$@"
+  --tunnel --ipv6-mode block --auto-route --kill-switch --dns "$TUN_DNS" "$@"

@@ -42,7 +42,7 @@ ensure_client() {
     echo "Starting shadowpipe client on ${RU_HOST} netns ${NETNS}..."
     ssh "$RU_HOST" "nohup ip netns exec ${NETNS} /usr/local/bin/shadowpipe-client \
       --server ${NL_SERVER} --server-fp ${SERVER_FP} --client-credential ${CLIENT_CREDENTIAL} \
-      --tunnel --auto-route \
+      --tunnel --ipv6-mode block --auto-route \
       --kill-switch --dns ${TUN_DNS} --camouflage h2 --guard-bytes 8192 \
       >> /tmp/sp-live.log 2>&1 &"
     sleep 4

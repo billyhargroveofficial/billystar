@@ -3655,7 +3655,8 @@ PY
   ip netns exec "${ns_client}" "${client}" --uri-file "${reality_uri_file}" \
     --client-credential "${guest_work_dir}/does-not-exist-client-credential.json" \
     --host-state-dir "${missing_credential_state}" \
-    --tunnel --tun-name sptunc --auto-route --kill-switch --dns 198.18.0.2 \
+    --tunnel --tun-name sptunc --ipv6-mode block \
+    --auto-route --kill-switch --dns 198.18.0.2 \
     >"${guest_result_dir}/missing-credential.stdout" \
     2>"${guest_result_dir}/missing-credential.stderr"
   local missing_credential_status=$?
@@ -3691,7 +3692,8 @@ PY
   ip netns exec "${ns_client}" "${client}" --uri-file "${missing_pin_uri_file}" \
     --client-credential "${client_credential}" \
     --host-state-dir "${missing_pin_state}" \
-    --tunnel --tun-name sptunc --auto-route --kill-switch --dns 198.18.0.2 \
+    --tunnel --tun-name sptunc --ipv6-mode block \
+    --auto-route --kill-switch --dns 198.18.0.2 \
     >"${guest_result_dir}/missing-pin.stdout" \
     2>"${guest_result_dir}/missing-pin.stderr"
   local missing_status=$?
@@ -3788,7 +3790,7 @@ PY
         --uri-file "${endpoint_file}" \
         --client-credential "${credential}" --host-state-dir "${host_state}" \
         --tunnel --tun-name sptunc --tun-addr 10.8.0.2 --tun-peer 10.8.0.1 \
-        --mtu 1280 --auto-route --kill-switch \
+        --mtu 1280 --ipv6-mode block --auto-route --kill-switch \
         --dns 198.18.0.2 --no-guard
       status=$?
       set -e
@@ -4057,7 +4059,7 @@ while True:
         --uri-file "${endpoint_file}" \
         --client-credential "${credential}" --host-state-dir "${host_state}" \
         --tunnel --tun-name sptunc --tun-addr 10.8.0.2 --tun-peer 10.8.0.1 \
-        --mtu 1280 --auto-route --kill-switch \
+        --mtu 1280 --ipv6-mode block --auto-route --kill-switch \
         --dns 198.18.0.2 --no-guard &
       child=$!
       printf "%s\n" "${child}" >"${work}/client.pid"

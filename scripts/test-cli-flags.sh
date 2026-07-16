@@ -15,13 +15,21 @@ for flag in --egress-iface --reality --reality-key --gen-reality-key --reality-s
   fi
 done
 
-# A normal daemon invocation must reject distinguishable lab carriers before
-# loading /etc identities, binding a socket, or attempting TUN creation.
+# A normal daemon invocation must fail before identities, bind or TUN. Linux
+# reaches the production carrier gate; non-Linux must stop even earlier at the
+# production-server host boundary.
 UNGATED_SERVER="$($BIN/shadowpipe-server 2>&1 || true)"
-case "$UNGATED_SERVER" in
-  *"production daemon requires --reality"*"distinguishable ShadowPipe bootstrap/challenge"*) : ;;
-  *) echo "FAIL: ungated server did not fail at the production carrier preflight: $UNGATED_SERVER" >&2; exit 1 ;;
-esac
+if [[ "$(uname -s)" == Linux ]]; then
+  case "$UNGATED_SERVER" in
+    *"production daemon requires --reality"*"distinguishable ShadowPipe bootstrap/challenge"*) : ;;
+    *) echo "FAIL: ungated server did not fail at the production carrier preflight: $UNGATED_SERVER" >&2; exit 1 ;;
+  esac
+else
+  case "$UNGATED_SERVER" in
+    *"production shadowpipe-server is supported only on Linux"*) : ;;
+    *) echo "FAIL: non-Linux server did not fail at the host boundary: $UNGATED_SERVER" >&2; exit 1 ;;
+  esac
+fi
 
 # The escape hatch is deliberately coupled to explicit user-owned no-TUN lab
 # mode by clap, so a lone opt-in cannot weaken production startup.
@@ -31,13 +39,24 @@ case "$LAB_WITHOUT_DEV" in
   *) echo "FAIL: lab carrier gate did not require development allowlist mode: $LAB_WITHOUT_DEV" >&2; exit 1 ;;
 esac
 
-DEV_REALITY_WITHOUT_REPLAY="$("$BIN/shadowpipe-server" \
-  --reality --development-user-allowlist \
-  --reality-short-id 0011223344556677 2>&1 || true)"
-case "$DEV_REALITY_WITHOUT_REPLAY" in
-  *"development REALITY requires explicit --reality-replay-store"*) : ;;
-  *) echo "FAIL: development REALITY silently accepted process-local replay state: $DEV_REALITY_WITHOUT_REPLAY" >&2; exit 1 ;;
-esac
+if [[ "$(uname -s)" == Linux ]]; then
+  DEV_REALITY_WITHOUT_REPLAY="$("$BIN/shadowpipe-server" \
+    --reality --development-user-allowlist \
+    --reality-short-id 0011223344556677 2>&1 || true)"
+  case "$DEV_REALITY_WITHOUT_REPLAY" in
+    *"development REALITY requires explicit --reality-replay-store"*) : ;;
+    *) echo "FAIL: development REALITY silently accepted process-local replay state: $DEV_REALITY_WITHOUT_REPLAY" >&2; exit 1 ;;
+  esac
+else
+  NON_LINUX_REALITY="$("$BIN/shadowpipe-server" \
+    --development-user-allowlist --allow-insecure-lab-carriers \
+    --reality --reality-replay-store ./private-replay.bin 2>&1 || true)"
+  case "$NON_LINUX_REALITY" in
+    *"--allow-insecure-lab-carriers"*"cannot be used with '--reality'"*) : ;;
+    *"non-Linux shadowpipe-server lab mode forbids REALITY"*) : ;;
+    *) echo "FAIL: non-Linux lab server accepted a REALITY path: $NON_LINUX_REALITY" >&2; exit 1 ;;
+  esac
+fi
 
 # The standalone REALITY echo binary is an explicitly acknowledged,
 # loopback-only protocol diagnostic. It must never become an accidental public
@@ -58,11 +77,18 @@ case "$DEMO_EMPTY_ACL" in
   *"1..=16 entries"*) : ;;
   *) echo "FAIL: standalone REALITY demo accepted an empty selector ACL: $DEMO_EMPTY_ACL" >&2; exit 1 ;;
 esac
-for flag in --auto-route --guard-bytes --profile-seed --server-fp --client-credential --development-user-credential --generate-client-credential --write-client-enrollment --reality --reality-pubkey --reality-short-id --uri --uri-file --kill-switch --dns --split --split-rules-dir --split-rules-list --split-direct-rules-list --split-dns --split-dns-upstream --split-dns-direct-upstream --split-dns-guard --split-leak-guard --split-preload-list --restore-lockdown --release-lockdown; do
+for flag in --auto-route --ipv6-mode --guard-bytes --profile-seed --server-fp --client-credential --development-user-credential --generate-client-credential --write-client-enrollment --reality --reality-pubkey --reality-short-id --uri --uri-file --kill-switch --dns --split --split-rules-dir --split-rules-list --split-direct-rules-list --split-dns --split-dns-upstream --split-dns-direct-upstream --split-dns-guard --split-leak-guard --split-preload-list --restore-lockdown --release-lockdown; do
   if ! "$BIN/shadowpipe-client" --help 2>&1 | grep -F -e "$flag" >/dev/null; then
     echo "FAIL: shadowpipe-client --help missing $flag" >&2
     exit 1
   fi
+done
+for mode in outer-only tunnel; do
+  IPV6_UNAVAILABLE="$("$BIN/shadowpipe-client" --ipv6-mode "$mode" --server-fp malformed 2>&1 || true)"
+  case "$IPV6_UNAVAILABLE" in
+    *"--ipv6-mode $mode is not implemented"*) : ;;
+    *) echo "FAIL: unsupported IPv6 mode did not fail before other preflight: $IPV6_UNAVAILABLE" >&2; exit 1 ;;
+  esac
 done
 # Missing authentication must fail before a socket or privileged TUN open. The
 # tunnel invocation intentionally runs without sudo: a TUN error here would mean

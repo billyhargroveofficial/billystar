@@ -59,6 +59,10 @@ grep -q -- '--kill-switch' examples/connect-client.sh \
   || fail "connect-client: fail-closed firewall is not enabled"
 grep -q -- '--dns' examples/connect-client.sh \
   || fail "connect-client: tunnel DNS pin is not enabled"
+grep -q -- '--ipv6-mode block' examples/connect-client.sh \
+  || fail "connect-client: explicit IPv6 leak-block policy is missing"
+grep -q -- '--ipv6-mode block' deploy/shadowpipe-client.env.example \
+  || fail "client env: explicit IPv6 leak-block policy is missing"
 
 # 5. The paired Linux units preserve the host mount/network namespace identity
 # required by WAL adoption while bounding every independent privilege/resource
