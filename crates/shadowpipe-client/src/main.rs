@@ -34,7 +34,10 @@ use shadowpipe_core::netguard::{
     AllowedEndpoint, DnsGuard, EndpointProtocol, KillSwitch, KillSwitchIdentity,
     KillSwitchInstallToken, KillSwitchPrepareError, PreparedKillSwitchRecovery,
 };
-use shadowpipe_core::platform::Ipv6Mode;
+use shadowpipe_core::network_events::CoalescedNetworkChanges;
+#[cfg(any(test, target_os = "linux"))]
+use shadowpipe_core::network_events::{NetworkChangeAccumulator, NetworkChangeSet};
+use shadowpipe_core::platform::{Ipv6Mode, NetworkChangeKind};
 use shadowpipe_core::policy_state::{PolicyExpiryCheckpoint, PolicyStateStore};
 use shadowpipe_core::profile::{profile_from_env, TunnelProfile};
 use shadowpipe_core::proto::{CamouflageMode, FrameFlags, PaddingProfile};
@@ -74,6 +77,8 @@ use shadowpipe_core::dns_exchange::{
 use shadowpipe_core::dns_exchange::{DnsExchangeFailure, DnsExchangeFailureKind};
 #[cfg(target_os = "linux")]
 use shadowpipe_core::netguard::resolv_conf;
+#[cfg(target_os = "linux")]
+use shadowpipe_core::network_events::linux::{LinuxNetworkEventInterest, LinuxNetworkEventSource};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum MeasurementScopeArg {
@@ -1359,6 +1364,65 @@ struct NewHostStateRuntime {
     tun: TunResource,
     kill_switch_install: KillSwitchInstallToken,
     dns_preflight: RuntimeDnsPreflight,
+}
+
+impl NewHostStateRuntime {
+    /// Abort the narrow startup interval after the exact new TUN has been
+    /// journaled, but before any firewall, route, or DNS mutation exists.
+    ///
+    /// A topology invalidation in this interval is ordinary restart input, not
+    /// an ownership conflict. Close the descriptor-owned TUN, prove that the
+    /// journaled identity disappeared, and remove the now-empty WAL. Only an
+    /// actual TUN identity conflict is promoted to `Conflict`.
+    fn close_new_tun_and_remove_wal(mut self, tun: SharedTun) -> Result<()> {
+        anyhow::ensure!(
+            self.journal.journal().phase == JournalPhase::Active,
+            "new-TUN startup cleanup requires an Active WAL"
+        );
+        anyhow::ensure!(
+            self.journal.journal().operations.len() == 1
+                && self
+                    .journal
+                    .journal()
+                    .operations
+                    .first()
+                    .is_some_and(|operation| {
+                        operation.state == OperationState::Applied
+                            && operation.resource == OwnedResource::Tun(self.tun.clone())
+                    }),
+            "new-TUN startup cleanup found host resources beyond its exact TUN"
+        );
+
+        let resource = OwnedResource::Tun(self.tun.clone());
+        let operation = self
+            .journal
+            .begin_remove(&resource)
+            .context("WAL startup TUN removal intent")?;
+        drop(tun);
+        match inspect_tun(&self.tun, self.journal.journal().owner.session_id)
+            .context("inspect startup TUN after descriptor close")?
+        {
+            shadowpipe_core::host_state::ResourceObservationKind::Absent => {}
+            shadowpipe_core::host_state::ResourceObservationKind::ExactOwnedPresent => {
+                anyhow::bail!("newly journaled TUN remains present after startup descriptor close")
+            }
+            shadowpipe_core::host_state::ResourceObservationKind::Conflict => {
+                self.journal
+                    .mark_conflict()
+                    .context("durably mark startup TUN identity conflict")?;
+                anyhow::bail!("newly journaled TUN identity changed during startup cleanup")
+            }
+        }
+        self.journal
+            .acknowledge_remove(operation)
+            .context("acknowledge startup TUN removal")?;
+        self.journal
+            .begin_cleaning()
+            .context("mark startup TUN WAL Cleaning")?;
+        self.journal
+            .remove_completed()
+            .context("remove startup TUN WAL")
+    }
 }
 
 /// New Linux host-state WALs are recoverable only when every attribution
@@ -3224,6 +3288,364 @@ const ROTATE_DELAY: Duration = Duration::from_millis(50);
 /// A session that lasted at least this long counts as "healthy": its drop
 /// reconnects fast instead of climbing the backoff curve.
 const STABLE_AFTER: Duration = Duration::from_secs(30);
+/// One readiness pass may consume at most this many netlink datagrams. A
+/// permanently busy or adversarial source must not starve shutdown/session
+/// futures; failure to reach `WouldBlock` inside the bound loses source
+/// authority and requests a fail-closed process replacement.
+#[cfg(any(test, target_os = "linux"))]
+const MAX_NETWORK_EVENT_DATAGRAMS_PER_DRAIN: usize = 256;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetworkRestartCause {
+    TopologyChanged(CoalescedNetworkChanges),
+    SourceLost { detail: String },
+}
+
+impl NetworkRestartCause {
+    fn source_lost(detail: impl Into<String>) -> Self {
+        Self::SourceLost {
+            detail: detail.into(),
+        }
+    }
+
+    fn is_only_owned_route_changes(&self) -> bool {
+        match self {
+            Self::TopologyChanged(batch) => {
+                let changes = batch.changes();
+                !changes.is_empty()
+                    && changes
+                        .iter()
+                        .all(|kind| kind == NetworkChangeKind::OwnedRouteChanged)
+            }
+            Self::SourceLost { .. } => false,
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkRestartCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TopologyChanged(batch) => {
+                write!(
+                    formatter,
+                    "topology changed at network-event generation {} (",
+                    batch.generation().get()
+                )?;
+                for (index, kind) in batch.changes().iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{kind:?}")?;
+                }
+                formatter.write_str(")")
+            }
+            Self::SourceLost { detail } => {
+                write!(formatter, "network-change source lost: {detail}")
+            }
+        }
+    }
+}
+
+/// Pure bounded drain used by the Linux adapter and injectable unit fakes.
+///
+/// Every decoded notification is only an invalidation trigger. The caller
+/// never treats message fields as current host state.
+#[cfg(any(test, target_os = "linux"))]
+fn drain_network_change_source<F, E>(
+    accumulator: &mut NetworkChangeAccumulator,
+    mut read: F,
+) -> Option<NetworkRestartCause>
+where
+    F: FnMut() -> std::result::Result<Option<NetworkChangeSet>, E>,
+    E: std::fmt::Display,
+{
+    for _ in 0..MAX_NETWORK_EVENT_DATAGRAMS_PER_DRAIN {
+        match read() {
+            Ok(Some(changes)) => {
+                if let Err(error) = accumulator.mark_dirty(changes) {
+                    return Some(NetworkRestartCause::source_lost(error.to_string()));
+                }
+            }
+            Ok(None) => {
+                return match accumulator.take_pending() {
+                    Ok(Some(batch)) => Some(NetworkRestartCause::TopologyChanged(batch)),
+                    Ok(None) => None,
+                    Err(error) => Some(NetworkRestartCause::source_lost(error.to_string())),
+                };
+            }
+            Err(error) => {
+                return Some(NetworkRestartCause::source_lost(error.to_string()));
+            }
+        }
+    }
+    Some(NetworkRestartCause::source_lost(format!(
+        "rtnetlink source did not quiesce after {MAX_NETWORK_EVENT_DATAGRAMS_PER_DRAIN} datagrams"
+    )))
+}
+
+enum FullTunnelNetworkWatcher {
+    #[cfg(target_os = "linux")]
+    Linux {
+        source: tokio::io::unix::AsyncFd<LinuxNetworkEventSource>,
+        accumulator: NetworkChangeAccumulator,
+    },
+    Disabled,
+}
+
+impl FullTunnelNetworkWatcher {
+    fn open(enabled: bool) -> Result<Self> {
+        if !enabled {
+            return Ok(Self::Disabled);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let source = LinuxNetworkEventSource::open(LinuxNetworkEventInterest::Ipv4UnderlayOnly)
+                .context("open read-only IPv4-underlay rtnetlink event source")?;
+            let source = tokio::io::unix::AsyncFd::new(source)
+                .context("register rtnetlink source with Tokio")?;
+            Ok(Self::Linux {
+                source,
+                accumulator: NetworkChangeAccumulator::new(),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("full-tunnel network-change monitoring is implemented only on Linux")
+        }
+    }
+
+    /// Synchronously drain queued notifications to a proven `WouldBlock`
+    /// boundary. This is used at startup authorization edges where awaiting
+    /// readiness would deadlock when no event is queued.
+    fn drain_now(&mut self) -> Option<NetworkRestartCause> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux {
+                source,
+                accumulator,
+            } => drain_network_change_source(accumulator, || source.get_mut().try_read()),
+            Self::Disabled => None,
+        }
+    }
+
+    /// Await the next invalidation forever. A disabled cross-platform watcher
+    /// intentionally has no timer or synthetic event, keeping non-auto-route
+    /// modes byte-for-byte equivalent at the select sites.
+    async fn next_restart(&mut self) -> NetworkRestartCause {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux {
+                source,
+                accumulator,
+            } => loop {
+                let mut ready = match source.readable_mut().await {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        return NetworkRestartCause::source_lost(format!(
+                            "Tokio readiness failed: {error}"
+                        ))
+                    }
+                };
+                let outcome =
+                    drain_network_change_source(accumulator, || ready.get_inner_mut().try_read());
+                match outcome {
+                    Some(cause) => return cause,
+                    None => ready.clear_ready(),
+                }
+            },
+            Self::Disabled => std::future::pending::<NetworkRestartCause>().await,
+        }
+    }
+
+    /// Consume only the route notifications produced by a just-completed,
+    /// journaled Shadowpipe route transaction. They are suppressible only
+    /// after the complete live protocol-186 census is re-proved exact.
+    ///
+    /// Any external route/rule event, link/address event, source loss, or
+    /// unexpected owned-route delta remains a restart request.
+    fn settle_owned_route_mutations(
+        &mut self,
+        guards: &FullTunnelGuards,
+    ) -> Option<NetworkRestartCause> {
+        const MAX_SETTLE_PASSES: usize = 4;
+
+        for _ in 0..MAX_SETTLE_PASSES {
+            if let Some(cause) = self.drain_now() {
+                if !cause.is_only_owned_route_changes() {
+                    return Some(cause);
+                }
+            }
+            if let Err(error) = guards.verify_live_owned_route_census() {
+                return Some(NetworkRestartCause::source_lost(format!(
+                    "owned-route notification could not be reconciled against the exact live census: {error:#}"
+                )));
+            }
+            match self.drain_now() {
+                None => return None,
+                Some(cause) if !cause.is_only_owned_route_changes() => return Some(cause),
+                Some(_) => {}
+            }
+        }
+
+        Some(NetworkRestartCause::source_lost(format!(
+            "owned-route notifications did not settle after {MAX_SETTLE_PASSES} exact census passes"
+        )))
+    }
+
+    /// Determine whether a fallible startup step was invalidated by topology
+    /// churn rather than turning an ordinary network flap into a permanent
+    /// Conflict journal.
+    ///
+    /// During this setup order every endpoint either still resolves through
+    /// the original default route or already has its exact bypass, so a fresh
+    /// recapture of the whole pre-TUN authority is valid.
+    fn detect_setup_network_invalidation(
+        &mut self,
+        guards: &FullTunnelGuards,
+        tun_iface: &str,
+    ) -> Option<NetworkRestartCause> {
+        let first = self.drain_now();
+        if first
+            .as_ref()
+            .is_some_and(|cause| !cause.is_only_owned_route_changes())
+        {
+            return first;
+        }
+
+        if let Err(error) = recapture_and_validate_underlay_paths(&guards.underlay_paths, tun_iface)
+        {
+            return Some(NetworkRestartCause::source_lost(format!(
+                "full-tunnel setup underlay revalidation failed: {error:#}"
+            )));
+        }
+        if guards.host_state_ambiguous {
+            return match self.drain_now() {
+                Some(cause) => Some(cause),
+                None => first,
+            };
+        }
+        if let Err(error) = guards.verify_live_owned_route_census() {
+            return Some(NetworkRestartCause::source_lost(format!(
+                "full-tunnel setup owned-route census failed: {error:#}"
+            )));
+        }
+
+        match self.drain_now() {
+            Some(cause) if cause.is_only_owned_route_changes() => {
+                self.settle_owned_route_mutations(guards)
+            }
+            cause => cause,
+        }
+    }
+
+    /// Reclassify a synchronous signed host-transaction failure only when the
+    /// event source proves that topology changed while the transaction was in
+    /// flight. An owned-route notification is suppressible after an exact
+    /// census only when the WAL is no longer ambiguous.
+    fn detect_failed_host_transaction_invalidation(
+        &mut self,
+        guards: &FullTunnelGuards,
+    ) -> Option<NetworkRestartCause> {
+        let first = self.drain_now();
+        if first
+            .as_ref()
+            .is_some_and(|cause| !cause.is_only_owned_route_changes())
+        {
+            return first;
+        }
+        if let Err(error) = guards.verify_active_underlay_paths() {
+            return Some(NetworkRestartCause::source_lost(format!(
+                "failed signed host transaction and active underlay revalidation failed: {error:#}"
+            )));
+        }
+        if guards.host_state_ambiguous {
+            // Give a notification already emitted by the completed synchronous
+            // kernel operation one scheduler handoff before the second bounded
+            // drain. No sleep or unbounded wait is involved.
+            std::thread::yield_now();
+            return match self.drain_now() {
+                Some(cause) => Some(cause),
+                None => first,
+            };
+        }
+        if let Err(error) = guards.verify_live_owned_route_census() {
+            return Some(NetworkRestartCause::source_lost(format!(
+                "failed signed host transaction and owned-route census failed: {error:#}"
+            )));
+        }
+        match self.drain_now() {
+            Some(cause) if cause.is_only_owned_route_changes() => {
+                self.settle_owned_route_mutations(guards)
+            }
+            cause => cause,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnderlayPathIdentity {
+    gateway: Option<Ipv4Addr>,
+    iface: String,
+}
+
+fn underlay_path_identities(
+    paths: &BTreeMap<Ipv4Addr, LinuxUnderlayPath>,
+) -> BTreeMap<Ipv4Addr, UnderlayPathIdentity> {
+    paths
+        .iter()
+        .map(|(ip, path)| {
+            (
+                *ip,
+                UnderlayPathIdentity {
+                    gateway: path.gateway(),
+                    iface: path.iface().to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn validate_startup_underlay_snapshot(
+    initial: &BTreeMap<Ipv4Addr, UnderlayPathIdentity>,
+    observed: &BTreeMap<Ipv4Addr, UnderlayPathIdentity>,
+    tun_iface: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        observed.values().all(|path| path.iface != tun_iface),
+        "post-TUN underlay recapture selected the new TUN interface {tun_iface}"
+    );
+    anyhow::ensure!(
+        observed == initial,
+        "underlay path changed between the pre-TUN and monitored post-TUN snapshots"
+    );
+    Ok(())
+}
+
+fn recapture_and_validate_underlay_paths(
+    initial: &BTreeMap<Ipv4Addr, LinuxUnderlayPath>,
+    tun_iface: &str,
+) -> Result<()> {
+    let initial_identity = underlay_path_identities(initial);
+    let observed = initial
+        .keys()
+        .copied()
+        .map(|ip| {
+            LinuxUnderlayPath::capture(ip)
+                .with_context(|| format!("re-capture monitored post-TUN underlay path for {ip}"))
+                .map(|path| {
+                    (
+                        ip,
+                        UnderlayPathIdentity {
+                            gateway: path.gateway(),
+                            iface: path.iface().to_string(),
+                        },
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    validate_startup_underlay_snapshot(&initial_identity, &observed, tun_iface)
+}
 
 /// Signal listeners are installed before opening a TUN or mutating host state.
 /// A normal service stop can therefore cancel the active carrier future and
@@ -3287,6 +3709,7 @@ struct FullTunnelGuards {
     route_owner: LinuxRouteOwner,
     host_state_ambiguous: bool,
     shutdown_complete: bool,
+    restart_recovery_handoff: bool,
 }
 
 impl FullTunnelGuards {
@@ -3318,6 +3741,7 @@ impl FullTunnelGuards {
             route_owner: LinuxRouteOwner::for_session(session_id),
             host_state_ambiguous: true,
             shutdown_complete: false,
+            restart_recovery_handoff: false,
         };
         for operation in firewall_operations {
             guards
@@ -3354,6 +3778,164 @@ impl FullTunnelGuards {
     fn set_routes(&mut self, routes: Vec<JournaledRouteGuard>) {
         debug_assert!(self.routes.is_none());
         self.routes = Some(routes);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn live_route_resources(&self) -> Result<Vec<RouteResource>> {
+        fn push_route(
+            resources: &mut Vec<RouteResource>,
+            guard: &JournaledRouteGuard,
+        ) -> Result<()> {
+            let OwnedResource::Route(route) = &guard.resource else {
+                anyhow::bail!("journaled route guard contains a non-route resource")
+            };
+            resources.push(route.clone());
+            Ok(())
+        }
+
+        let mut resources = Vec::new();
+        if let Some(routes) = &self.routes {
+            for route in routes {
+                push_route(&mut resources, route)?;
+            }
+        }
+        if let Some(routes) = &self.bypass_routes {
+            for route in routes.values() {
+                push_route(&mut resources, route)?;
+            }
+        }
+        if let Some(route) = &self.ssh_bypass {
+            push_route(&mut resources, route)?;
+        }
+        Ok(resources)
+    }
+
+    /// Re-read the complete reserved protocol namespace and prove it contains
+    /// exactly the route resources currently owned by this live guard.
+    ///
+    /// This is the sole authorization for suppressing rtnetlink notifications
+    /// generated by Shadowpipe's own journaled route mutations.
+    fn verify_live_owned_route_census(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            anyhow::ensure!(
+                !self.shutdown_complete && !self.host_state_ambiguous,
+                "cannot verify owned routes while host state is incomplete or ambiguous"
+            );
+            let guard_resources = self.live_route_resources()?;
+            let resources: Vec<RouteResource> = self
+                .journal
+                .journal()
+                .operations
+                .iter()
+                .filter_map(|operation| {
+                    if operation.state != OperationState::Applied {
+                        return None;
+                    }
+                    match &operation.resource {
+                        OwnedResource::Route(route) => Some(route.clone()),
+                        _ => None,
+                    }
+                })
+                .collect();
+            anyhow::ensure!(
+                resources.len() == guard_resources.len()
+                    && resources.iter().all(|resource| {
+                        guard_resources
+                            .iter()
+                            .filter(|candidate| *candidate == resource)
+                            .count()
+                            == 1
+                    })
+                    && guard_resources.iter().all(|resource| {
+                        resources
+                            .iter()
+                            .filter(|candidate| *candidate == resource)
+                            .count()
+                            == 1
+                    }),
+                "live route guards and Applied route WAL records differ"
+            );
+            let expected_namespace = self
+                .journal
+                .journal()
+                .owner
+                .network_namespace
+                .context("live host journal lacks its Linux network namespace identity")?;
+            anyhow::ensure!(
+                current_linux_network_namespace_identity()
+                    .context("capture live network namespace for route census")?
+                    == expected_namespace,
+                "live route census ran outside the journaled network namespace"
+            );
+            let prepared = PreparedLinuxRouteGroup::prepare(
+                self.session_id,
+                expected_namespace,
+                &resources,
+                true,
+            )
+            .map_err(anyhow::Error::new)
+            .context("prepare exact live owned-route census")?;
+            for resource in &resources {
+                anyhow::ensure!(
+                    prepared.observe(&OwnedResource::Route(resource.clone()))
+                        == Some(
+                            shadowpipe_core::host_state::ResourceObservationKind::ExactOwnedPresent,
+                        ),
+                    "live owned-route census does not classify every expected route as exact"
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("live owned-route census is Linux-only")
+        }
+    }
+
+    /// Re-query every currently authorized carrier bypass. Unlike the complete
+    /// startup authority, these addresses all have an exact `/32` underlay
+    /// route even after split-default installation, so `ip route get` cannot
+    /// recurse through the TUN.
+    fn verify_active_underlay_paths(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let tun_iface = &self
+                .tun_resource
+                .as_ref()
+                .context("active underlay verification has no TUN identity")?
+                .interface
+                .name;
+            let active = self
+                .bypass_routes
+                .as_ref()
+                .context("active underlay verification has no bypass owner")?;
+            anyhow::ensure!(
+                !active.is_empty(),
+                "active underlay verification has no carrier bypass"
+            );
+            for ip in active.keys() {
+                let expected = self
+                    .underlay_paths
+                    .get(ip)
+                    .with_context(|| format!("active bypass {ip} has no captured underlay"))?;
+                let observed = LinuxUnderlayPath::capture(*ip)
+                    .with_context(|| format!("re-capture active underlay path for {ip}"))?;
+                anyhow::ensure!(
+                    observed.iface() != tun_iface,
+                    "active carrier path for {ip} recursed through TUN {tun_iface}"
+                );
+                anyhow::ensure!(
+                    observed == *expected,
+                    "active carrier underlay path for {ip} changed"
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("active underlay verification is Linux-only")
+        }
     }
 
     fn journaled_add_route(&mut self, spec: &LinuxOwnedRouteSpec) -> Result<JournaledRouteGuard> {
@@ -3746,6 +4328,46 @@ impl FullTunnelGuards {
         if let Some(kill_switch) = self.kill_switch.take() {
             std::mem::forget(kill_switch);
         }
+    }
+
+    /// Preserve crash-recoverable kernel/file objects exactly as they stand
+    /// when topology invalidates a fallible startup transaction.
+    ///
+    /// The independent restart lockdown must already be Active. Userspace
+    /// guards are deliberately forgotten so their ordinary Drop handlers
+    /// cannot mutate routes, DNS or firewall state without matching WAL
+    /// acknowledgements. The non-persistent TUN descriptor is owned by the
+    /// caller and closes separately, exactly as it would on process death.
+    fn preserve_incomplete_state_for_restart_recovery(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.shutdown_complete && !self.restart_recovery_handoff,
+            "restart-recovery handoff was already completed"
+        );
+        anyhow::ensure!(
+            self.journal.journal().phase != JournalPhase::Conflict
+                && self.journal.journal().phase != JournalPhase::Cleaning,
+            "cannot hand a terminal main WAL to automatic restart recovery"
+        );
+
+        if let Some(routes) = self.routes.take() {
+            std::mem::forget(routes);
+        }
+        if let Some(routes) = self.bypass_routes.take() {
+            std::mem::forget(routes);
+        }
+        if let Some(route) = self.ssh_bypass.take() {
+            std::mem::forget(route);
+        }
+        if let Some(dns) = self.legacy_dns.take() {
+            std::mem::forget(dns);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(dns) = self.dns_exchange.take() {
+            std::mem::forget(dns);
+        }
+        self.preserve_firewall();
+        self.restart_recovery_handoff = true;
+        Ok(())
     }
 
     /// Persist an operator-visible fail-closed terminal state. `Conflict` is
@@ -4310,6 +4932,7 @@ enum SignedSessionEnd {
     Session(Result<()>),
     Shutdown(Result<&'static str>),
     PolicyExpired,
+    NetworkRestart(NetworkRestartCause),
 }
 
 enum SignedSessionEvent {
@@ -4317,23 +4940,74 @@ enum SignedSessionEvent {
     Refresh(Result<PreparedObservation>),
     Shutdown(Result<&'static str>),
     PolicyExpired,
+    NetworkRestart(NetworkRestartCause),
 }
 
 enum SignedBackoffEvent {
     Complete,
     Shutdown(Result<&'static str>),
     PolicyExpired,
+    NetworkRestart(NetworkRestartCause),
 }
 
 enum SignedBackoffEnd {
     Complete,
     Shutdown(&'static str),
     PolicyExpired,
+    NetworkRestart(NetworkRestartCause),
+}
+
+enum LegacySessionEvent {
+    Session(Result<()>),
+    Shutdown(Result<&'static str>),
+    NetworkRestart(NetworkRestartCause),
+}
+
+enum LegacyBackoffEvent {
+    Complete,
+    Shutdown(Result<&'static str>),
+    NetworkRestart(NetworkRestartCause),
+}
+
+fn signed_active_network_restart(cause: NetworkRestartCause) -> SignedSessionEvent {
+    SignedSessionEvent::NetworkRestart(cause)
+}
+
+fn signed_backoff_network_restart(cause: NetworkRestartCause) -> SignedBackoffEvent {
+    SignedBackoffEvent::NetworkRestart(cause)
+}
+
+fn legacy_network_restart(cause: NetworkRestartCause) -> TunnelTerminalOutcome {
+    TunnelTerminalOutcome::NetworkRestart(cause)
+}
+
+fn signed_host_transaction_failure(
+    network_watcher: &mut FullTunnelNetworkWatcher,
+    guards: &FullTunnelGuards,
+    accepted: &AcceptedSignedPolicy,
+    context: &'static str,
+    error: anyhow::Error,
+) -> Result<TunnelTerminalOutcome> {
+    if signed_policy_expired(accepted) {
+        return Err(error).context(context);
+    }
+    let cause = network_watcher.detect_failed_host_transaction_invalidation(guards);
+    if signed_policy_expired(accepted) {
+        return Err(error).context(context);
+    }
+    if let Some(cause) = cause {
+        return Ok(TunnelTerminalOutcome::NetworkRestartWithRecovery {
+            cause,
+            failure: format!("{context}: {error:#}"),
+        });
+    }
+    Err(error).context(context)
 }
 
 async fn wait_signed_backoff(
     accepted: &AcceptedSignedPolicy,
     shutdown: &mut ShutdownSignals,
+    network_watcher: &mut FullTunnelNetworkWatcher,
     delay: Duration,
 ) -> Result<SignedBackoffEnd> {
     let deadline = Instant::now()
@@ -4352,12 +5026,14 @@ async fn wait_signed_backoff(
         biased;
         _ = wait_signed_policy_expiry(accepted) => SignedBackoffEvent::PolicyExpired,
         signal = shutdown.recv() => SignedBackoffEvent::Shutdown(signal),
+        cause = network_watcher.next_restart() => signed_backoff_network_restart(cause),
         _ = tokio::time::sleep(remaining) => SignedBackoffEvent::Complete,
     };
     match event {
         SignedBackoffEvent::Complete => Ok(SignedBackoffEnd::Complete),
         SignedBackoffEvent::Shutdown(signal) => Ok(SignedBackoffEnd::Shutdown(signal?)),
         SignedBackoffEvent::PolicyExpired => Ok(SignedBackoffEnd::PolicyExpired),
+        SignedBackoffEvent::NetworkRestart(cause) => Ok(SignedBackoffEnd::NetworkRestart(cause)),
     }
 }
 
@@ -4368,6 +5044,7 @@ async fn run_signed_endpoint_loop(
     guards: &mut FullTunnelGuards,
     accepted: &AcceptedSignedPolicy,
     shutdown: &mut ShutdownSignals,
+    network_watcher: &mut FullTunnelNetworkWatcher,
 ) -> Result<TunnelTerminalOutcome> {
     let SignedCarrierContext {
         profile,
@@ -4435,6 +5112,7 @@ async fn run_signed_endpoint_loop(
                         biased;
                         _ = wait_signed_policy_expiry(accepted) => SignedSessionEvent::PolicyExpired,
                         signal = shutdown.recv() => SignedSessionEvent::Shutdown(signal),
+                        cause = network_watcher.next_restart() => signed_active_network_restart(cause),
                         result = &mut session => SignedSessionEvent::Session(result),
                         result = &mut refresh => SignedSessionEvent::Refresh(result),
                     }
@@ -4453,9 +5131,21 @@ async fn run_signed_endpoint_loop(
                                 .context("abort active DNS observation after policy expiry")?;
                             break SignedSessionEnd::PolicyExpired;
                         }
-                        let observation = match commit_observation_transaction(
+                        let committed = match commit_observation_transaction(
                             policy, guards, prepared, accepted,
-                        )? {
+                        ) {
+                            Ok(committed) => committed,
+                            Err(error) => {
+                                return signed_host_transaction_failure(
+                                    network_watcher,
+                                    guards,
+                                    accepted,
+                                    "commit active signed endpoint observation",
+                                    error,
+                                );
+                            }
+                        };
+                        let observation = match committed {
                             ObservationCommit::Committed(observation) => observation,
                             ObservationCommit::PolicyExpired => {
                                 break SignedSessionEnd::PolicyExpired
@@ -4468,7 +5158,18 @@ async fn run_signed_endpoint_loop(
                             %hostname,
                             "committed transactional signed endpoint DNS refresh"
                         );
-                        cleanup_retired_endpoints(policy, guards)?;
+                        if let Err(error) = cleanup_retired_endpoints(policy, guards) {
+                            return signed_host_transaction_failure(
+                                network_watcher,
+                                guards,
+                                accepted,
+                                "clean retired endpoints after active signed observation",
+                                error,
+                            );
+                        }
+                        if let Some(cause) = network_watcher.settle_owned_route_mutations(guards) {
+                            break SignedSessionEnd::NetworkRestart(cause);
+                        }
                     }
                     SignedSessionEvent::Shutdown(signal) => {
                         break SignedSessionEnd::Shutdown(signal);
@@ -4476,16 +5177,52 @@ async fn run_signed_endpoint_loop(
                     SignedSessionEvent::PolicyExpired => {
                         break SignedSessionEnd::PolicyExpired;
                     }
+                    SignedSessionEvent::NetworkRestart(cause) => {
+                        break SignedSessionEnd::NetworkRestart(cause);
+                    }
                 }
             }
+        };
+
+        let end = match end {
+            // The carrier future is already dropped. Do not run lease or
+            // retirement host mutations after topology authority was revoked:
+            // the complete controlled teardown below removes every endpoint
+            // resource under the independent lockdown.
+            SignedSessionEnd::NetworkRestart(cause) => {
+                return Ok(TunnelTerminalOutcome::NetworkRestart(cause));
+            }
+            other => other,
         };
 
         // The session future (and therefore its carrier socket) is dropped at
         // the block boundary above.  Only now may a final lease release deny
         // and remove a DNS-depublished tuple.
-        release_endpoint_lease(policy, guards, lease)
-            .context("release signed endpoint lease after carrier socket drop")?;
-        cleanup_retired_endpoints(policy, guards)?;
+        if let Err(error) = release_endpoint_lease(policy, guards, lease)
+            .context("release signed endpoint lease after carrier socket drop")
+        {
+            return signed_host_transaction_failure(
+                network_watcher,
+                guards,
+                accepted,
+                "release signed endpoint lease after carrier socket drop",
+                error,
+            );
+        }
+        if let Err(error) = cleanup_retired_endpoints(policy, guards) {
+            return signed_host_transaction_failure(
+                network_watcher,
+                guards,
+                accepted,
+                "clean retired endpoints after signed carrier socket drop",
+                error,
+            );
+        }
+        if matches!(&end, SignedSessionEnd::Session(_)) {
+            if let Some(cause) = network_watcher.settle_owned_route_mutations(guards) {
+                return Ok(TunnelTerminalOutcome::NetworkRestart(cause));
+            }
+        }
 
         let result = match end {
             SignedSessionEnd::Session(result) => result,
@@ -4502,6 +5239,9 @@ async fn run_signed_endpoint_loop(
                     "signed endpoint policy expired; carrier dropped before revoking host authority"
                 );
                 return Ok(TunnelTerminalOutcome::PolicyExpired);
+            }
+            SignedSessionEnd::NetworkRestart(_) => {
+                unreachable!("network restart returned before lease cleanup")
             }
         };
 
@@ -4531,8 +5271,26 @@ async fn run_signed_endpoint_loop(
                 );
                 drop(snapshot);
                 if should_rehydrate {
-                    match commit_authority_rehydration_transaction(policy, guards, accepted)? {
+                    let rehydration =
+                        match commit_authority_rehydration_transaction(policy, guards, accepted) {
+                            Ok(rehydration) => rehydration,
+                            Err(error) => {
+                                return signed_host_transaction_failure(
+                                    network_watcher,
+                                    guards,
+                                    accepted,
+                                    "rehydrate complete signed endpoint authority",
+                                    error,
+                                );
+                            }
+                        };
+                    match rehydration {
                         AuthorityRehydrationCommit::Committed { revived_candidates } => {
+                            if let Some(cause) =
+                                network_watcher.settle_owned_route_mutations(guards)
+                            {
+                                return Ok(TunnelTerminalOutcome::NetworkRestart(cause));
+                            }
                             let snapshot = policy.coordinator().snapshot();
                             failure_epoch.note_rehydrated(
                                 snapshot.generation,
@@ -4579,7 +5337,7 @@ async fn run_signed_endpoint_loop(
             }
         };
 
-        match wait_signed_backoff(accepted, shutdown, delay).await? {
+        match wait_signed_backoff(accepted, shutdown, network_watcher, delay).await? {
             SignedBackoffEnd::Complete => {}
             SignedBackoffEnd::Shutdown(signal) => {
                 info!(signal, "shutdown requested during signed reconnect backoff");
@@ -4588,6 +5346,9 @@ async fn run_signed_endpoint_loop(
             SignedBackoffEnd::PolicyExpired => {
                 warn!("signed endpoint policy expired during reconnect backoff");
                 return Ok(TunnelTerminalOutcome::PolicyExpired);
+            }
+            SignedBackoffEnd::NetworkRestart(cause) => {
+                return Ok(TunnelTerminalOutcome::NetworkRestart(cause));
             }
         }
     }
@@ -4611,6 +5372,12 @@ fn drop_full_tunnel_guards<R, B, S, D, K>(
 impl Drop for FullTunnelGuards {
     fn drop(&mut self) {
         if self.shutdown_complete {
+            return;
+        }
+        if self.restart_recovery_handoff {
+            tracing::warn!(
+                "full-tunnel startup state left recoverable under durable restart lockdown; main WAL deliberately not sealed Conflict"
+            );
             return;
         }
         // An unwind, remote stop, task cancellation, or process-level runtime
@@ -4652,7 +5419,15 @@ fn arm_restart_lockdown_for_teardown(
             barrier.as_ref().is_some_and(LockdownBarrier::is_active),
             "restart lockdown is not Active before main teardown"
         );
-        info!("durable restart lockdown active before main host-state teardown");
+        barrier
+            .as_mut()
+            .expect("Active restart lockdown exists")
+            .verify_active()
+            .context("strictly verify restart lockdown kernel/WAL state Active")?;
+        info!(
+            verification = "strict",
+            "durable restart lockdown active before main host-state teardown"
+        );
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
@@ -4660,6 +5435,63 @@ fn arm_restart_lockdown_for_teardown(
         let _ = (args, control_flow, barrier);
         anyhow::bail!("restart-lockdown teardown handoff is Linux-only")
     }
+}
+
+fn controlled_network_restart(
+    args: &Args,
+    control_flow: Option<LockdownControlFlow>,
+    barrier: &mut Option<LockdownBarrier>,
+    guards: &mut FullTunnelGuards,
+    tun: SharedTun,
+    cause: NetworkRestartCause,
+) -> Result<()> {
+    warn!(
+        %cause,
+        "network topology invalidated the captured underlay; replacing this process under durable lockdown"
+    );
+    arm_restart_lockdown_for_teardown(args, control_flow, barrier)
+        .context("arm durable restart lockdown after network invalidation")?;
+    guards
+        .close_after_sessions(tun)
+        .context("tear down invalidated full-tunnel host state under restart lockdown")?;
+    barrier
+        .as_mut()
+        .context("controlled network restart lost its lockdown handle")?
+        .verify_active()
+        .context("prove restart lockdown remains Active after replacement teardown")?;
+    Err(anyhow::anyhow!(
+        "{cause}; invalidated routes, DNS, bypasses, TUN, and main kill-switch were removed in fail-closed order while durable restart lockdown remains Active; restart shadowpipe-client (systemd Restart=always does this automatically), or use --release-lockdown only to intentionally restore direct networking"
+    ))
+}
+
+fn handoff_incomplete_host_state_for_network_restart(
+    args: &Args,
+    control_flow: Option<LockdownControlFlow>,
+    barrier: &mut Option<LockdownBarrier>,
+    guards: &mut FullTunnelGuards,
+    tun: SharedTun,
+    cause: NetworkRestartCause,
+    setup_error: anyhow::Error,
+) -> Result<()> {
+    warn!(
+        %cause,
+        %setup_error,
+        "network topology invalidated an incomplete host transaction; handing its WAL to the replacement process"
+    );
+    arm_restart_lockdown_for_teardown(args, control_flow, barrier)
+        .context("arm durable restart lockdown for incomplete host-state recovery")?;
+    guards
+        .preserve_incomplete_state_for_restart_recovery()
+        .context("preserve incomplete main WAL and exact host objects for startup recovery")?;
+    drop(tun);
+    barrier
+        .as_mut()
+        .context("incomplete host-state recovery lost its lockdown handle")?
+        .verify_active()
+        .context("prove restart lockdown remains Active after incomplete setup handoff")?;
+    Err(anyhow::anyhow!(
+        "{cause}; host transaction also failed: {setup_error:#}; the non-persistent TUN was closed, the non-Conflict main WAL and exact remaining host objects were retained for next-start recovery, and durable restart lockdown remains Active"
+    ))
 }
 
 #[cfg(not(unix))]
@@ -4756,18 +5588,44 @@ fn next_fail_streak(action: ReconnectAction, session_ok: bool, current: u32) -> 
     }
 }
 
-/// Only `LocalShutdown` authorizes deterministic host-state restoration.
-/// Every other terminal cause is remote, time-derived, or fatal and must leave
-/// the durable firewall journal sealed fail-closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Terminal causes have deliberately disjoint host-state authority:
+/// local shutdown may restore under a restart barrier, network invalidation
+/// requests orderly replacement while that barrier stays Active, and policy
+/// expiry remains sealed fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TunnelTerminalOutcome {
     LocalShutdown(&'static str),
     PolicyExpired,
+    NetworkRestart(NetworkRestartCause),
+    NetworkRestartWithRecovery {
+        cause: NetworkRestartCause,
+        failure: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelTerminalDisposition {
+    RestoreAfterLocalShutdown,
+    RestartUnderLockdown,
+    SealFailClosed,
 }
 
 impl TunnelTerminalOutcome {
-    const fn authorizes_host_restore(self) -> bool {
-        matches!(self, Self::LocalShutdown(_))
+    const fn disposition(&self) -> TunnelTerminalDisposition {
+        match self {
+            Self::LocalShutdown(_) => TunnelTerminalDisposition::RestoreAfterLocalShutdown,
+            Self::NetworkRestart(_) | Self::NetworkRestartWithRecovery { .. } => {
+                TunnelTerminalDisposition::RestartUnderLockdown
+            }
+            Self::PolicyExpired => TunnelTerminalDisposition::SealFailClosed,
+        }
+    }
+
+    const fn authorizes_host_restore(&self) -> bool {
+        matches!(
+            self.disposition(),
+            TunnelTerminalDisposition::RestoreAfterLocalShutdown
+        )
     }
 }
 
@@ -4875,6 +5733,23 @@ fn signed_reality_pool(policy: &VerifiedEndpointPolicy) -> Result<Vec<RuntimeRea
                 .map(|target| RuntimeRealityEndpoint::from_verified_target(&target))
         })
         .collect()
+}
+
+fn abort_new_full_tunnel_startup(
+    runtime: NewHostStateRuntime,
+    tun: SharedTun,
+    cause: anyhow::Error,
+) -> Result<()> {
+    match runtime.close_new_tun_and_remove_wal(tun) {
+        Ok(()) => Err(cause).context(
+            "full-tunnel startup invalidated after TUN creation; exact new TUN and WAL were removed",
+        ),
+        Err(cleanup_error) => Err(cause).with_context(|| {
+            format!(
+                "full-tunnel startup invalidated and exact new-TUN cleanup failed: {cleanup_error:#}"
+            )
+        }),
+    }
 }
 
 async fn run_tunnel_mode(
@@ -5064,6 +5939,31 @@ async fn run_tunnel_mode(
     } else {
         None
     };
+    let mut network_watcher = if args.auto_route {
+        let startup_monitor = (|| -> Result<FullTunnelNetworkWatcher> {
+            // Subscribe only after the descriptor-owned TUN has its durable
+            // alias/WAL identity. The second complete snapshot closes the
+            // pre-subscription race; the bounded drain closes the interval
+            // between that snapshot and firewall authorization.
+            let mut watcher = FullTunnelNetworkWatcher::open(true)?;
+            recapture_and_validate_underlay_paths(&underlay_paths, &iface)?;
+            if let Some(cause) = watcher.drain_now() {
+                anyhow::bail!("network invalidated full-tunnel startup: {cause}");
+            }
+            Ok(watcher)
+        })();
+        match startup_monitor {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                let runtime = new_host_runtime
+                    .take()
+                    .expect("auto-route TUN has a journaled startup runtime");
+                return abort_new_full_tunnel_startup(runtime, tun, error);
+            }
+        }
+    } else {
+        FullTunnelNetworkWatcher::open(false)?
+    };
 
     if carrier_endpoints.len() > 1 {
         info!(
@@ -5204,6 +6104,39 @@ async fn run_tunnel_mode(
             runtime.tun,
             &firewall_operations,
         )?;
+        macro_rules! full_tunnel_setup_try {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Some(cause) =
+                            network_watcher.detect_setup_network_invalidation(&guards, &iface)
+                        {
+                            return handoff_incomplete_host_state_for_network_restart(
+                                args,
+                                lockdown_control,
+                                restart_lockdown,
+                                &mut guards,
+                                tun,
+                                cause,
+                                error,
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+        }
+        if let Some(cause) = network_watcher.detect_setup_network_invalidation(&guards, &iface) {
+            return controlled_network_restart(
+                args,
+                lockdown_control,
+                restart_lockdown,
+                &mut guards,
+                tun,
+                cause,
+            );
+        }
         info!(
             endpoints = server_ips.len(),
             validation_scope = "synthetic-linux-ipv4",
@@ -5216,40 +6149,42 @@ async fn run_tunnel_mode(
                     .underlay_paths
                     .get(&ssh_ip)
                     .context("pre-TUN SSH underlay path is missing")?;
-                let spec = path
+                let spec = full_tunnel_setup_try!(path
                     .owned_ssh_bypass_spec(ssh_ip, guards.route_owner)
-                    .context("derive exact SSH bypass route")?;
-                let route = guards
+                    .context("derive exact SSH bypass route"));
+                let route = full_tunnel_setup_try!(guards
                     .journaled_add_route(&spec)
-                    .context("install journaled SSH bypass route")?;
+                    .context("install journaled SSH bypass route"));
                 guards.set_ssh_bypass(route);
             }
         }
         for ip in &server_ips {
+            let mutation = full_tunnel_setup_try!(guards.route_add_bypass(*ip));
             anyhow::ensure!(
-                guards.route_add_bypass(*ip)? == OwnedMutation::Changed,
+                mutation == OwnedMutation::Changed,
                 "initial server bypass unexpectedly already existed for {ip}"
             );
             info!(server_ip = %ip, "server bypass route installed");
         }
         let mut routes = Vec::with_capacity(2);
         for destination in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(128, 0, 0, 0)] {
-            let spec =
-                LinuxOwnedRouteSpec::split_default(destination, iface.clone(), guards.route_owner)
-                    .context("derive owned split-default route")?;
-            routes.push(
-                guards
-                    .journaled_add_route(&spec)
-                    .context("install journaled split-default route")?,
-            );
+            let spec = full_tunnel_setup_try!(LinuxOwnedRouteSpec::split_default(
+                destination,
+                iface.clone(),
+                guards.route_owner,
+            )
+            .context("derive owned split-default route"));
+            routes.push(full_tunnel_setup_try!(guards
+                .journaled_add_route(&spec)
+                .context("install journaled split-default route")));
         }
         guards.set_routes(routes);
         info!(%iface, "split routes installed");
         // DNS pinning so name resolution rides the tunnel instead of leaking.
         let d = args.dns.expect("validated --auto-route DNS requirement");
-        guards
+        full_tunnel_setup_try!(guards
             .apply_dns_exchange(dns_preflight, &[d])
-            .context("pin system DNS through crash-recoverable exchange")?;
+            .context("pin system DNS through crash-recoverable exchange"));
         info!(dns = %d, "system DNS pinned through the tunnel");
         (Some(guards), None, None, None)
     } else {
@@ -5257,6 +6192,29 @@ async fn run_tunnel_mode(
         info!("hint: --auto_route or: sudo route add -net 0.0.0.0/1 -interface {iface}");
         (None, None, None, None)
     };
+
+    // The complete replacement is now durably Active, but an adopted restart
+    // barrier has not yet been released. Drain once more so any topology event
+    // observed during firewall/route/DNS setup forces a controlled replacement
+    // instead of authorizing stale bypass paths.
+    let startup_network_cause = if let Some(guards) = full_tunnel_guards.as_ref() {
+        network_watcher.settle_owned_route_mutations(guards)
+    } else {
+        network_watcher.drain_now()
+    };
+    if let Some(cause) = startup_network_cause {
+        let guards = full_tunnel_guards
+            .as_mut()
+            .context("network invalidation lacks full-tunnel guards")?;
+        return controlled_network_restart(
+            args,
+            lockdown_control,
+            restart_lockdown,
+            guards,
+            tun,
+            cause,
+        );
+    }
 
     if let Some(mut barrier) = restart_lockdown.take() {
         let guards = full_tunnel_guards
@@ -5308,6 +6266,7 @@ async fn run_tunnel_mode(
             guards,
             accepted,
             &mut shutdown,
+            &mut network_watcher,
         )
         .await
         {
@@ -5353,22 +6312,43 @@ async fn run_tunnel_mode(
                 };
             }
         };
-        if let TunnelTerminalOutcome::LocalShutdown(signal) = terminal {
-            debug_assert!(terminal.authorizes_host_restore());
-            info!(
-                signal,
-                "local shutdown requested; installing durable restart lockdown before signed host teardown"
-            );
-            arm_restart_lockdown_for_teardown(args, lockdown_control, restart_lockdown)?;
-            guards
-                .close_after_sessions(tun)
-                .context("close signed TUN and restore host state in fail-closed order")?;
-            return Ok(());
-        }
-
         let reason = match terminal {
+            TunnelTerminalOutcome::LocalShutdown(signal) => {
+                debug_assert!(
+                    TunnelTerminalOutcome::LocalShutdown(signal).authorizes_host_restore()
+                );
+                info!(
+                    signal,
+                    "local shutdown requested; installing durable restart lockdown before signed host teardown"
+                );
+                arm_restart_lockdown_for_teardown(args, lockdown_control, restart_lockdown)?;
+                guards
+                    .close_after_sessions(tun)
+                    .context("close signed TUN and restore host state in fail-closed order")?;
+                return Ok(());
+            }
+            TunnelTerminalOutcome::NetworkRestart(cause) => {
+                return controlled_network_restart(
+                    args,
+                    lockdown_control,
+                    restart_lockdown,
+                    guards,
+                    tun,
+                    cause,
+                );
+            }
+            TunnelTerminalOutcome::NetworkRestartWithRecovery { cause, failure } => {
+                return handoff_incomplete_host_state_for_network_restart(
+                    args,
+                    lockdown_control,
+                    restart_lockdown,
+                    guards,
+                    tun,
+                    cause,
+                    anyhow::anyhow!(failure),
+                );
+            }
             TunnelTerminalOutcome::PolicyExpired => "signed policy expiry",
-            TunnelTerminalOutcome::LocalShutdown(_) => unreachable!("handled above"),
         };
         // Persist the exact accepted hash before sealing the host journal. This
         // prevents an orderly monotonic expiry followed by wall-clock rollback
@@ -5420,23 +6400,13 @@ async fn run_tunnel_mode(
         // a session helper; connect/handshake failures surface as Err -> Backoff,
         // a guard rotation as Err(RotateConnection) -> Rotate, clean close as Ok.
         let session_start = Instant::now();
-        let res = tokio::select! {
+        let event = tokio::select! {
+            biased;
             signal = shutdown.recv() => {
-                let signal = match signal {
-                    Ok(signal) => signal,
-                    Err(error) => {
-                        if let Some(guards) = full_tunnel_guards.as_mut() {
-                            guards.seal_fail_closed("fatal shutdown-signal error")?;
-                        }
-                        drop(tun);
-                        return Err(error).context(
-                            "shutdown signal listener failed; host state remains fail-closed",
-                        );
-                    }
-                };
-                info!(signal, "shutdown requested; restoring routes, DNS and firewall");
-                terminal = TunnelTerminalOutcome::LocalShutdown(signal);
-                break;
+                LegacySessionEvent::Shutdown(signal)
+            }
+            cause = network_watcher.next_restart() => {
+                LegacySessionEvent::NetworkRestart(cause)
             }
             result = async {
                 if !pool.is_empty() {
@@ -5484,7 +6454,34 @@ async fn run_tunnel_mode(
                         &client_credential,
                     ).await
                 }
-            } => result,
+            } => LegacySessionEvent::Session(result),
+        };
+        let res = match event {
+            LegacySessionEvent::Session(result) => result,
+            LegacySessionEvent::Shutdown(signal) => {
+                let signal = match signal {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        if let Some(guards) = full_tunnel_guards.as_mut() {
+                            guards.seal_fail_closed("fatal shutdown-signal error")?;
+                        }
+                        drop(tun);
+                        return Err(error).context(
+                            "shutdown signal listener failed; host state remains fail-closed",
+                        );
+                    }
+                };
+                info!(
+                    signal,
+                    "shutdown requested; restoring routes, DNS and firewall"
+                );
+                terminal = TunnelTerminalOutcome::LocalShutdown(signal);
+                break;
+            }
+            LegacySessionEvent::NetworkRestart(cause) => {
+                terminal = legacy_network_restart(cause);
+                break;
+            }
         };
 
         let action = classify_run_result(&res);
@@ -5530,8 +6527,19 @@ async fn run_tunnel_mode(
                 delay
             }
         };
-        tokio::select! {
+        let backoff_event = tokio::select! {
+            biased;
             signal = shutdown.recv() => {
+                LegacyBackoffEvent::Shutdown(signal)
+            }
+            cause = network_watcher.next_restart() => {
+                LegacyBackoffEvent::NetworkRestart(cause)
+            }
+            _ = tokio::time::sleep(delay) => LegacyBackoffEvent::Complete,
+        };
+        match backoff_event {
+            LegacyBackoffEvent::Complete => {}
+            LegacyBackoffEvent::Shutdown(signal) => {
                 let signal = match signal {
                     Ok(signal) => signal,
                     Err(error) => {
@@ -5544,17 +6552,25 @@ async fn run_tunnel_mode(
                         );
                     }
                 };
-                info!(signal, "shutdown requested during reconnect backoff; restoring guards");
+                info!(
+                    signal,
+                    "shutdown requested during reconnect backoff; restoring guards"
+                );
                 terminal = TunnelTerminalOutcome::LocalShutdown(signal);
                 break;
             }
-            _ = tokio::time::sleep(delay) => {}
+            LegacyBackoffEvent::NetworkRestart(cause) => {
+                terminal = legacy_network_restart(cause);
+                break;
+            }
         }
     }
     if let Some(guards) = full_tunnel_guards.as_mut() {
         match terminal {
             TunnelTerminalOutcome::LocalShutdown(signal) => {
-                debug_assert!(terminal.authorizes_host_restore());
+                debug_assert!(
+                    TunnelTerminalOutcome::LocalShutdown(signal).authorizes_host_restore()
+                );
                 info!(
                     signal,
                     "local shutdown requested; installing durable restart lockdown before host teardown"
@@ -5563,6 +6579,27 @@ async fn run_tunnel_mode(
                 guards
                     .close_after_sessions(tun)
                     .context("close TUN and restore full-tunnel host state in fail-closed order")?;
+            }
+            TunnelTerminalOutcome::NetworkRestart(cause) => {
+                return controlled_network_restart(
+                    args,
+                    lockdown_control,
+                    restart_lockdown,
+                    guards,
+                    tun,
+                    cause,
+                );
+            }
+            TunnelTerminalOutcome::NetworkRestartWithRecovery { cause, failure } => {
+                return handoff_incomplete_host_state_for_network_restart(
+                    args,
+                    lockdown_control,
+                    restart_lockdown,
+                    guards,
+                    tun,
+                    cause,
+                    anyhow::anyhow!(failure),
+                );
             }
             TunnelTerminalOutcome::PolicyExpired => {
                 unreachable!("unsigned/manual tunnel loop has no policy expiry")
@@ -6365,8 +7402,180 @@ mod tests {
 
     #[test]
     fn only_explicit_local_shutdown_authorizes_host_restore() {
+        let restart = topology_restart_cause();
+        assert_eq!(
+            TunnelTerminalOutcome::LocalShutdown("SIGTERM").disposition(),
+            TunnelTerminalDisposition::RestoreAfterLocalShutdown
+        );
+        assert_eq!(
+            TunnelTerminalOutcome::NetworkRestart(restart.clone()).disposition(),
+            TunnelTerminalDisposition::RestartUnderLockdown
+        );
+        assert_eq!(
+            TunnelTerminalOutcome::NetworkRestartWithRecovery {
+                cause: restart.clone(),
+                failure: "synthetic route transaction".to_string(),
+            }
+            .disposition(),
+            TunnelTerminalDisposition::RestartUnderLockdown
+        );
+        assert_eq!(
+            TunnelTerminalOutcome::PolicyExpired.disposition(),
+            TunnelTerminalDisposition::SealFailClosed
+        );
         assert!(TunnelTerminalOutcome::LocalShutdown("SIGTERM").authorizes_host_restore());
+        assert!(!TunnelTerminalOutcome::NetworkRestart(restart).authorizes_host_restore());
+        assert!(!TunnelTerminalOutcome::NetworkRestartWithRecovery {
+            cause: topology_restart_cause(),
+            failure: "synthetic route transaction".to_string(),
+        }
+        .authorizes_host_restore());
         assert!(!TunnelTerminalOutcome::PolicyExpired.authorizes_host_restore());
+    }
+
+    fn topology_restart_cause() -> NetworkRestartCause {
+        let mut accumulator = NetworkChangeAccumulator::new();
+        accumulator
+            .mark(shadowpipe_core::platform::NetworkChangeKind::DefaultRouteChanged)
+            .unwrap();
+        NetworkRestartCause::TopologyChanged(accumulator.take_pending().unwrap().unwrap())
+    }
+
+    #[test]
+    fn only_exact_owned_route_batches_are_suppressible_after_census() {
+        let mut accumulator = NetworkChangeAccumulator::new();
+        accumulator
+            .mark(NetworkChangeKind::OwnedRouteChanged)
+            .unwrap();
+        let owned =
+            NetworkRestartCause::TopologyChanged(accumulator.take_pending().unwrap().unwrap());
+        assert!(owned.is_only_owned_route_changes());
+
+        accumulator
+            .mark(NetworkChangeKind::OwnedRouteChanged)
+            .unwrap();
+        accumulator
+            .mark(NetworkChangeKind::RoutingPolicyChanged)
+            .unwrap();
+        let mixed =
+            NetworkRestartCause::TopologyChanged(accumulator.take_pending().unwrap().unwrap());
+        assert!(!mixed.is_only_owned_route_changes());
+        assert!(!NetworkRestartCause::source_lost("synthetic").is_only_owned_route_changes());
+    }
+
+    #[test]
+    fn startup_underlay_double_snapshot_is_exact_and_rejects_tun_recursion() {
+        let endpoint = Ipv4Addr::new(203, 0, 113, 10);
+        let original = BTreeMap::from([(
+            endpoint,
+            UnderlayPathIdentity {
+                gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
+                iface: "eth0".to_string(),
+            },
+        )]);
+        validate_startup_underlay_snapshot(&original, &original, "tun9").unwrap();
+
+        let mut changed = original.clone();
+        changed.get_mut(&endpoint).unwrap().gateway = Some(Ipv4Addr::new(192, 0, 2, 2));
+        assert!(validate_startup_underlay_snapshot(&original, &changed, "tun9").is_err());
+
+        let mut recursive = original.clone();
+        recursive.get_mut(&endpoint).unwrap().iface = "tun9".to_string();
+        let error = validate_startup_underlay_snapshot(&original, &recursive, "tun9").unwrap_err();
+        assert!(error.to_string().contains("selected the new TUN"));
+    }
+
+    #[test]
+    fn bounded_network_monitor_coalesces_and_fails_closed_on_loss_or_nonquiescence() {
+        use std::collections::VecDeque;
+
+        let mut reads: VecDeque<std::result::Result<Option<NetworkChangeSet>, &'static str>> =
+            VecDeque::from([
+                Ok(Some(NetworkChangeSet::one(
+                    shadowpipe_core::platform::NetworkChangeKind::InterfaceSetChanged,
+                ))),
+                Ok(Some(NetworkChangeSet::one(
+                    shadowpipe_core::platform::NetworkChangeKind::DefaultRouteChanged,
+                ))),
+                Ok(None),
+            ]);
+        let mut accumulator = NetworkChangeAccumulator::new();
+        let cause =
+            drain_network_change_source(&mut accumulator, || reads.pop_front().unwrap()).unwrap();
+        let NetworkRestartCause::TopologyChanged(batch) = cause else {
+            panic!("coalesced fake source did not produce TopologyChanged");
+        };
+        assert_eq!(batch.generation().get(), 2);
+        assert!(batch
+            .changes()
+            .contains(shadowpipe_core::platform::NetworkChangeKind::InterfaceSetChanged));
+        assert!(batch
+            .changes()
+            .contains(shadowpipe_core::platform::NetworkChangeKind::DefaultRouteChanged));
+
+        let mut accumulator = NetworkChangeAccumulator::new();
+        let lost = drain_network_change_source(&mut accumulator, || {
+            Err::<Option<NetworkChangeSet>, _>("synthetic ENOBUFS")
+        })
+        .unwrap();
+        assert!(matches!(
+            lost,
+            NetworkRestartCause::SourceLost { ref detail }
+                if detail.contains("synthetic ENOBUFS")
+        ));
+
+        let mut accumulator = NetworkChangeAccumulator::new();
+        let busy = drain_network_change_source(&mut accumulator, || {
+            Ok::<_, &'static str>(Some(NetworkChangeSet::new()))
+        })
+        .unwrap();
+        assert!(matches!(
+            busy,
+            NetworkRestartCause::SourceLost { ref detail }
+                if detail.contains("did not quiesce")
+        ));
+
+        let mut accumulator = NetworkChangeAccumulator::with_generation(
+            shadowpipe_core::network_events::NetworkEventGeneration::new(u64::MAX),
+        );
+        let overflow = drain_network_change_source(&mut accumulator, || {
+            Ok::<_, &'static str>(Some(NetworkChangeSet::one(
+                shadowpipe_core::platform::NetworkChangeKind::Resume,
+            )))
+        })
+        .unwrap();
+        assert!(matches!(
+            overflow,
+            NetworkRestartCause::SourceLost { ref detail }
+                if detail.contains("generation overflow")
+        ));
+    }
+
+    #[test]
+    fn signed_and_legacy_network_events_map_only_to_network_restart() {
+        let cause = topology_restart_cause();
+        assert!(matches!(
+            signed_active_network_restart(cause.clone()),
+            SignedSessionEvent::NetworkRestart(mapped) if mapped == cause
+        ));
+        assert!(matches!(
+            signed_backoff_network_restart(cause.clone()),
+            SignedBackoffEvent::NetworkRestart(mapped) if mapped == cause
+        ));
+        assert!(matches!(
+            legacy_network_restart(cause.clone()),
+            TunnelTerminalOutcome::NetworkRestart(mapped) if mapped == cause
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_network_watcher_never_synthesizes_a_restart() {
+        let mut watcher = FullTunnelNetworkWatcher::open(false).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), watcher.next_restart())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
