@@ -530,3 +530,6 @@ clean-room rules are defined in
 The pinned sing-box/sing-tun/Xray platform synthesis, exact source references,
 IPv6 staging decision and Linux/macOS/Windows adoption backlog are in
 [`docs/upstream-platform-audit-2026-07-16.md`](docs/upstream-platform-audit-2026-07-16.md).
+The bounded no-marketing comparison with current VLESS Encryption/REALITY,
+Hysteria2 and AmneziaWG 2.0 is in
+[`docs/protocol-comparison-2026-07-16.md`](docs/protocol-comparison-2026-07-16.md).
