@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0.0",
+  "experiment_id": "002-whitelist-relay",
+  "status": "DESIGN_DRAFT_NOT_FROZEN",
+  "scope": "SYNTHETIC_PRIVATE_VM_POLICY_ONLY",
+  "field_evidence": false,
+  "safety": {
+    "macos_live_sing_box": "NO_TOUCH",
+    "host_network_mutation_allowed": false,
+    "vm_only_mutation": true,
+    "linux_network_namespaces_required": true,
+    "owned_private_endpoints_only": true,
+    "internet_connectivity_allowed": false,
+    "public_or_cloud_endpoints_allowed": false,
+    "test_namespaces_have_default_route": false,
+    "internet_scanning": false
+  },
+  "arms": {
+    "A": "DIRECT_TO_CONTROLLED_EXIT",
+    "B": "CANDIDATE_RELAY_TO_SAME_CONTROLLED_EXIT",
+    "C1": "GENUINE_ALLOWED_SERVICE_CONTROL",
+    "C2": "NEGATIVE_NONALLOWLISTED_RELAY_CONTROL",
+    "C3": "LOCAL_OPERATOR_REACHABILITY_ELIGIBILITY_PROBE"
+  },
+  "allocation": {
+    "unit": "ONE_SHORT_TIME_BLOCK_WITH_ONE_A_AND_ONE_B_TRIAL",
+    "blocks": 60,
+    "sequence": "BALANCED_AB_BA",
+    "trials_by_arm": {
+      "A": 60,
+      "B": 60,
+      "C1": 60,
+      "C2": 12
+    },
+    "C1_schedule": "ONE_NONCONCURRENT_GENUINE_COVER_CONTROL_AT_RANDOM_POSITION_IN_EVERY_BLOCK",
+    "C2_schedule": "ONE_NONCONCURRENT_NEGATIVE_RELAY_CONTROL_IN_EVERY_FIFTH_BLOCK_AT_RANDOM_POSITION",
+    "C3_schedule": "ONE_LIGHTWEIGHT_ELIGIBILITY_PROBE_BEFORE_EVERY_BLOCK_NOT_ANALYZED_AS_AN_OUTCOME_ARM",
+    "total_trials": 192,
+    "total_C3_eligibility_probes": 60,
+    "seed": 20260715002,
+    "schedule_file": "allocation-schedule.json",
+    "schedule_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "schedule_must_materialize_all_arms": true,
+    "simultaneous_shared_bottleneck_trials": false,
+    "washout_seconds": 2
+  },
+  "success": {
+    "minimum_authenticated_payload_bytes": 1048576,
+    "object_hash_required": true,
+    "clean_terminal_close_required": true,
+    "dns_or_route_escape_allowed": false
+  },
+  "analysis": {
+    "primary_binary_estimand": "PAIRED_COMPLETION_DIFFERENCE",
+    "binary_test": "EXACT_MCNEMAR_WITH_DISCORDANT_PAIR_INTERVAL",
+    "continuous_estimand": "WITHIN_BLOCK_LOG_GOODPUT_B_MINUS_A",
+    "C1_role": "SEPARATE_GENUINE_COVER_AVAILABILITY_AND_DEGRADATION_CONTROL_NOT_POOLED_WITH_AB",
+    "C2_role": "NEGATIVE_RELAY_SPECIFICITY_CONTROL_NOT_POOLED_WITH_AB",
+    "C3_role": "BLOCK_ELIGIBILITY_AND_LOCAL_REACHABILITY_CHECK_NOT_AN_OUTCOME_ARM",
+    "cluster": "BLOCK",
+    "order_and_carryover_terms": true,
+    "did_only_for_separately_declared_policy_transition": true,
+    "multiplicity_plan": "TO_BE_FILLED_BEFORE_FREEZE"
+  },
+  "caps": {
+    "max_total_duration_minutes": 120,
+    "max_total_payload_bytes": 1073741824
+  },
+  "required_outputs": [
+    "manifest.json",
+    "environment.json",
+    "allocation-schedule.json",
+    "aggregate.json",
+    "RESULT.md",
+    "cleanup-state.txt",
+    "checksums.sha256"
+  ],
+  "cleanup_invariants": [
+    "NO_TEST_NAMESPACES",
+    "NO_LAB_LISTENERS",
+    "NO_LAB_QDISC_OR_FIREWALL_RULES",
+    "NO_ROUTE_OR_DEFAULT_ROUTE_RESIDUE"
+  ],
+  "publication_blocked_when_cleanup_incomplete": true
+}

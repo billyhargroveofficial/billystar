@@ -1,0 +1,212 @@
+{
+  "schema_version": "1.0.0",
+  "experiment_id": "001-trigger-unit",
+  "manifest_revision": 1,
+  "status": "DESIGN_DRAFT_NOT_FROZEN",
+  "scope": "SYNTHETIC_PRIVATE_VM_ONLY",
+  "field_evidence": false,
+  "created_utc": "2026-07-14T21:00:00Z",
+  "safety": {
+    "macos_live_sing_box": "NO_TOUCH",
+    "host_network_mutation_allowed": false,
+    "vm_only_mutation": true,
+    "linux_network_namespaces_required": true,
+    "network_scope": "PRIVATE_VM_NETNS_ONLY",
+    "internet_connectivity_allowed": false,
+    "public_or_cloud_endpoints_allowed": false,
+    "test_namespaces_have_default_route": false,
+    "forbidden_actions": [
+      "STOP_RESTART_SIGNAL_OR_EDIT_SING_BOX",
+      "HOST_ROUTE_DNS_PF_NETWORKEXTENSION_MUTATION",
+      "PRODUCTION_CREDENTIAL_REUSE",
+      "INTERNET_WIDE_SCANNING"
+    ]
+  },
+  "roles": {
+    "build_observer": "macos-host-read-only",
+    "client_sink_and_emulator": "orbstack-arch-linux-netns",
+    "portability_smoke_only": "parallels-windows-11-arm64"
+  },
+  "endpoints": {
+    "client_name": "client.lab.invalid",
+    "sink_name": "sink.lab.invalid",
+    "addresses_source": "UNTRACKED_GUEST_RUNTIME_FILE",
+    "contains_real_addresses": false
+  },
+  "provenance": {
+    "git_sha": "TO_BE_FILLED",
+    "git_dirty_digest": "TO_BE_FILLED",
+    "client_binary_sha256": "TO_BE_FILLED",
+    "server_binary_sha256": "TO_BE_FILLED",
+    "random_seed": 20260715001,
+    "rng": "rand_chacha-0.3.1-ChaCha20Rng",
+    "allocation_schedule_file": "allocation-schedule.json",
+    "allocation_schedule_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "analysis_binary_sha256": "TO_BE_FILLED_BEFORE_FREEZE"
+  },
+  "prior": {
+    "trigger_unit": "T0_UNKNOWN_CONDITIONAL",
+    "blanket_foreign_flow_16k_rule": "CONTRADICTED_ON_EXISTING_REPO_SCOPE",
+    "per_five_tuple_rule": "NOT_ACCEPTED",
+    "volume_guard_default": "OFF"
+  },
+  "candidate_models": [
+    "T0_UNKNOWN_CONDITIONAL",
+    "T1_FIVE_TUPLE",
+    "T2A_DESTINATION_IP_PORT_AGGREGATE",
+    "T2B_DESTINATION_IP_AGGREGATE",
+    "T3A_PREFIX_AGGREGATE",
+    "T3B_ASN_AGGREGATE",
+    "T4_CLASSIFIER_X_TOPOLOGY",
+    "T5A_PATH_GLOBAL",
+    "T5B_TIME_POLICY"
+  ],
+  "factors": {
+    "carrier_shape": [
+      "RAW",
+      "REAL_TLS",
+      "SHADOWPIPE_AFTER_CORRECTNESS_GATE"
+    ],
+    "port_class": [
+      "HIGH",
+      "HTTPS_LIKE"
+    ],
+    "concurrency": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "connection_strategy": [
+      "SAME_CONNECTION",
+      "RECONNECT_SAME_DESTINATION",
+      "NEW_CONTROLLED_DESTINATION"
+    ],
+    "controlled_topology_contrast": [
+      "SAME_IP_SAME_PORT_FRESH_TUPLE",
+      "SAME_IP_DIFFERENT_PORT",
+      "SAME_PREFIX_DIFFERENT_IP",
+      "SAME_ASN_DIFFERENT_PREFIX",
+      "DIFFERENT_ASN_SAME_TIME_BLOCK",
+      "SAME_PATH_NEXT_TIME_BLOCK"
+    ],
+    "direction": [
+      "DOWNLINK",
+      "UPLINK",
+      "BALANCED"
+    ],
+    "payload_bytes": [
+      8192,
+      16384,
+      32768,
+      131072,
+      524288,
+      2097152,
+      4194304
+    ],
+    "vm_injected_model": [
+      "NONE",
+      "T1_FIVE_TUPLE",
+      "T2A_DESTINATION_IP_PORT_AGGREGATE",
+      "T2B_DESTINATION_IP_AGGREGATE",
+      "T3A_PREFIX_AGGREGATE",
+      "T3B_ASN_AGGREGATE",
+      "T4_CLASSIFIER_CONDITIONAL",
+      "T5A_PATH_GLOBAL",
+      "T5B_TIME_POLICY"
+    ]
+  },
+  "design": {
+    "sequence": "STAGED_FRACTIONAL_FACTORIAL_SEEDED_RANDOMIZED_BLOCKS",
+    "factor_arrays_are_cartesian": false,
+    "allocation_must_be_materialized_before_outcomes": true,
+    "stages": [
+      {"name": "CORRECTNESS_AND_POSITIVE_CONTROL", "trials": 12},
+      {"name": "FRACTIONAL_FACTORIAL_DISCOVERY", "trials": 64},
+      {
+        "name": "FROZEN_HELD_OUT_POSITIVE_MODELS",
+        "trials": 240,
+        "positive_model_classes": 8,
+        "trials_per_model": 30
+      },
+      {"name": "FROZEN_HELD_OUT_NULL", "trials": 60}
+    ],
+    "max_total_trials": 376,
+    "warmup_trials": 3,
+    "warmup_trials_included_in_correctness_stage": true,
+    "washout_seconds": 2,
+    "trial_timeout_seconds": 30,
+    "max_total_duration_minutes": 240,
+    "max_total_payload_bytes": 8589934592,
+    "shadowpipe_correctness_gate_required": true
+  },
+  "primary_event": {
+    "name": "SILENT_DEGRADATION",
+    "goodput_fraction_of_own_baseline_below": 0.1,
+    "minimum_duration_seconds": 5,
+    "requires_connection_still_established": true,
+    "exclude_on_local_crypto_or_framing_error": true
+  },
+  "outcome_classes": [
+    "COMPLETE",
+    "SILENT_DEGRADATION",
+    "CONNECT_FAIL",
+    "REMOTE_CLOSE",
+    "RST",
+    "CRYPTO_ERROR",
+    "FRAMING_ERROR",
+    "LOCAL_TIMEOUT",
+    "MEASUREMENT_FAULT"
+  ],
+  "metrics": [
+    "BYTES_DELIVERED",
+    "TIME_TO_FIRST_BYTE_MS",
+    "GOODPUT_BYTES_PER_SECOND_WINDOWS",
+    "TRANSPORT_RTT_MS",
+    "RETRANSMISSIONS",
+    "LOSS_OR_ECN_WHEN_AVAILABLE",
+    "EVENT_TIME_MS",
+    "ERROR_CLASS"
+  ],
+  "analysis": {
+    "no_target_event_at_fixed_horizon_is_right_censored": true,
+    "successful_payload_completion_is_competing_terminal_event": true,
+    "implementation_failures_are_noninformative_censoring": false,
+    "method": "COMPETING_RISK_SENSITIVITY_PLUS_BLOCK_CLUSTERED_MODEL_CHECKS",
+    "no_trigger_verdict": "NO_TRIGGER_OBSERVED",
+    "ambiguous_attribution_verdict": "INCONCLUSIVE",
+    "held_out_positive_trials": 240,
+    "held_out_positive_trials_per_model": 30,
+    "minimum_observed_held_out_vm_micro_accuracy": 0.95,
+    "minimum_per_model_wilson_lower_recall": 0.70,
+    "require_complete_confusion_matrix": true,
+    "report_wilson_interval": true,
+    "held_out_null_trials": 60,
+    "null_false_positive_one_sided_confidence": 0.95,
+    "maximum_null_false_positive_upper_bound": 0.05,
+    "zero_error_upper_bound_formula": "1 - alpha^(1/n)"
+  },
+  "outputs": {
+    "payload_capture": false,
+    "stable_client_identifier": false,
+    "real_ip_export": false,
+    "aggregate_only": true,
+    "required_files": [
+      "manifest.json",
+      "environment.json",
+      "aggregate.json",
+      "RESULT.md",
+      "allocation-schedule.json",
+      "cleanup-state.txt",
+      "checksums.sha256"
+    ],
+    "cleanup_invariants": [
+      "NO_TEST_NAMESPACES",
+      "NO_LAB_LISTENERS",
+      "NO_LAB_QDISC_OR_FIREWALL_RULES",
+      "NO_ROUTE_OR_DEFAULT_ROUTE_RESIDUE"
+    ],
+    "publication_blocked_when_cleanup_incomplete": true
+  }
+}

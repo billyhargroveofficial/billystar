@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "evidence": {
+      "min_probe_count": 3,
+      "min_successful_probes": 2,
+      "min_independent_windows": 2,
+      "min_representative_workload_bytes": 1048576,
+      "max_observation_age_ms": 300000,
+      "min_reachability_lower_bound": 0.25,
+      "min_goodput_lower_bound_bytes_per_second": 7168.0
+    },
+    "goodput_scale_bytes_per_second": 262144.0
+  },
+  "requirements": {
+    "access_regime": "destination_ip_and_name_allowlist",
+    "topology": {
+      "kind": "one_of",
+      "topologies": [
+        "domestic_cloud_relay",
+        "cloud_edge"
+      ]
+    },
+    "excluded_failure_domains": [],
+    "now_unix_ms": 1750000000000
+  },
+  "candidates": [
+    {
+      "capabilities": {
+        "carrier_id": "domestic-relay-a",
+        "topology": "domestic_cloud_relay",
+        "access_regimes": [
+          "open_internet",
+          "destination_ip_and_name_allowlist"
+        ],
+        "features": [
+          "native_multiplexing",
+          "cover_path_probe"
+        ],
+        "failure_domains": [
+          {
+            "scope": "provider",
+            "key": "domestic-cloud-a"
+          }
+        ],
+        "max_parallel_streams": 8
+      },
+      "health": {
+        "carrier_id": "domestic-relay-a",
+        "sequence": 42,
+        "state": "healthy",
+        "reachability": {
+          "lower": 0.50,
+          "point": 0.82,
+          "upper": 0.91
+        },
+        "goodput_bytes_per_second": {
+          "lower": 450000.0,
+          "point": 700000.0,
+          "upper": 900000.0
+        },
+        "evidence": {
+          "probe_count": 8,
+          "successful_probes": 7,
+          "independent_windows": 4,
+          "successful_independent_windows": 4,
+          "minimum_successful_workload_bytes": 4194304,
+          "last_observation_unix_ms": 1749999980000,
+          "last_successful_probe_unix_ms": 1749999980000
+        },
+        "active_failure_domains": []
+      }
+    },
+    {
+      "capabilities": {
+        "carrier_id": "direct-browser-tls",
+        "topology": "direct",
+        "access_regimes": [
+          "open_internet"
+        ],
+        "features": [],
+        "failure_domains": [
+          {
+            "scope": "protocol",
+            "key": "direct-tls"
+          }
+        ],
+        "max_parallel_streams": 4
+      },
+      "health": {
+        "carrier_id": "direct-browser-tls",
+        "sequence": 19,
+        "state": "healthy",
+        "reachability": {
+          "lower": 0.56,
+          "point": 0.97,
+          "upper": 0.99
+        },
+        "goodput_bytes_per_second": {
+          "lower": 4000000.0,
+          "point": 5000000.0,
+          "upper": 6000000.0
+        },
+        "evidence": {
+          "probe_count": 12,
+          "successful_probes": 12,
+          "independent_windows": 5,
+          "successful_independent_windows": 5,
+          "minimum_successful_workload_bytes": 8388608,
+          "last_observation_unix_ms": 1749999990000,
+          "last_successful_probe_unix_ms": 1749999990000
+        },
+        "active_failure_domains": []
+      }
+    },
+    {
+      "capabilities": {
+        "carrier_id": "domestic-relay-underprobed",
+        "topology": "domestic_cloud_relay",
+        "access_regimes": [
+          "destination_ip_and_name_allowlist"
+        ],
+        "features": [
+          "half_duplex_streaming"
+        ],
+        "failure_domains": [
+          {
+            "scope": "provider",
+            "key": "domestic-cloud-b"
+          }
+        ],
+        "max_parallel_streams": 2
+      },
+      "health": {
+        "carrier_id": "domestic-relay-underprobed",
+        "sequence": 3,
+        "state": "degraded",
+        "reachability": {
+          "lower": 0.20,
+          "point": 0.75,
+          "upper": 0.88
+        },
+        "goodput_bytes_per_second": {
+          "lower": 90000.0,
+          "point": 150000.0,
+          "upper": 230000.0
+        },
+        "evidence": {
+          "probe_count": 2,
+          "successful_probes": 2,
+          "independent_windows": 1,
+          "successful_independent_windows": 1,
+          "minimum_successful_workload_bytes": 16384,
+          "last_observation_unix_ms": 1749999970000,
+          "last_successful_probe_unix_ms": 1749999970000
+        },
+        "active_failure_domains": []
+      }
+    }
+  ]
+}

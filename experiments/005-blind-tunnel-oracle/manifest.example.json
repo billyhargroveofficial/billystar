@@ -1,0 +1,427 @@
+{
+  "schema_version": "1.0.0",
+  "experiment_id": "005-blind-tunnel-oracle",
+  "manifest_revision": 1,
+  "status": "DESIGN_DRAFT_NOT_FROZEN_NOT_RUN",
+  "created_utc": "2026-07-15T00:00:00Z",
+  "scope": "SYNTHETIC_DISPOSABLE_LINUX_VM_NETNS_ONLY",
+  "has_been_run": false,
+  "field_evidence": false,
+  "maximum_evidence_tier": "E0_DESIGN_ONLY",
+  "primary_source": {
+    "title": "Architectural VPN Vulnerabilities, Disclosure Fatigue, and Structural Failures",
+    "venue": "FOCI_2026",
+    "url": "https://www.petsymposium.org/foci/2026/foci-2026-0007.php",
+    "transfer_boundary": "THE_PAPER_DOES_NOT_ESTABLISH_SHADOWPIPE_LINUX_OR_RU_CENSOR_VULNERABILITY"
+  },
+  "safety": {
+    "macos_live_sing_box": "NO_TOUCH",
+    "host_network_mutation_allowed": false,
+    "host_tun_or_raw_socket_allowed": false,
+    "vm_only_mutation": true,
+    "linux_network_namespaces_required": true,
+    "explicit_lab_token_required": true,
+    "internet_connectivity_allowed": false,
+    "dns_resolution_allowed": false,
+    "cloud_or_public_endpoints_allowed": false,
+    "production_credentials_allowed": false,
+    "payload": "SYNTHETIC_ONLY",
+    "adaptive_scanning_allowed": false,
+    "forbidden_actions": [
+      "STOP_RESTART_SIGNAL_OR_EDIT_MACOS_SING_BOX",
+      "HOST_ROUTE_DNS_PF_NETWORKEXTENSION_OR_TUN_MUTATION",
+      "RAW_PACKET_EMISSION_OUTSIDE_PREFIX_OWNED_VM_NETNS",
+      "CONNECT_LAB_BRIDGE_TO_VM_MANAGEMENT_OR_DEFAULT_INTERFACE",
+      "INTERNET_OR_LAN_TARGETING",
+      "PUBLIC_ADDRESS_OR_DOMAIN_USE",
+      "CLOUD_RESOURCE_CREATION",
+      "PRODUCTION_KEY_OR_SUBSCRIPTION_REUSE",
+      "ADAPTIVE_ADDRESS_PORT_OR_SEQUENCE_SCAN"
+    ],
+    "abort_if": [
+      "RUNNER_IS_NOT_ATTESTED_LINUX_VM",
+      "ANY_TEST_NAMESPACE_HAS_DEFAULT_ROUTE",
+      "LAB_PREFIX_HAS_ROUTE_TO_MANAGEMENT_INTERFACE",
+      "TARGET_NOT_PRESENT_IN_FROZEN_SCHEDULE",
+      "PACKET_CAPTURE_SHOWS_LAB_PACKET_ON_MANAGEMENT_INTERFACE",
+      "CLEANUP_PRECHECK_IS_NOT_EMPTY"
+    ]
+  },
+  "address_space": {
+    "ipv4": "198.18.0.0/15",
+    "ipv6": "2001:db8::/32",
+    "dns_suffix": "lab.invalid",
+    "contains_real_addresses": false,
+    "default_routes_in_test_namespaces": false
+  },
+  "topology": {
+    "isolation": "ALL_VETH_BRIDGES_AND_ROUTES_TERMINATE_INSIDE_DISPOSABLE_VM_NAMESPACES",
+    "namespace_prefix": "zat005-${RUN_ID}",
+    "namespaces": {
+      "attacker": "RAW_PACKET_EMITTER_AND_ATTACKER_VISIBLE_OUTER_CAPTURE",
+      "client": "TUNNEL_ENDPOINT_AND_TCP_STATE_OWNER",
+      "transit": "PRIVATE_NON_NAT_FORWARDING_HOP",
+      "vpn": "TUNNEL_TERMINATION_AND_FROZEN_ROUTE_OR_NAT_RECIPE",
+      "destination": "DETERMINISTIC_SYNTHETIC_TCP_OBJECT",
+      "observer": "READ_ONLY_GROUND_TRUTH_NOT_AVAILABLE_TO_ATTACKER_DETECTOR"
+    },
+    "management_interface_attachment": false,
+    "root_namespace_forwarding_to_physical_interface": false,
+    "attacker_detector_visible_links": [
+      "ACCESS_VICTIM_TO_TUNNEL_SERVER_DIRECTION_ONLY"
+    ],
+    "ground_truth_links": [
+      "ACCESS_INGRESS",
+      "CLIENT_TUNNEL_BOUNDARY",
+      "VPN_EGRESS",
+      "DESTINATION_LINK"
+    ]
+  },
+  "tunnel_implementations": {
+    "synthetic_oracle_calibration_only": true,
+    "eligible_real_vm_tunnels": [
+      "REFERENCE_WIREGUARD_VM",
+      "SHADOWPIPE_AFTER_SUSTAINED_CORRECTNESS_GATE"
+    ],
+    "minimum_real_vm_tunnels_at_freeze": 1,
+    "pool_protocol_claims": false,
+    "configuration_sha256": "TO_BE_FILLED_PER_TUNNEL_BEFORE_FREEZE"
+  },
+  "valid_topology_cells": [
+    {
+      "id": "V4-R0",
+      "address_family": "IPV4",
+      "egress": "ROUTED_NO_TRANSLATION"
+    },
+    {
+      "id": "V4-NP",
+      "address_family": "IPV4",
+      "egress": "SNAT44_PORT_PRESERVING_DETERMINISTIC"
+    },
+    {
+      "id": "V4-NR",
+      "address_family": "IPV4",
+      "egress": "SNAT44_BOUNDED_RANDOMIZED_PORT_RANGE"
+    },
+    {
+      "id": "V6-R0",
+      "address_family": "IPV6",
+      "egress": "ROUTED_NO_TRANSLATION"
+    },
+    {
+      "id": "V6-N66",
+      "address_family": "IPV6",
+      "egress": "STATEFUL_NAT66_LAB_DIAGNOSTIC_ONLY"
+    }
+  ],
+  "security_profiles": {
+    "V0_PERMISSIVE_REPRODUCTION": "DELIBERATELY_PERMISSIVE_VM_ONLY_ORACLE_REPRODUCTION_CELL",
+    "H1_STRICT_INTERFACE_SCOPE": "DROP_ACCESS_INGRESS_TO_VIRTUAL_TUNNEL_PREFIX_BEFORE_LOCAL_OR_FORWARD_PATH",
+    "H2_H1_PLUS_STATEFUL_RESPONSE_FILTER": "H1_PLUS_UNSOLICITED_TUPLE_STATE_REJECTION_AND_RESPONSE_SUPPRESSION",
+    "primary_profiles": [
+      "V0_PERMISSIVE_REPRODUCTION",
+      "H2_H1_PLUS_STATEFUL_RESPONSE_FILTER"
+    ],
+    "H1_role": "MECHANISTIC_SECONDARY"
+  },
+  "tcp_state_strata": [
+    "NO_SOCKET",
+    "LISTEN",
+    "SYN_SENT",
+    "ESTABLISHED_IDLE",
+    "ESTABLISHED_ACTIVE",
+    "TIME_WAIT"
+  ],
+  "packet_treatments": {
+    "maximum_raw_packets_per_trial": 1,
+    "families": [
+      "SYN_ACK_ASSIGNED_TUNNEL_ADDRESS",
+      "SYN_ACK_MATCHING_REMOTE_AND_LOCAL_PORT",
+      "ACK_MATCHING_TUPLE_IN_WINDOW",
+      "RST_MATCHING_TUPLE_IN_WINDOW"
+    ],
+    "matched_negative_controls": [
+      "SHAM_NO_PACKET",
+      "UNASSIGNED_ADDRESS_SAME_LAB_PREFIX",
+      "WRONG_SYNTHETIC_REMOTE_ADDRESS",
+      "UNUSED_SCHEDULED_LOCAL_PORT",
+      "OUT_OF_WINDOW_SEQUENCE_OR_ACK",
+      "NO_SOCKET",
+      "WRONG_ADDRESS_FAMILY",
+      "UNROUTED_DOCUMENTATION_PREFIX_ADDRESS"
+    ],
+    "maximum_candidate_addresses": 16,
+    "maximum_candidate_ports": 32,
+    "maximum_predeclared_sequence_bins": 16,
+    "packet_headers_source": "FROZEN_ALLOCATION_SCHEDULE_ONLY",
+    "payload_bytes": 0,
+    "attacker_detector_excludes_emitted_frame": true
+  },
+  "state_recipe": {
+    "immutable_before_trial": true,
+    "fresh_network_stack_before_destructive_trial": true,
+    "verified_components": [
+      "SOCKET_STATE",
+      "CONNTRACK_STATE",
+      "ROUTE_TABLES",
+      "POLICY_RULES",
+      "NEIGHBOR_STATE",
+      "RESPONSE_RATE_LIMIT_STATE",
+      "TUNNEL_HEALTH"
+    ],
+    "state_mismatch_terminal": "MEASUREMENT_FAULT"
+  },
+  "allocation": {
+    "unit": "PAIRED_BLOCK_WITH_INDEPENDENTLY_RECREATED_MATCHING_AND_NEGATIVE_TRIALS",
+    "sequence": "BALANCED_AB_BA",
+    "rng": "rand_chacha-0.3.1-ChaCha20Rng",
+    "seed": 20260715005,
+    "factor_arrays_are_cartesian": false,
+    "schedule_file": "allocation-schedule.json",
+    "schedule_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "schedule_must_materialize_every_TRIAL_ID": true,
+    "treatment_order_hidden_from_detector": true,
+    "stages": [
+      {
+        "name": "SAFETY_AND_STATE_CORRECTNESS",
+        "non_injection_trials": 24,
+        "outcomes_open_before_detector_freeze": true
+      },
+      {
+        "name": "DETECTOR_CALIBRATION_AND_FREEZE",
+        "synthetic_positive_trials": 80,
+        "null_sham_trials": 60,
+        "real_tunnel_outcomes_open": false
+      },
+      {
+        "name": "ADDRESS_ORACLE_HELD_OUT",
+        "paired_blocks": 120,
+        "trials": 240,
+        "minimum_V0_blocks": 60,
+        "minimum_H2_blocks": 60
+      },
+      {
+        "name": "TUPLE_AND_TCP_STATE_HELD_OUT",
+        "paired_blocks": 240,
+        "trials": 480,
+        "allocation": "FROZEN_FRACTIONAL_FACTORIAL_WITH_ALL_TCP_STATE_AND_VALID_TOPOLOGY_CELLS"
+      },
+      {
+        "name": "RESET_OUTCOME_HELD_OUT",
+        "paired_blocks": 120,
+        "trials": 240,
+        "minimum_V0_blocks": 60,
+        "minimum_H2_blocks": 60
+      }
+    ],
+    "total_paired_blocks": 480,
+    "max_total_trials": 1124,
+    "max_trials_emitting_raw_packet": 1040,
+    "destructive_trial_reuses_previous_connection": false,
+    "order_and_carryover_terms_required": true
+  },
+  "caps": {
+    "max_total_duration_minutes": 240,
+    "max_trial_duration_seconds": 3,
+    "max_total_synthetic_application_payload_bytes": 134217728,
+    "max_raw_packets_total": 1040,
+    "max_raw_packets_per_second": 1,
+    "max_raw_packet_burst": 1,
+    "max_concurrent_test_namespaces": 6,
+    "adaptive_extension_after_outcomes": false
+  },
+  "causal_chain": {
+    "required_fields": [
+      "INJECTION_EMITTED",
+      "SCHEDULED_HEADER_SHA256",
+      "ACCESS_INGRESS_SEEN",
+      "INGRESS_DISPOSITION",
+      "ROUTE_EGRESS_INTERFACE",
+      "POLICY_RULE_ID",
+      "CONNTRACK_STATE",
+      "NAT_MAPPING_CLASS",
+      "KERNEL_TCP_ACTION",
+      "ATTACKER_VISIBLE_OUTER_DELTA",
+      "APPLICATION_OUTCOME"
+    ],
+    "ingress_dispositions": [
+      "PRE_ROUTE_DROP",
+      "LOCAL_INPUT",
+      "FORWARDED",
+      "TUNNEL_INPUT",
+      "UNKNOWN"
+    ],
+    "kernel_tcp_actions": [
+      "SILENT",
+      "SYN_ACK",
+      "RST",
+      "CHALLENGE_ACK",
+      "ACK",
+      "RETRANSMIT",
+      "UNKNOWN"
+    ],
+    "application_outcomes": [
+      "ALIVE",
+      "COMPLETE",
+      "RESET",
+      "TIMEOUT",
+      "CORRUPT",
+      "NOT_APPLICABLE"
+    ],
+    "incomplete_chain_terminal": "MEASUREMENT_FAULT"
+  },
+  "oracle_detector": {
+    "feature_scope": "ATTACKER_VISIBLE_VICTIM_TO_TUNNEL_SERVER_DIRECTION_ONLY",
+    "allowed_features": [
+      "OUTER_PACKET_DIRECTION",
+      "OUTER_PACKET_SIZE",
+      "MONOTONIC_RELATIVE_TIME"
+    ],
+    "forbidden_features": [
+      "EMITTED_ATTACK_PACKET",
+      "PAYLOAD",
+      "INNER_CAPTURE",
+      "SOCKET_TABLE",
+      "CONNTRACK_STATE",
+      "GROUND_TRUTH_COUNTERS",
+      "TRIAL_LABEL"
+    ],
+    "feature_code_sha256": "TO_BE_FILLED_BEFORE_CALIBRATION",
+    "frozen_detector_sha256": "TO_BE_FILLED_AFTER_CALIBRATION_BEFORE_MAIN_OUTCOMES",
+    "frozen_threshold": "TO_BE_FILLED_AFTER_CALIBRATION_BEFORE_MAIN_OUTCOMES",
+    "clock": "CLOCK_MONOTONIC_RAW"
+  },
+  "terminal_classes": [
+    "COMPLETE",
+    "OUTER_ORACLE_EVENT",
+    "APPLICATION_RESET",
+    "NO_ORACLE_EVENT_AT_FIXED_HORIZON",
+    "LOCAL_IMPLEMENTATION_FAULT",
+    "MEASUREMENT_FAULT",
+    "SAFETY_ABORT"
+  ],
+  "analysis": {
+    "primary_estimands": {
+      "address": "P_OUTER_ORACLE_ASSIGNED_MINUS_UNASSIGNED_MATCHED_ADDRESS",
+      "tuple_state": "P_OUTER_ORACLE_MATCHING_MINUS_WRONG_MATCHED_TUPLE_STATE",
+      "reset": "P_APPLICATION_RESET_IN_WINDOW_MINUS_OUT_OF_WINDOW_RST",
+      "hardening": "RD_V0_MINUS_RD_H2_DIFFERENCE_IN_DIFFERENCES"
+    },
+    "primary_binary_test": "EXACT_MCNEMAR",
+    "primary_interval": "PAIRED_RISK_DIFFERENCE_INTERVAL",
+    "multiplicity": "HOLM_ACROSS_ADDRESS_TUPLE_STATE_RESET_PRIMARY_FAMILIES",
+    "secondary_model": "CONDITIONAL_LOGISTIC_REGRESSION_WITH_BLOCK_FIXED_EFFECTS",
+    "secondary_interactions": [
+      "ADDRESS_FAMILY",
+      "VALID_TOPOLOGY_CELL",
+      "TCP_STATE",
+      "TREATMENT_ORDER",
+      "TUNNEL_IMPLEMENTATION"
+    ],
+    "pool_address_families_for_protocol_claim": false,
+    "pool_tunnel_implementations_for_protocol_claim": false,
+    "sparse_interactions_are_descriptive": true,
+    "calibration_positive_trials": 80,
+    "minimum_two_sided_95_percent_wilson_sensitivity_lower_bound": 0.95,
+    "calibration_null_trials": 60,
+    "maximum_one_sided_95_percent_null_false_positive_upper_bound": 0.05,
+    "maximum_measurement_fault_fraction": 0.02,
+    "differential_attrition_allowed": false,
+    "no_event_at_fixed_horizon_is_negative_only_after_complete_chain": true,
+    "ambiguous_verdict": "INCONCLUSIVE"
+  },
+  "acceptance_gates": {
+    "safety": "ALL_VM_ISOLATION_PREFLIGHT_AND_POST_CLEANUP_CHECKS_PASS",
+    "correctness": "LEGITIMATE_SYNTHETIC_TUNNEL_FLOW_COMPLETES_WITH_EXPECTED_NONCE_AND_HASH",
+    "calibration": "WILSON_SENSITIVITY_AND_FALSE_POSITIVE_GATES_PASS_BEFORE_MAIN_OUTCOMES",
+    "oracle_reproduction": "V0_HELD_OUT_MATCHED_DIFFERENTIAL_PASSES_FROZEN_EFFECT_AND_INTERVAL_GATE",
+    "hardening_oracle_upper_bound": 0.05,
+    "hardening_legitimate_completion_noninferiority_margin": -0.05,
+    "hardening_requires_positive_V0_oracle": true,
+    "dns_or_route_leak_allowed": false,
+    "field_graduation_from_this_manifest": false
+  },
+  "falsifiers": [
+    "SYNTHETIC_CALIBRATION_FAILS",
+    "V0_MATCHING_AND_NEGATIVE_RESPONSE_DISTRIBUTIONS_ARE_EQUIVALENT",
+    "SIGNAL_DEPENDS_ON_THE_EMITTED_FRAME_OR_GROUND_TRUTH_FEATURE",
+    "SIGNAL_IS_EXPLAINED_BY_BACKGROUND_TRAFFIC_RATE_LIMIT_ORDER_OR_CAPTURE_LOSS",
+    "H2_RETAINS_ORACLE_DIFFERENTIAL",
+    "H2_BREAKS_LEGITIMATE_TRAFFIC_OR_LEAK_GATE",
+    "CAUSAL_CHAIN_CANNOT_BE_COMPLETED",
+    "RESULT_REQUIRES_CROSS_FAMILY_OR_CROSS_PROTOCOL_EXTRAPOLATION"
+  ],
+  "provenance": {
+    "git_sha": "TO_BE_FILLED",
+    "git_dirty_digest": "TO_BE_FILLED",
+    "vm_image_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "kernel_release": "TO_BE_FILLED_BEFORE_FREEZE",
+    "kernel_config_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "sysctl_snapshot_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "route_policy_recipe_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "nat_firewall_recipe_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "tunnel_binary_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "destination_binary_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "injector_binary_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "capture_filter_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "analysis_binary_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "manifest_sha256": "TO_BE_FILLED_BEFORE_FREEZE",
+    "utc_window": "TO_BE_FILLED_AT_RUN",
+    "monotonic_clock": "CLOCK_MONOTONIC_RAW"
+  },
+  "cleanup": {
+    "unique_run_prefix_required": true,
+    "refuse_stale_prefix": true,
+    "traps": [
+      "EXIT",
+      "INT",
+      "TERM"
+    ],
+    "remove_prefix_owned_only": [
+      "NETWORK_NAMESPACES",
+      "VETHS",
+      "BRIDGES",
+      "QDISCS",
+      "NFTABLES_TABLES",
+      "LISTENERS",
+      "TEMPORARY_FILES"
+    ],
+    "postconditions": [
+      "NO_PREFIX_OWNED_NAMESPACE_LINK_TABLE_OR_QDISC",
+      "NO_LAB_LISTENER_OR_PROCESS",
+      "NO_ROUTE_FOR_LAB_PREFIXES",
+      "NO_MANAGEMENT_INTERFACE_QDISC_CHANGE",
+      "MACOS_SING_BOX_PID_AND_START_TIME_UNCHANGED"
+    ],
+    "failure_status": "CLEANUP_INCOMPLETE",
+    "cleanup_failure_blocks_publication": true
+  },
+  "outputs": {
+    "raw_payload_capture": false,
+    "raw_header_and_ground_truth_access_controlled": true,
+    "publish_real_addresses": false,
+    "publish_stable_client_identifier": false,
+    "publishable_bundle": "AGGREGATES_REDACTED_HEADER_SUMMARIES_EXCLUSIONS_AND_CHECKSUMS_ONLY",
+    "required_files": [
+      "manifest.json",
+      "allocation-schedule.json",
+      "topology.json",
+      "detector-card.json",
+      "aggregate.json",
+      "exclusions.json",
+      "cleanup-state.txt",
+      "RESULT.md",
+      "checksums.sha256"
+    ],
+    "allowed_pre_run_wording": "DESIGN_DRAFT_NOT_RUN",
+    "allowed_calibration_only_wording": "HARNESS_ORACLE_RECOVERED",
+    "allowed_held_out_real_tunnel_positive_wording": "ORACLE_REPRODUCED_IN_SCOPED_VM_CELL",
+    "allowed_vm_negative_wording": "NO_ORACLE_OBSERVED_IN_SCOPED_VM_CELL",
+    "forbidden_wording": [
+      "FIELD_BYPASS",
+      "TSPU_VULNERABLE",
+      "ALL_VPNS_VULNERABLE",
+      "MITIGATION_PROVEN_GLOBALLY"
+    ]
+  }
+}
