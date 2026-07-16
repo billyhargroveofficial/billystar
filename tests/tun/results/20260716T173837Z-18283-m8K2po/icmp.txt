@@ -1,0 +1,25 @@
+PING 198.18.0.2 (198.18.0.2) 1200(1228) bytes of data.
+1208 bytes from 198.18.0.2: icmp_seq=1 ttl=63 time=0.524 ms
+1208 bytes from 198.18.0.2: icmp_seq=2 ttl=63 time=0.759 ms
+1208 bytes from 198.18.0.2: icmp_seq=3 ttl=63 time=0.765 ms
+1208 bytes from 198.18.0.2: icmp_seq=4 ttl=63 time=0.781 ms
+1208 bytes from 198.18.0.2: icmp_seq=5 ttl=63 time=0.854 ms
+1208 bytes from 198.18.0.2: icmp_seq=6 ttl=63 time=0.822 ms
+1208 bytes from 198.18.0.2: icmp_seq=7 ttl=63 time=0.976 ms
+1208 bytes from 198.18.0.2: icmp_seq=8 ttl=63 time=42.3 ms
+1208 bytes from 198.18.0.2: icmp_seq=9 ttl=63 time=0.896 ms
+1208 bytes from 198.18.0.2: icmp_seq=10 ttl=63 time=1.02 ms
+1208 bytes from 198.18.0.2: icmp_seq=11 ttl=63 time=41.7 ms
+1208 bytes from 198.18.0.2: icmp_seq=12 ttl=63 time=0.937 ms
+1208 bytes from 198.18.0.2: icmp_seq=13 ttl=63 time=50.3 ms
+1208 bytes from 198.18.0.2: icmp_seq=14 ttl=63 time=1.03 ms
+1208 bytes from 198.18.0.2: icmp_seq=15 ttl=63 time=0.729 ms
+1208 bytes from 198.18.0.2: icmp_seq=16 ttl=63 time=1.06 ms
+1208 bytes from 198.18.0.2: icmp_seq=17 ttl=63 time=0.916 ms
+1208 bytes from 198.18.0.2: icmp_seq=18 ttl=63 time=0.982 ms
+1208 bytes from 198.18.0.2: icmp_seq=19 ttl=63 time=0.990 ms
+1208 bytes from 198.18.0.2: icmp_seq=20 ttl=63 time=43.4 ms
+
+--- 198.18.0.2 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 19357ms
+rtt min/avg/max/mdev = 0.524/9.586/50.309/17.486 ms

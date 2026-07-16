@@ -177,6 +177,66 @@ The paired unit requires the restore gate, starts after locally configured
 state, and sends SIGTERM with a 90-second cleanup budget. It does not configure
 the static underlay; that remains an explicit machine-specific prerequisite.
 
+## Network-change process replacement
+
+The Linux full-tunnel client opens a read-only rtnetlink source after its
+underlay has been captured. Notifications are bounded invalidation triggers,
+not authority: ten event kinds coalesce into a fixed two-byte set, one datagram
+is capped at 64 KiB, and one readiness drain is capped at 256 datagrams.
+Unexpected sender, `ENOBUFS`, kernel overrun, malformed input, generation
+overflow or a source that does not quiesce all require fail-closed replacement.
+
+The active IPv4-underlay source observes link, IPv4 address, route and
+policy-rule groups. It suppresses Shadowpipe's own protocol-186 route
+notifications only after a fresh exact live census. The only link-event
+exclusion is a structurally exact `RTM_NEWLINK` transition whose change mask is
+only `IFF_PROMISC`; this prevents a packet observer from restarting the VPN.
+Resolver APIs, explicit DHCP lease/lifetime events and suspend/resume are not
+yet integrated.
+
+When an active generation receives any other topology invalidation, it:
+
+1. creates or adopts the durable restart barrier and strictly verifies its WAL,
+   table and kernel handle as `Active`;
+2. closes sessions and the non-persistent TUN;
+3. removes invalidated DNS, routes, endpoint bypasses and the main kill-switch
+   in fail-closed order;
+4. verifies the restart barrier again;
+5. exits nonzero, leaving direct L3 output blocked.
+
+For an incomplete setup transaction, the replacement path may instead retain a
+non-`Conflict` main WAL and exact remaining resources so startup recovery can
+finish them. It still closes the TUN and retains the strict durable barrier.
+
+The installed
+[`shadowpipe-client-full-tunnel.service`](shadowpipe-client-full-tunnel.service)
+uses exactly `Restart=always` and `RestartSec=1s`, so systemd starts a fresh
+process that performs startup recovery and re-observes the underlay. A client
+started manually does not self-re-exec: after this exit, restart it manually
+from the console while leaving the lockdown in place. Do not use
+`--release-lockdown` unless direct networking is intentionally desired.
+
+An operator `systemctl stop` is different from an unexpected process exit:
+systemd suppresses the configured restart, sends SIGTERM, and the client leaves
+the durable barrier active after main teardown. The current isolated evidence
+run placed a manager-stop gate before SIGTERM and proved no third generation
+appeared.
+
+Run
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md),
+with tracked compact
+[`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md),
+pinned to `81f188f772cc6b674fde748a361691f1bda19691`, replaced a real
+`c0` default route with `c1`. Generation 1 reported exact
+`DefaultRouteChanged`, exited status 1 behind strict durable lockdown with the
+main WAL absent, and generation 2 became `Active` through `c1` before releasing
+the intermediate barrier. A real promiscuous capture left its PID/start identity
+and restart count unchanged. This was an isolated harness that emulated the
+unit's restart/stop semantics; it did not run real systemd PID 1 and is not
+production, reboot, native macOS/Windows or field evidence. The complete
+170,055,680-byte sealed bundle and its 168,317,113-byte raw c1 IPv4 pcap remain
+local/ignored; the compact index publishes pcap hashes separately.
+
 ## First activation, then enable the reboot gate
 
 This mechanism preserves fail-closed continuity after an owned WAL has been

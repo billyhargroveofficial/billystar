@@ -1,0 +1,1 @@
+{"bypass_gateway":"10.233.0.1","bypass_interface":"c1","generation":26,"operation_count":8,"phase":"active","resource_census":{"dns":1,"firewall":2,"firewall_endpoint":1,"route":3,"tun":1},"schema_version":3}

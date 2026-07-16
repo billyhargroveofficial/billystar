@@ -1,71 +1,96 @@
 # Scoped security and current-source validation audit — 2026-07-16
 
-Status: the executable code and laboratory runners described here passed the
-bounded current-source gates listed below. This is engineering evidence, not an
-independent cryptographic audit, production certification, formal proof,
-field-censorship result, or claim that Shadowpipe is unblockable or
-indistinguishable.
+Status: executable-source commit
+`81f188f772cc6b674fde748a361691f1bda19691` has one current-source privileged
+Linux full-TUN **PASS**, scoped to an isolated disposable OrbStack clone and
+private namespaces. Later edits to this audit are documentation drift, not
+executable drift. Earlier bundles in this document remain valid captured-source
+snapshots for their own frozen commits; they are not substitutes for the tested
+executable baseline. This is engineering evidence, not an independent
+cryptographic audit, production certification, formal proof, field-censorship
+result, or claim that Shadowpipe is unblockable or indistinguishable.
 
 This document supersedes the implementation-status conclusions in the
 historical [2026-07-15 dependency and key-storage audit](security-audit-2026-07-15.md).
-Older result bundles remain useful diagnostics, but only the five final bundles
-in this document support the current scoped PASS statements.
+Older result bundles remain useful diagnostics and scoped historical evidence,
+but only
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
+supports a privileged current executable-source Linux full-TUN statement.
 
 ## Executive verdict
 
-The current implementation has credible laboratory evidence for:
+The current commit has credible scoped laboratory evidence for:
 
-- native Linux ARM64 compilation, tests, strict Clippy and runner portability;
 - an authenticated Linux IPv4 OS-TUN path over production-gated REALITY;
 - fail-closed rejection of a foreign pre-existing named TUN;
-- same-boot `SIGKILL` recovery for the complete eight-resource Linux host-state
-  journal;
-- an early-userspace Linux local-OUTPUT lockdown across a real guest reboot;
-- native Windows 11 ARM64 H2/no-TUN authenticated echo and a 1 MiB transfer.
+- exact `c0 -> c1` default-route replacement causing process replacement:
+  generation 1 exits nonzero under strict durable lockdown and generation 2
+  reaches `Active` through `c1`;
+- ignoring a PROMISC-only link notification while a real promiscuous observer
+  leaves the active client PID/start time unchanged;
+- connected IPv6 fail-closed egress blocking, with empty directional pcaps and
+  positive `SP6` DROP counters, without claiming an IPv6 tunnel;
+- manager-gated final shutdown with no generation 3, continued IPv4/IPv6
+  lockdown and explicit release;
+- ICMP/TCP/UDP/DNS, a verified 64 MiB transfer and carrier-cut recovery within
+  a seven-second upper bound.
+
+Captured snapshots additionally record native Linux ARM64 portability, a
+same-boot eight-resource crash matrix, an early-userspace reboot lockdown cell,
+and Windows 11 ARM64 H2/no-TUN behavior. They are not validation of the current
+executable-source baseline.
 
 It does **not** yet have evidence for:
 
 - native Windows Wintun, macOS Network Extension/TUN, Android VpnService, or
   complete IPv6 behavior;
+- the tested handoff path under a real systemd PID 1 service manager, resolver
+  or DHCP changes, or suspend/resume;
 - paired tunnel recovery across reboot, filesystem/power-loss recovery, hostile
   same-UID/root races, or distributed replay consistency;
 - fleet enrollment, offline-root ceremony, threshold authorization, staged
   production rollout, or rollback drills;
 - formal verification, independent review, or resistance to any real censor.
 
-The resident Mac was only an unprivileged observer, build coordinator and VM
-orchestrator. Its live sing-box was not stopped, restarted, signalled, reloaded,
-reconfigured or bypassed.
+The resident Mac was only an unprivileged observer, source/evidence stream
+coordinator and VM orchestrator. Its live sing-box was not stopped, restarted,
+signalled, reloaded, reconfigured or bypassed. A macOS sandbox is not treated as
+a separate network stack; native macOS work remains assigned to the separate
+[host-isolated macOS lab design](mac-host-isolated-lab.md).
 
-## Final evidence set
+## Evidence set and source drift
 
-The Linux ARM64 source snapshot froze 187 files with manifest SHA-256
+The current privileged bundle pinned an exact clean `git archive` of
+`81f188f772cc6b674fde748a361691f1bda19691`, transferred it into the isolated
+guest through bounded stdin, built and ran from guest-local storage, and
+returned a validated sealed archive through bounded stdout. It contains 745
+checksum entries and records valid host safety, clone cleanup, evidence sealing,
+source isolation and private-material scans.
+
+The older Linux ARM64 snapshot froze 187 files with manifest SHA-256
 `fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
-At capture time it matched 187/187. A read-only post-documentation recheck now
-matches all 165/165 non-Markdown inputs and 177/187 files overall. The exact
-ten changed files are documentation only: `README.md`, `SECURITY.md`,
-`docs/architecture-causal-carrier-plane.md`, `docs/claims-ledger.md`,
-`docs/lab-vm-runbook.md`, `docs/phase3-production-safety.md`,
-`docs/protocol-v3-authentication.md`, `docs/related-work-matrix-2026.md`, this
-audit and `docs/threat-model-2026.md`. Therefore the executable code and
-runners remain the tested bytes, while a whole-worktree manifest correctly
-records documentation drift.
+It and the other pre-`81f188f` bundles remain evidence for the exact source they
+captured. Subsequent executable network-change and runner changes mean they
+must not be cited as validation of the current executable source, even when
+their individual captured results remain internally valid.
 
-| Evidence bundle | Exact result | Scope established | Explicit non-claim |
+| Evidence bundle | Source relation | Scope established | Explicit non-claim |
 |---|---|---|---|
-| [Linux ARM64 `20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md) | `PASS`; 342/342 checksum entries; 187-file source manifest; no-default 671 passed, 0 failed, 3 ignored; all-features 685 passed, 0 failed, 3 ignored; both strict Clippy profiles valid | Native ARM64 CPU/filesystem portability, format, metadata, host ShellCheck, guest `bash -n`, five correctly partitioned runner self-tests | No privileged route, DNS, firewall, TUN, namespace, service or field behavior |
-| [Full-TUN `20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md) | `PASS`; 573/573 checksum entries; ICMP 20/20; TCP 561,905,664 bytes; UDP 6,252,976 bytes, 0/5,092 lost; matching 64 MiB SHA-256 `5ca1b38d0543084e1a1027831af37e3552e47ac34eb42bb8012c26ece4f67510`; recovery upper bound 8 seconds | Disposable OrbStack Linux IPv4/private-netns OS-TUN, REALITY, mandatory protocol-v3 credential/allowlist, DNS, leak controls, carrier cut/reconnect, replay-store file contract, explicit lockdown release and foreign named-TUN collision | No IPv6, native Windows/macOS TUN, production, censor or continuous-host-monitor result |
-| [Phase 3 `20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md) | `PASS`; 29/29 scenarios; 1,443/1,443 checksum entries; guest, cleanup, host-safety, clone absence and evidence seal valid | Fresh net+mount+PID namespace per scenario; same-boot `SIGKILL` cuts across schema-v3 all-eight-resource apply and recovery boundaries; durable conflict behavior | No real reboot of an active tunnel, torn sector, power-loss writeback, hostile privileged writer or field result |
-| [Reboot lockdown `20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md) | `PASS`; 650/650 checksum entries; boot IDs `87e5f499-ba07-49d2-b822-31357ce16111` and `add60ca5-ecdc-4bf6-9743-6d90a0aa3d10`; restore active 2,995 microseconds before networkd start | One disposable Linux guest; native nft inet/output L3 barrier across a real reboot; loopback allow, non-loopback IPv4 deny, exact explicit release | No paired client/server tunnel, initrd, L2/AF_PACKET, FORWARD, container-netns, production or censorship result |
-| [Windows ARM64 `20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md) | `PASS`; 891/891 checksum entries; ARM64 PE 5,072,384 bytes, SHA-256 `2734e79f98866910aa8e0386af4ff630191b0a72fd1945177f078cb69d500bad`; exact nonce and 1,048,576-byte echo; 2 authenticated sessions and 1 rejection | Native Windows 11 ARM64 no-default build with `-D warnings`; H2 chunk carrier; mandatory v3 auth; missing-pin and unenrolled-device negative controls; Windows route/DNS digests unchanged | No Wintun, Windows adapter/firewall/route mutation, leak proof, production or field result |
+| [Linux full-TUN `20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md) | **Current executable source `81f188f`; PASS; 745 checksum entries** | Isolated disposable Linux/private-netns IPv4 TUN; REALITY/v3 auth; exact default-route handoff and process replacement; PROMISC regression; connected-IPv6 OUTPUT blocking; manager-stop/no-generation-3; ICMP/TCP/UDP/DNS/64 MiB/cut recovery; host/source/secret/cleanup safety | No real systemd PID 1, resolver/DHCP/suspend event, IPv6 tunnel, native macOS/Windows, production, field or censorship result |
+| [Linux ARM64 `20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md) | Captured snapshot; `PASS`; 342/342 checksum entries | Native ARM64 CPU/filesystem portability, format, metadata and frozen test/Clippy matrices | Not current executable source; no privileged route, DNS, firewall, TUN, namespace, service or field behavior |
+| [Earlier full-TUN `20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md) | Captured snapshot; `PASS`; 573/573 checksum entries | Earlier disposable Linux IPv4/private-netns TUN, carrier cut/reconnect, explicit lockdown release and foreign named-TUN collision | Not current executable source; no network-change process-replacement proof |
+| [Phase 3 `20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md) | Captured snapshot; `PASS`; 1,443/1,443 checksum entries | Same-boot `SIGKILL` cuts across schema-v3 eight-resource apply and recovery boundaries | Not current executable source; no real reboot, power-loss or current handoff proof |
+| [Reboot lockdown `20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md) | Captured snapshot; `PASS`; 650/650 checksum entries | Early-userspace local Linux L3 OUTPUT barrier across one guest reboot | Not current executable source; no paired tunnel or current handoff proof |
+| [Windows ARM64 `20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md) | Captured snapshot; `PASS`; 891/891 checksum entries | Native Windows 11 ARM64 H2/no-TUN authentication and exact 1 MiB echo | Not current executable source; no Wintun, route/firewall/adapter mutation or leak proof |
 
-All five manifests were generated as relative SHA-256 evidence inventories and
-rechecked. They are not externally signed, independently timestamped or
-laboratory-attested.
+The manifests are relative SHA-256 evidence inventories. They are not externally
+signed, independently timestamped or laboratory-attested.
 
-## Local and dependency gates
+## Captured local and dependency gates
 
-The final code path passed the following local gate classes:
+The pre-`81f188f` frozen snapshot passed the following local gate classes. These
+commands document captured regression evidence and must not be represented as a
+fresh matrix for the current executable source:
 
 ```text
 cargo fmt --all -- --check
@@ -81,17 +106,18 @@ all five VM/Windows runners: --self-test
 target/tools/cargo-audit/bin/cargo-audit audit -D warnings
 ```
 
-The final frozen native Linux ARM64 snapshot records 671 passed tests in the
+That frozen native Linux ARM64 snapshot records 671 passed tests in the
 no-default profile and 685 in the all-features profile, with 0 failed and 3
 ignored in each. A later local release-suite run after the security fixes
 registered 709 tests and passed. These counts describe different harness
 aggregations and must not be added together.
 
-The dependency gate used cargo-audit 0.22.2, scanned 276 locked packages against
-a fetched RustSec database containing 1,160 advisories, and returned success
-under `-D warnings`. This is a known-advisory, yanked-package and unmaintained
-dependency check. It is not source review, provenance verification,
-reproducible-build attestation or evidence against undisclosed vulnerabilities.
+The captured dependency gate used cargo-audit 0.22.2, scanned 276 locked
+packages against a fetched RustSec database containing 1,160 advisories, and
+returned success under `-D warnings`. This is a known-advisory, yanked-package
+and unmaintained dependency check. It is not source review, provenance
+verification, reproducible-build attestation or evidence against undisclosed
+vulnerabilities.
 
 `scripts/test-live-services.sh` was deliberately not run because it can start or
 reuse a remote privileged tunnel and is not a read-only local regression gate.
@@ -309,15 +335,19 @@ weakening the no-touch rule.
 
 ### VM lifecycle
 
-The shared lifecycle lock serializes Shadowpipe runners. Start, stop, reboot and
-guest commands use a strictly parsed bound opaque clone ID. OrbStack 2.2.1 was
-observed to panic on delete-by-ID despite advertising support, so deletion by
-name is permitted only after an immediate name-to-bound-ID equality check and
-then a 60-second name-and-ID absence proof.
+The shared lifecycle lock serializes Shadowpipe runners. The current full-TUN
+runner clones a dedicated stopped source base whose configuration is required
+to be both VM-isolated and network-isolated, with no mounted Mac filesystem,
+forwarded ports or SSH agent. The first guest action installs and re-proves an
+ownership marker. Pinned source enters only through bounded stdin; validated
+sealed evidence exits only through bounded stdout. Start, stop and guest
+commands use a strictly parsed bound opaque clone ID. Deletion by name is
+permitted only after an immediate name-to-bound-ID equality check and then a
+name-and-ID absence proof.
 
 An unrelated same-host OrbStack lifecycle operator remains outside the harness
-trust boundary. The source OrbStack VM `arch` finished stopped; the Windows 11
-VM finished suspended.
+trust boundary. The dedicated source base finished stopped. The current Linux
+run made no statement about Windows VM state.
 
 ### Filesystem and operator
 
@@ -391,6 +421,8 @@ diagnostics, not members of the final evidence set.
 - Complete IPv6 full-TUN route/firewall/DNS/leak/recovery coverage.
 - Native Windows Wintun and macOS Network Extension/TUN matrices; Android
   VpnService implementation and mobile bootstrap/leak audit.
+- Current executable-source validation under a real systemd PID 1 manager, plus
+  resolver, DHCP and suspend/resume network-change matrices.
 - Paired client/server recovery across reboot, plus torn-write, fsync-order,
   power-loss and whole-storage rollback experiments on disposable media.
 - Threshold/offline-root service authorization that contains compromise of one

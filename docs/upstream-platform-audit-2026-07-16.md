@@ -45,6 +45,43 @@ Windows API за существующей Shadowpipe platform boundary.
 5. полный inner IPv6 tunnel появляется только после route/DNS/firewall/PMTUD,
    recovery и leak matrices.
 
+## Current Shadowpipe implementation delta
+
+After this upstream audit, Shadowpipe independently implemented the conservative
+Linux event path behind its own contracts:
+
+- ten typed invalidations coalesce in an exact two-byte `u16` set with a
+  monotonic, overflow-poisoned generation;
+- the active IPv4-underlay rtnetlink source observes link, IPv4 address, route
+  and policy-rule groups under fixed datagram/drain bounds;
+- event payloads never authorize state. External changes or source loss require
+  durable-lockdown process replacement and fresh startup observation;
+- protocol-186 owned-route notifications are suppressible only after an exact
+  live route census;
+- only a structurally exact `RTM_NEWLINK` `IFF_PROMISC`-only observer
+  transition is excluded. Mixed link changes remain fail-closed.
+
+Current executable-source run
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md),
+with tracked compact
+[`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md),
+pinned to `81f188f772cc6b674fde748a361691f1bda19691`, replaced a real
+`c0` default route with `c1`. Generation 1 exited status 1 after strict durable
+lockdown with its main WAL absent; generation 2 became `Active` through `c1`.
+A real promiscuous capture did not change generation-2 PID/start identity or
+restart count. The final manager-stop gate preceded SIGTERM and no generation 3
+appeared.
+
+This closes only a synthetic isolated Linux IPv4 full-TUN/default-route handoff
+cell. The harness emulated `Restart=always`/`RestartSec=1s`; it did not run real
+systemd PID 1. Resolver/DHCP/suspend observation, native macOS/Windows sources,
+outer/inner IPv6 and in-process migration remain open. Five earlier Linux
+ARM64/full-TUN/host-recovery/reboot/Windows bundles are snapshot-bound after
+executable-source drift; this run does not refresh their current-source status.
+The complete 170,055,680-byte sealed bundle, including the 168,317,113-byte raw
+c1 IPv4 pcap, remains local/ignored; the tracked compact index publishes pcap
+hashes separately.
+
 ## Зафиксированные audit inputs
 
 | Проект | Ревизия | Роль в аудите | Лицензия и граница |
@@ -195,9 +232,9 @@ egress/NAT/service hardening ведётся отдельно.
 
 | Client platform | Что уже доказано в Shadowpipe | Clean-room mechanisms to adopt/adapt | Production Alpha gate |
 |---|---|---|---|
-| Linux client | Native ARM64 build/test; disposable IPv4 full-TUN; REALITY/v3; route/DNS/firewall transaction; same-boot WAL recovery; early reboot lockdown | Native netlink and nftables adapters; systemd-resolved control; `SO_MARK`/interface binding; netlink event coalescing; actual-kernel reconciliation; typed MTU/offload observation | IPv4 paired reboot recovery, power-loss/torn-write matrix, native adapters behind WAL, default IPv6 block, distro/kernel/network-manager matrix and 72-hour soak |
-| macOS | Rust/core portability only; no native system VPN or host mutation evidence | `NEPacketTunnelProvider`; `NEPacketTunnelNetworkSettings`; provider-owned packet flow; `NWPathMonitor`; sleep/wake/reassert; Keychain; signed/notarized app plus minimal helper if required | Disposable macOS VM or sacrificial Mac proves routes, DNS, IPv6 block, path changes, sleep/wake, provider crash and uninstall without touching the live resident Mac VPN |
-| Windows | Native ARM64 no-TUN H2/v3 client, auth negative controls and exact transfer; route/DNS unchanged | Wintun; IP Helper route/address/DNS APIs; WFP kill-switch; fixed authenticated named pipe; service SID/ACL; Authenticode pairing; power and interface notifications | Native Wintun packet path, exact owned-state WAL, IPv4 leak matrix, IPv6 block, DNS leak prevention, suspend/resume, service crash/reboot and clean uninstall in disposable Windows VM |
+| Linux client | Current executable-source isolated IPv4 full-TUN/default-route process replacement; REALITY/v3; route/DNS/firewall transaction; connected IPv6 OUTPUT block. Earlier ARM64, all-resource crash and reboot results are snapshot-bound | Complete native netlink route/rule/address mutation and nftables adapters; systemd-resolved control; `SO_MARK`/interface binding; resolver/DHCP/suspend events; typed MTU/offload observation | Real systemd PID-1 replacement, fresh ARM64/crash/reboot cells, IPv4 paired reboot recovery, power-loss/torn-write matrix, distro/kernel/network-manager matrix and 72-hour soak |
+| macOS | Rust/core portability only; no native system VPN or host mutation evidence | `NEPacketTunnelProvider`; `NEPacketTunnelNetworkSettings`; provider-owned packet flow; `NWPathMonitor`; sleep/wake/reassert; Keychain; signed/notarized app plus minimal helper if required | A separate macOS VM or sacrificial Mac, as defined by [`mac-host-isolated-lab.md`](mac-host-isolated-lab.md), proves routes, DNS, IPv6 block, path changes, sleep/wake, provider crash and uninstall without touching the resident Mac VPN |
+| Windows | Snapshot-bound native ARM64 no-TUN H2/v3 client, auth negative controls and exact transfer; route/DNS unchanged | Wintun; IP Helper route/address/DNS APIs; WFP kill-switch; fixed authenticated named pipe; service SID/ACL; Authenticode pairing; power and interface notifications | Fresh current-source portability plus native Wintun packet path, exact owned-state WAL, IPv4 leak matrix, IPv6 block, DNS leak prevention, suspend/resume, service crash/reboot and clean uninstall in disposable Windows VM |
 
 ## Ranked implementation backlog
 
@@ -210,7 +247,7 @@ hardening, performance or later protocol scope.
 | Rank | Mechanism | Required Shadowpipe behavior | Acceptance gate |
 |---|---|---|---|
 | `P0.1` | Platform capability/backend contract | Pure desired/observed state, stable interface identity, monotonic generation, explicit supported capabilities and fail-closed ambiguity | Missing, stale, future, ambiguous and capability-incomplete observations produce zero OS mutation |
-| `P0.2` | Event-driven reconciliation | Linux netlink, Apple `NWPathMonitor`, Windows IP Helper/power events only mark state dirty; worker re-reads actual OS state | Event storms coalesce into bounded work; stale generations cannot publish routes, DNS or carrier sockets |
+| `P0.2` | Event-driven reconciliation | Linux netlink, Apple `NWPathMonitor`, Windows IP Helper/power events only mark state dirty; worker re-reads actual OS state. Linux currently implements conservative process replacement and fresh startup observation | Event storms coalesce into bounded work; stale generations cannot publish routes, DNS or carrier sockets; resolver/DHCP/suspend and native Apple/Windows sources remain required |
 | `P0.3` | Default IPv6 block | Non-loopback IPv6 cannot bypass an IPv4-only tunnel; DNS filtering is not treated as sufficient | TCP/UDP/ICMPv6 and DNS/HTTPS IPv6-hint leak tests stay blocked before start, during carrier cut, after crash and through reboot |
 | `P0.4` | Linux native backend | Typed netlink routes/rules/addresses, nftables transaction, resolved adapter and pre-connect mark/bind | Exact foreign-state preservation, WAL cuts around every operation and parity with the existing IPv4 full-TUN bundle |
 | `P0.5` | macOS NetworkExtension backend | Provider owns network settings and packet flow; Rust core owns protocol/packet processing; no production standalone-utun path | IPv4 TUN, DNS, IPv6 block, provider crash, reassert, path change and sleep/wake pass in isolated Apple lab |
@@ -371,11 +408,17 @@ still decides which carrier classes are eligible for production traffic.
 
 ### Linux gate
 
+The current isolated run closes one narrow item: a real netns default-route
+replacement from `c0` to `c1` caused exact `DefaultRouteChanged`, strict
+generation replacement and no leak-barrier release before generation 2 became
+Active. It does not close the broader matrix below.
+
 - x86_64 and ARM64;
 - Ubuntu/Debian, Fedora and Arch;
 - NetworkManager, systemd-networkd and systemd-resolved combinations;
 - foreign TUN, route, nft table/chain and DNS ownership collisions;
-- default-interface disappearance and replacement;
+- default-interface disappearance and replacement across real managers,
+  including DHCP/resolver consequences;
 - carrier endpoint address rotation;
 - IPv6 literal/DNS/application leaks while inner IPv6 is disabled;
 - `SIGKILL`, reboot and power-cut points around every native backend operation;
@@ -385,6 +428,9 @@ still decides which carrier classes are eligible for production traffic.
 ### macOS gate
 
 - disposable Apple environment only; never the resident Mac with live sing-box;
+- follow the separate
+  [`host-isolated macOS lab design`](mac-host-isolated-lab.md); application
+  sandboxing alone does not create another Darwin network stack;
 - app extension and system extension variants as applicable;
 - provider start/stop/reassert/crash;
 - Wi-Fi/Ethernet changes, constrained/expensive paths and sleep/wake;
@@ -416,8 +462,9 @@ still decides which carrier classes are eligible for production traffic.
   workflow intentionally avoids code reuse.
 - It does not close native macOS or Windows TUN gates.
 - It does not add IPv6 support merely by documenting the staged decision.
-- It does not change the evidence tier of existing Linux VM or Windows no-TUN
-  bundles.
+- The new Linux handoff run does not refresh the snapshot-bound Linux ARM64,
+  all-resource crash, reboot or Windows no-TUN bundles.
+- It does not prove the installed units under real systemd PID 1.
 - It does not authorize touching, restarting or replacing the live macOS
   sing-box.
 

@@ -1,9 +1,14 @@
 # VM-only lab runbook
 
-Статус: на 2026-07-16 запечатаны пять раздельных current-source synthetic
-scopes: native Linux ARM64 portability
+Статус: на 2026-07-16 current executable-source commit
+`81f188f772cc6b674fde748a361691f1bda19691` имеет один privileged synthetic
+Linux full-TUN PASS; последующие изменения этого runbook считаются
+documentation drift:
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md).
+Более ранние PASS bundles сохраняют значение только как captured-source
+snapshots своих frozen commits: native Linux ARM64 portability
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md),
-full-TUN IPv4/netns
+предыдущий full-TUN IPv4/netns
 [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md),
 same-boot Phase-3 crash/recovery
 [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md),
@@ -11,11 +16,10 @@ early-userspace reboot lockdown
 [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
 и Windows 11 ARM64 H2 no-TUN
 [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md).
-Stage A всё ещё частична: short-write/reorder/abrupt-close matrix, IPv6,
-Windows Wintun/leak, macOS native TUN/route и default `tls-chrome` build
-остаются отдельными gates; causal protocols 001–003 не запускались. Старые
-bundles — historical/diagnostic, а не current-source замена. Любое отклонение
-от invariant ниже останавливает эксперимент.
+Stage A всё ещё частична: real systemd PID 1, resolver/DHCP/suspend event
+matrices, IPv6 tunnel, Windows Wintun/leak, macOS native TUN/route и default
+`tls-chrome` build остаются отдельными gates; causal protocols 001–003 не
+запускались. Любое отклонение от invariant ниже останавливает эксперимент.
 
 ## Absolute invariant
 
@@ -23,10 +27,12 @@ bundles — historical/diagnostic, а не current-source замена. Любо
 
 Mac = build/read-only safety observer плюс unprivileged loopback-only
 deterministic correctness smoke на ephemeral owned ports; non-loopback bind и
-любая network mutation запрещены. OrbStack Arch = единственная Linux-машина для
-netns/qdisc/nft mutation. Parallels Windows 11 ARM64 = native client/portability
-и cross-VM socket control без Linux network mutation. Ни один тест не требует
-отключения host VPN.
+любая network mutation запрещены. Linux mutation выполняется только в
+disposable clone выделенной остановленной isolated OrbStack base VM; исходная
+base не является рабочим test guest. Parallels Windows 11 ARM64 = native
+client/portability и cross-VM socket control без Linux network mutation. Ни один
+тест не требует отключения host VPN. Детальный boundary для native macOS:
+[`mac-host-isolated-lab.md`](mac-host-isolated-lab.md).
 
 ## 1. Роли
 
@@ -34,7 +40,7 @@ netns/qdisc/nft mutation. Parallels Windows 11 ARM64 = native client/portability
 |---|---|---|
 | macOS host | Reproducible build, hash artefacts, read-only safety observation, loopback-only correctness smoke | `git`, compiler, checksums, просмотр process/route state; unprivileged bind only to `127.0.0.1`/`::1` on ephemeral owned ports; без `sudo` и network mutation |
 | Parallels Windows 11 ARM64 | Native client/portability control | test client, private cross-VM sockets, hashes; без route/firewall/DNS mutation и impairment |
-| OrbStack Arch VM | Client/relay/sink/censor emulator | disposable namespaces, veth, owned listeners, nftables/qdisc, result aggregation |
+| Dedicated isolated OrbStack base + disposable clone | Client/relay/sink/censor emulator | base stays stopped outside cloning; clone uses private namespaces, veth, owned listeners, nftables/qdisc and sealed result aggregation |
 | External field endpoint | Отдельный будущий scope | Только после явной авторизации, bounded owned endpoint, без production credential reuse |
 
 Если VM фактически разделяет host network stack для конкретной операции, эта операция запрещена. Проверить boundary до запуска, а не после.
@@ -99,10 +105,10 @@ mode отсутствует: negative test проверяет early failure, а 
 ## 4. Guest network isolation
 
 Preferred mutating test path is a dedicated namespace/veth topology entirely
-inside the OrbStack Linux guest:
+inside a disposable clone of the isolated OrbStack base:
 
 ```text
-OrbStack Arch root namespace (management only)
+Disposable isolated clone root namespace (management only)
    |
 lab bridge/veth (no public forwarding)
    +-- client netns
@@ -112,7 +118,7 @@ lab bridge/veth (no public forwarding)
 ```
 
 Apply `tc netem`, rate limits and firewall classifiers only to recorded lab
-veths, never to OrbStack's management interface. Bind listeners to
+veths, never to the clone's management interface. Bind listeners to
 loopback/private lab interfaces. The guest watchdog is passive: on timeout it
 writes a failure/deletion barrier and performs no signal or network mutation.
 Named residue is inspected and the disposable VM is then destroyed or
@@ -139,7 +145,7 @@ Cross-guest Windows→OrbStack is a portability smoke only: first prove reachabi
 
 Exit gate: zero unexplained data corruption; a local correctness error must never be labeled censor action.
 
-#### Native Linux ARM64 current-source cell — PASS
+#### Native Linux ARM64 captured-source cell — PASS for frozen snapshot
 
 Run
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
@@ -153,34 +159,41 @@ Scope — native ARM64 CPU/filesystem portability без route, DNS, firewall, T
 netns, qdisc, sysctl или service mutation. Это не privileged network и не field
 evidence.
 
-#### Recorded Linux IPv4 OS-TUN cell — PASS
+#### Current Linux IPv4 OS-TUN + network handoff cell — PASS
 
 Run
-[`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
-использовал disposable OrbStack clone и private netns; его `status.env`
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
+использовал pinned clean `git archive` commit
+`81f188f772cc6b674fde748a361691f1bda19691`, dedicated isolated source base,
+disposable clone и private netns; его `status.env`
 содержит `test_status=valid`, `cleanup_status=valid`,
-`host_safety_status=valid` и `field_evidence=false`. Зафиксированы:
+`host_safety_status=valid`, `clone_cleanup_status=valid`,
+`evidence_bundle_status=valid` и `field_evidence=false`. Зафиксированы:
 
 - production-gated REALITY URI/short-ID/pin и mandatory protocol-v3
   credential/allowlist; unauthenticated TLS probe получил synthetic cover
   response при нуле inner sessions до authenticated-client start;
-- durable REALITY replay store leased до bind: data file 1,572,960 bytes,
-  отдельный lock и lifecycle marker прошли private-state cleanup;
 - planted persistent empty-alias TUN с requested client name дал atomic
-  `EBUSY`/`EEXIST` за 172 ms: 0 underlay/carrier packets, foreign
-  link/MTU/address/alias exact-state unchanged, resolver unchanged, 0
-  protocol-186 routes, 0 Shadowpipe firewall state и no WAL;
-- ICMP 20/20, 0% loss; TCP receiver 561,905,664 bytes при 446.785 Mbit/s;
-  UDP 5,092/5,092 packets, 0 lost;
-- 64 MiB source/download SHA-256
-  `5ca1b38d0543084e1a1027831af37e3552e47ac34eb42bb8012c26ece4f67510`;
-- tunneled DNS answer `198.18.0.2`; strict non-carrier underlay,
-  missing-credential, missing-pin и restart-lockdown captures дали `0/0/0`;
-- TCP-reset cut не дал direct fallback, recovery upper bound 8 s;
-- после SIGTERM durable L3/OUTPUT restart barrier оставался активным; explicit
-  release удалил его WAL и exact table, восстановил direct route, а guest-root
-  snapshots/private resolver совпали с baseline;
-- все 573/573 checksum manifest entries прошли `sha256sum -c`.
+  `EBUSY`/`EEXIST` до host-state mutation и оставил foreign interface
+  exact-state unchanged;
+- реальный `ip route replace` сменил default route `c0 -> c1`; exact
+  `DefaultRouteChanged` заставил generation 1 завершиться status 1, при этом
+  intermediate main WAL отсутствовал, а strict durable lockdown оставался
+  active;
+- supervisor создал generation 2 с другим PID/start time; она достигла
+  `Active`, записала strict main WAL и использовала exact bypass interface `c1`;
+- PROMISC-only `RTM_NEWLINK` был проигнорирован: real promiscuous packet
+  observer работал при неизменных PID/start time generation 2 и без нового
+  topology restart;
+- connected IPv6 c0/c1 canaries оставались подняты, directional client-egress
+  pcaps были empty, а generation-specific `SP6` DROP counters стали positive;
+  это fail-closed OUTPUT proof, не IPv6 tunnel;
+- ICMP, TCP, UDP, DNS, verified 64 MiB transfer и carrier-cut recovery с upper
+  bound не более 7 s прошли;
+- manager-stop gate остановил live generation 2, generation 3 не появилась,
+  IPv4/IPv6 canaries оставались blocked до explicit release;
+- все 745 checksum manifest entries, source/evidence transfer, clone deletion,
+  host safety и final private-material scans прошли.
 
 Stable Mac pre/post snapshots совпали для default/full IPv4+IPv6 routes, DNS,
 static PF config/anchor hashes и exact sing-box PID/start/argv/config/binary.
@@ -191,16 +204,20 @@ Runtime PF rules не инспектировались без host privilege
 (`pf_runtime_observed=false`), поэтому этот слой не входит в proof. Сравнение —
 before/after endpoints, не continuous monitor.
 
-Start/run/guest addressing использовало bound opaque OrbStack ID. OrbStack 2.2.1
-в observed lab run паниковал на delete-by-ID; delete-by-name был разрешён только
-после fresh name-to-ID equality, затем проверены late-appearance window и
-отсутствие ID/имени. Unrelated same-host OrbStack operators остаются вне trust
-boundary.
+Runner проверил isolated/network-isolated config source и clone, отсутствие
+mounts/forwarded ports/SSH agent, `/mnt/mac` и работоспособного guest-to-host
+`mac` command channel. Source передан bounded stdin, sealed evidence возвращён
+validated bounded stdout tar; shared checkout не использовался. Start/run/guest
+addressing использовало bound opaque OrbStack ID. Delete-by-name был разрешён
+только после fresh name-to-ID equality, затем проверены late-appearance window
+и отсутствие ID/имени. Unrelated same-host OrbStack operators остаются вне
+trust boundary.
 
 Результат классифицируется как synthetic Linux IPv4 implementation evidence,
-не production/field/censor evidence и не proof для IPv6, Windows или macOS.
+не production/field/censor evidence и не proof для real systemd PID 1,
+resolver/DHCP/suspend events, IPv6 tunnel, Windows или macOS.
 
-#### Phase-3 crash/recovery cell — PASS, same-boot scope
+#### Phase-3 captured-source crash/recovery cell — PASS, same-boot snapshot
 
 Run
 [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md)
@@ -223,7 +240,7 @@ torn filesystem write или power loss. Resolver target — private tmpfs, не
 systemd-resolved и не guest `/etc`. `field_evidence=false`; Mac host наблюдался
 только before/after, loaded PF runtime не наблюдался.
 
-#### Early-userspace reboot lockdown cell — PASS, barrier-only scope
+#### Early-userspace captured-source reboot lockdown cell — PASS, barrier-only snapshot
 
 Run
 [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
@@ -238,7 +255,7 @@ reachable. Все 650/650 checksum entries проверены.
 client/server tunnel; она не доказывает production, initrd, L2/AF_PACKET,
 FORWARD, container-netns или censorship behavior.
 
-#### Windows 11 ARM64 H2 no-TUN cell — PASS
+#### Windows 11 ARM64 H2 no-TUN captured-source cell — PASS
 
 Run
 [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)

@@ -171,8 +171,8 @@ collision; unnamed client TUN creation remains kernel-allocated. Route/firewall
 helpers have bounded deadlines/output and are killed/reaped as process groups
 on timeout; they are still trusted executables, not sandboxed adversarial code.
 
-The current integrated privileged Phase-3 crash matrix is recorded as a scoped
-synthetic Linux **PASS** in
+The privileged Phase-3 crash matrix is recorded as a scoped captured-source
+Linux **PASS** in
 [`20260716T124109Z-93828`](tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md):
 29/29 fresh-namespace scenarios (28 recovered plus one intentional conflict),
 complete evidence finalization and 1443/1443 checksum entries. It proves
@@ -183,17 +183,36 @@ semantics. A separate early-userspace
 cell changed boot IDs and proved the exact Linux L3 OUTPUT barrier restored
 2,995 microseconds before networkd start, loopback allowance, non-loopback
 denial and explicit release; 650/650 checksums verified. That cell has no paired
-client/server tunnel and is not a production claim.
+client/server tunnel and is not a production claim. These two bundles remain
+valid for their frozen captured source only; neither is a proof for the current
+executable-source baseline.
 
-The current full-TUN run
+For the executable-source baseline at commit
+`81f188f772cc6b674fde748a361691f1bda19691`, the current scoped full-TUN proof is
+[`20260716T173837Z-18283-m8K2po`](tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md).
+The isolated disposable Linux clone replaced its real default route from `c0`
+to `c1`; the client emitted the exact `DefaultRouteChanged` cause, generation 1
+exited with status 1 while a strict durable lockdown remained active, and a
+separate generation 2 reached `Active` with its carrier bypass bound to `c1`.
+A PROMISC-only `RTM_NEWLINK` notification was ignored: a real promiscuous
+observer ran while generation 2 retained the same PID and start time. Connected
+IPv6 canaries remained enabled but were not tunneled; directional client-egress
+IPv6 captures were empty and the generation-specific `SP6` DROP counters
+increased. Manager-gated shutdown stopped the live generation 2, produced no
+generation 3, retained fail-closed IPv4/IPv6 protection, and required explicit
+release. ICMP, TCP, UDP, DNS, a verified 64 MiB transfer and carrier-cut
+recovery within a seven-second upper bound passed. All 745 checksum entries,
+host-safety, clone cleanup, source/evidence isolation and secret scans were
+valid.
+
+This result is synthetic Linux IPv4/private-netns evidence. It is not a test of
+a real systemd PID 1 service manager, resolver or DHCP change handling,
+suspend/resume, an IPv6 tunnel, native macOS or Windows clients, production
+deployment, field operation or censorship resistance.
+
+The earlier full-TUN bundle
 [`20260716T123535Z-91294-70zWb7`](tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
-also planted a persistent foreign named TUN: explicit client creation failed
-with `EBUSY`/`EEXIST` in 172 ms, emitted zero underlay/carrier packets, made no
-WAL/firewall/route/DNS mutation and left the foreign interface exact-state
-unchanged. Its ordinary IPv4 path carried ICMP/TCP/UDP/DNS and a verified
-64 MiB payload; 573/573 checksums verified.
-
-Native Linux ARM64 current-source portability
+and the native Linux ARM64 portability snapshot
 [`20260716T122834Z-linux-arm64-current`](tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
 verified 342/342 checksums and a 187-entry frozen-source manifest with SHA-256
 `fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
@@ -201,9 +220,11 @@ Windows ARM64 H2 no-TUN
 [`20260716T125113Z-36840-dd0c2571`](tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
 verified 891/891 checksums, two authenticated sessions plus one rejection and
 an exact 1 MiB echo without Windows route/DNS/firewall/adapter mutation. These
-are VM implementation/portability results with `field_evidence=false`; they do
-not establish IPv6, Windows Wintun, native macOS TUN safety, fleet rollout,
-hostile-network behavior or a release claim. See
+are retained captured-source snapshots with `field_evidence=false`, not
+validation of the current executable-source baseline. They do not establish
+IPv6, Windows Wintun, native macOS TUN safety, fleet rollout, hostile-network
+behavior or a release claim.
+See
 [`docs/phase3-production-safety.md`](docs/phase3-production-safety.md) and the
 [2026-07-16 scoped audit](docs/security-audit-2026-07-16.md).
 
@@ -216,17 +237,25 @@ be run on the macOS host.
 
 For the validation workstation, the configured live `sing-box` file and
 process, host routes, DNS, PF, TUN, and NetworkExtension state are `NO_TOUCH` for
-all ZATMENIE experiments. Tests belong in OrbStack/Parallels guests or a later
-explicitly authorized owned field scope.
+all ZATMENIE experiments. A macOS process sandbox does not provide a second
+Darwin network stack, so it is not an acceptable native-TUN containment
+boundary. Linux mutation belongs in a disposable clone of the dedicated,
+stopped, isolated OrbStack source base; native macOS testing requires a separate
+macOS VM or physical Mac. See the
+[host-isolated macOS lab design](docs/mac-host-isolated-lab.md).
 
 The sealed Linux runs compare Mac state at bounded before/after observation
 points; they are not continuous host-mutation monitors. Loaded PF runtime rules
-could not be read without privilege and remain explicitly unobserved. OrbStack
-guest operations bind opaque IDs; because OrbStack 2.2.1 panicked on
-delete-by-ID in an observed lab run, deletion by name is permitted only after an
-immediate name-to-bound-ID revalidation followed by ID/name absence checks.
-Unrelated same-host OrbStack lifecycle operators remain outside the harness
-trust boundary.
+could not be read without privilege and remain explicitly unobserved. The
+current runner creates a disposable clone from the dedicated isolated base,
+proves isolation and ownership before guest work, transfers pinned source only
+through bounded stdin, returns a validated evidence archive through bounded
+stdout, and requires `/mnt/mac`, SSH-agent forwarding and every discovered
+guest-to-host `mac` command channel to be absent or fail closed. Guest operations
+bind opaque IDs; deletion by name is permitted only after immediate
+name-to-bound-ID revalidation followed by ID/name absence checks. Unrelated
+same-host OrbStack lifecycle operators remain outside the harness trust
+boundary.
 
 The read-only Mac observer discovers exact-name `sing-box` candidates, captures
 each argv, selects exactly one process whose argv matches the protected managed

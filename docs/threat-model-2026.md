@@ -174,9 +174,24 @@ The Mac is a protected production workstation. Forbidden during research:
 - binding test services to public interfaces;
 - reusing live subscription material in manifests or captures.
 
+A macOS sandbox does not create an independent Darwin network stack and is not a
+safe containment boundary for native TUN/route testing. The approved split is
+read-only/build work on the resident Mac, Linux mutation in an isolated
+disposable VM clone, and future native macOS mutation only in a separate macOS
+VM or physical Mac. See
+[`mac-host-isolated-lab.md`](mac-host-isolated-lab.md).
+
 ### VM boundary
 
-All impairment, firewall, qdisc, namespaces, test routes and disposable censor/relay services live inside **OrbStack Arch Linux netns**. Parallels Windows 11 ARM64 is only a portability/private-socket control and receives no route/firewall/DNS/impairment mutation. Guest state may be destroyed, restored from snapshot or deterministically reprovisioned; the host network must not need rollback. Experiments use owned endpoints and bounded rates; no Internet-wide probing.
+All impairment, firewall, qdisc, namespaces, test routes and disposable
+censor/relay services live inside a disposable clone of the dedicated stopped,
+isolated OrbStack source base. Source enters through bounded stdin and sealed
+evidence exits through validated bounded stdout; no Mac mount or forwarded SSH
+agent is allowed. Parallels Windows 11 ARM64 is only a
+portability/private-socket control and receives no
+route/firewall/DNS/impairment mutation. Guest state is destroyed after the run;
+the host network must not need rollback. Experiments use owned endpoints and
+bounded rates; no Internet-wide probing.
 
 ### OS-TUN / route boundary
 
@@ -184,22 +199,30 @@ Current `--auto-route` is a Linux-first implementation. Configuration requires
 `--tunnel --kill-switch --dns` and rejects invalid/non-Linux use before
 DNS/socket/TUN or host mutation; runtime ordering arms the kill-switch before
 bypass/default routes and DNS pinning. Run
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
+pins tested executable commit `81f188f772cc6b674fde748a361691f1bda19691`
+and adds scoped
+V/S, E1 synthetic Linux evidence. A real `c0 -> c1` default-route replacement
+produced exact `DefaultRouteChanged`; generation 1 exited status 1 while strict
+durable lockdown remained active, then a distinct generation 2 reached
+`Active` with its bypass on `c1`. A real promiscuous observer generated a
+PROMISC-only link notification without changing the generation-2 PID/start time
+or restart count. Directional client-egress IPv6 pcaps were empty while `SP6`
+DROP counters increased. Manager-stop terminated the live generation 2,
+suppressed generation 3 and preserved IPv4/IPv6 blocking until explicit
+release. ICMP/TCP/UDP/DNS, a verified 64 MiB transfer and carrier-cut recovery
+within a seven-second upper bound passed; 745 checksum entries, host safety,
+clone cleanup, source isolation and secret scans were valid.
+
+This is an IPv4 tunnel plus connected-IPv6 OUTPUT-block proof in a private
+Linux namespace. It does not exercise a real systemd PID 1 manager,
+resolver/DHCP changes, suspend/resume, an IPv6 tunnel, native Windows/macOS
+networking, production paths or censor behavior. The earlier full-TUN run
 [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
-adds scoped V/S, E1 evidence: synthetic OrbStack Linux IPv4 TCP/UDP/ICMP/DNS TUN
-workloads, strict non-carrier-only IPv4 underlay BPF (`0/0/0`), missing-pin
-and missing-credential captures (`0/0/0`), bounded allowed-carrier marker
-capture (`28/28/0`) and selective sink capture (`5124/5125/0`) all passed, as
-did 64 MiB payload, fail-closed reset, recovery within a recorded `8 s` upper
-bound and explicit restart-lockdown release. A planted foreign persistent named
-TUN with empty alias collided atomically under client `IFF_TUN_EXCL` before
-route/firewall/resolver/WAL mutation and remained exact unchanged; explicit
-named server TUN uses the same exclusive kernel flag. All 573 checksum entries
-verified. Delivered marker
-payload with no plaintext marker in the bounded carrier pcap is only a regression
-heuristic, not cryptographic proof. It does not prove that every OS, IPv6 path,
-production network or censor condition cannot leak or strand state, and it does
-not exercise live DNS TTL refresh. Windows Wintun and macOS TUN/route behavior
-remain separate gates; the protected Mac remains `NO_TOUCH`.
+remains a valid captured-source snapshot, not current executable-source
+evidence. Delivered
+marker absence from a bounded carrier pcap remains a regression heuristic, not
+cryptographic proof.
 
 ### Signed endpoint-policy boundary — IMPLEMENTED, SCOPE-LIMITED
 
@@ -272,12 +295,13 @@ client creation retains kernel name allocation. Route/firewall subprocesses
 have bounded time and output, process-group termination and guaranteed child
 reap; they remain trusted executables rather than a sandbox boundary.
 
-Current-source run
+Captured-source run
 [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md)
 sealed 29/29 fresh-namespace scenarios and 1443/1443 checksum entries. It covers
 schema-v3 eight-resource WAL cuts and recovery markers under same-boot
 `SIGKILL`, including durable conflict behavior. It does not cover kernel reboot,
-torn writes or power-loss storage semantics.
+torn writes or power-loss storage semantics, and it is not validation of the
+current executable source.
 
 A separate
 [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
@@ -287,27 +311,30 @@ explicit release across 650/650 checksum entries. It has no paired tunnel and no
 production/initrd/L2/FORWARD claim. Both results are `field_evidence=false`. See
 [`phase3-production-safety.md`](phase3-production-safety.md).
 
-Native Linux ARM64 current-source portability run
+Native Linux ARM64 captured-source portability run
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
 verified 342/342 entries for frozen source manifest
 `fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`,
 including both workspace test feature sets and strict Clippy. Later
 documentation-only finalization left the 165 non-Markdown source files
-unchanged relative to that capture. It made no privileged network mutation.
+unchanged relative to that capture at the time of the recorded recheck. Later
+executable network-change work means this is now a frozen snapshot rather than
+current executable-source evidence. It made no privileged network mutation.
 Windows 11 ARM64 run
 [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
 verified 891/891 entries for H2 no-TUN v3 auth, missing-pin/unenrolled negative
 controls and exact 1 MiB echo. Its 5,072,384-byte PE SHA-256 is
 `2734e79f98866910aa8e0386af4ff630191b0a72fd1945177f078cb69d500bad`.
-Neither run is native Windows TUN, privileged Linux networking, censorship or
-production evidence.
+Neither run is current executable-source native Windows TUN, privileged Linux
+networking, censorship or production evidence.
 
 Mac host-safety evidence is bounded before/after observation, not continuous
 monitoring. Loaded PF runtime remained unavailable without privilege and is not
-claimed. OrbStack opaque IDs were bound for guest operations; an observed
-OrbStack 2.2.1 delete-by-ID panic required delete-by-name only after fresh
-name-to-ID equality, followed by absence proof. Unrelated same-host lifecycle
-operators remain outside the trust boundary.
+claimed. The current runner binds opaque IDs, requires a dedicated isolated
+source base and disposable clone, rejects Mac mounts/SSH forwarding/working
+guest-to-host command channels, and allows clone deletion by name only after
+fresh name-to-ID equality followed by absence proof. Unrelated same-host
+lifecycle operators remain outside the trust boundary.
 
 ### Relay boundary
 

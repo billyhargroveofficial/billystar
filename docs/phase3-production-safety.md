@@ -9,22 +9,24 @@ audit, or evidence of resistance to a real censor.
 | Layer | Current status | This does not establish |
 |---|---|---|
 | Signed policy, endpoint coordinator, host journal and recovery adapters | Implemented with adversarial unit/component tests | Cryptographic review, fleet-safe rollout, or a green release pipeline |
-| Native Linux ARM64 portability | [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md): scoped PASS, 342/342 checksums, 187/187 frozen-source manifest | Privileged networking, another architecture, production or field behavior |
-| Linux full-TUN runtime | [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md): scoped PASS, 573/573 checksum entries | IPv6, native Windows/macOS TUN, production or field behavior |
-| Linux same-boot crash recovery | [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md): 29/29 scenarios, 1443/1443 checksum entries | Kernel reboot, torn writes or power-loss storage semantics |
-| Linux reboot lockdown | [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md): distinct boot IDs, restore 2,995 us before networkd, 650/650 checksum entries | Paired tunnel recovery, production/initrd/L2/FORWARD behavior |
-| Windows 11 ARM64 no-TUN | [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md): scoped PASS, 891/891 checksums | Wintun, route/DNS/firewall mutation safety, production or field behavior |
+| Current executable-source Linux full-TUN handoff | [`RESULT.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md) plus tracked compact [`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md), commit `81f188f772cc6b674fde748a361691f1bda19691`: scoped PASS, overall/test/cleanup/host-safety valid, 745/745 local sealed-manifest entries | Real systemd PID 1, production, real reboot, native macOS/Windows, outer/inner IPv6 or field behavior |
+| Native Linux ARM64 portability | Snapshot-bound [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md): scoped PASS, 342/342 checksums, 187/187 frozen-source manifest | Current executable-source portability, privileged networking, production or field behavior |
+| Earlier Linux full-TUN runtime | Snapshot-bound [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md): scoped PASS, 573/573 checksum entries | Current network-handoff implementation, IPv6, native Windows/macOS TUN, production or field behavior |
+| Linux same-boot crash recovery | Snapshot-bound [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md): 29/29 scenarios, 1443/1443 checksum entries | Current executable-source host recovery, kernel reboot, torn writes or power-loss storage semantics |
+| Linux reboot lockdown | Snapshot-bound [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md): distinct boot IDs, restore 2,995 us before networkd, 650/650 checksum entries | Current executable-source reboot behavior, paired tunnel recovery, production/initrd/L2/FORWARD behavior |
+| Windows 11 ARM64 no-TUN | Snapshot-bound [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md): scoped PASS, 891/891 checksums | Current executable-source Windows portability, Wintun, route/DNS/firewall mutation safety, production or field behavior |
 | Censorship resistance | Architecture and research hypotheses only | No current TSPU/GFW/operator result, unblockability, or indistinguishability |
 | Platforms | Linux-first host-state implementation | IPv6 completeness, Windows Wintun safety, macOS TUN/route safety, Android VpnService, or mobility behavior |
 
 These are synthetic disposable-guest implementation results with
-`field_evidence=false`, not one combined production certification. The full-TUN
-cell proves the current IPv4/netns runtime path; the Phase-3 matrix proves
-same-boot process-crash recovery; the reboot cell independently proves that an
-early-userspace L3 OUTPUT barrier survives a real guest reboot and releases only
-on explicit operator action. Linux ARM64 and Windows ARM64 are separate
-portability gates; the Windows cell deliberately performs no TUN or Windows
-network-state mutation. None of these synthetic results is field-censorship
+`field_evidence=false`, not one combined production certification. Executable
+source changed after the five earlier captures, so they remain valid only for
+their exact frozen snapshots. The new current-source cell proves only the
+isolated Linux IPv4 full-TUN/default-route handoff and connected IPv6
+OUTPUT-block scope. It does not refresh native ARM64 portability, the
+all-resource same-boot crash matrix, real reboot behavior or Windows. Its
+supervisor emulates the installed `Restart=always`/`RestartSec=1s` contract; it
+is not real systemd PID 1. None of these synthetic results is field-censorship
 evidence.
 
 ## 1. Trust and policy object
@@ -279,7 +281,54 @@ requirements.
 
 ## 7. Sealed implementation evidence
 
-### Native Linux ARM64 portability cell
+### Current executable-source Linux full-TUN handoff cell
+
+Run
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
+has a tracked compact
+[`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md) and
+used a clean `git archive` pinned to
+`81f188f772cc6b674fde748a361691f1bda19691`. The source entered an isolated
+disposable OrbStack clone through bounded stdin, and the sealed evidence left
+through a validated stdout tar; there was no shared checkout, `/mnt/mac`, SSH
+agent or working `mac` command channel. Overall, test, cleanup, host-safety,
+evidence and clone-cleanup statuses were valid; all 745 checksum entries
+verified, the clone was deleted and the source base ended stopped.
+The complete 170,055,680-byte sealed bundle remains local/ignored and is not
+claimed committed. Its 168,317,113-byte `client-c1-ipv4.pcap` remains local;
+the compact tracked index publishes pcap hashes separately.
+
+A real default-route replacement moved the underlay from `c0` to `c1` and
+produced the exact `DefaultRouteChanged` cause. Generation 1 exited with status
+1 only after strict durable restart lockdown was Active; its invalidated routes,
+DNS, bypasses, TUN and main kill-switch were removed, and the main WAL was
+absent. Generation 2 then re-observed the host, installed its bypass through
+`c1`, reached `Active`, and only then released the intermediate barrier.
+
+A real promiscuous capture toggled `IFF_PROMISC`, but generation-2 PID
+`4587`, start ticks `10360288` and topology restart count `2` remained
+unchanged. This proves only the structurally exact PROMISC-only observer
+exclusion; mixed link changes remain invalidations. Before the final SIGTERM,
+the manager-stop gate was present. Generation 2 armed the final strict durable
+lockdown and no generation 3 appeared; explicit release later removed both WALs
+and the exact table. The harness emulated service-manager restart/stop
+semantics and did not run real systemd PID 1.
+
+The authenticated path carried ICMP 20/20, TCP 530,317,312 receiver bytes, UDP
+6,251,748 receiver bytes in 5,091 packets with zero loss, tunneled DNS and a
+64 MiB transfer with matching SHA-256
+`d29e4d088c91b35184c2102d796721c611834bb4e1599acc163797e3d32f8799`.
+Carrier-cut recovery had a recorded upper bound of 7 seconds. Directional
+client-originated IPv6 pcaps on `c0` and `c1` were empty while the exact
+generation-specific SP6 chains counted 21 and 11 dropped packets.
+
+This is a synthetic IPv4 tunnel plus connected-netns IPv6 OUTPUT-block result.
+It does not establish outer or inner IPv6, inbound/L2/FORWARD behavior, a real
+reboot, current-source portability or all-resource crash recovery, native
+macOS/Windows VPNs, production operation, censorship resistance or field
+availability.
+
+### Snapshot-bound native Linux ARM64 portability cell
 
 Run
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
@@ -292,9 +341,10 @@ format, metadata, shell syntax and runner self-test partitions passed. All
 `fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
 
 This was unprivileged CPU/filesystem portability only: no route, DNS, firewall,
-TUN, netns, qdisc, sysctl or service mutation occurred.
+TUN, netns, qdisc, sysctl or service mutation occurred. Later executable-source
+changes mean this result no longer proves current-source portability.
 
-### Full-TUN Linux IPv4/netns cell
+### Snapshot-bound earlier full-TUN Linux IPv4/netns cell
 
 Run
 [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
@@ -318,10 +368,12 @@ foreign device.
 Non-carrier underlay, missing-credential, missing-pin and
 post-restart-lockdown captures were `0/0/0`; explicit release removed the
 lockdown WAL/table. All 573 checksum entries verified. This remains IPv4
-synthetic scope. The observed forward-on-fail response is a bounded synthetic
-cover oracle, not general active-probe indistinguishability.
+synthetic scope for its frozen source. The observed forward-on-fail response is
+a bounded synthetic cover oracle, not general active-probe
+indistinguishability. The current executable-source handoff result is the newer
+cell above.
 
-### Same-boot schema-v3 crash/recovery matrix
+### Snapshot-bound same-boot schema-v3 crash/recovery matrix
 
 Run
 [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md)
@@ -337,14 +389,15 @@ entries verified.
 
 This is same-boot process-crash evidence. It does not simulate a kernel reboot,
 torn filesystem writes or power loss, and its private tmpfs resolver is not a
-systemd-resolved integration test.
+systemd-resolved integration test. Executable source later changed, so current
+all-resource host-recovery status remains open.
 
 The `SPPOLEX1` expiry tombstone is covered by adversarial policy-state/component
-tests in the same current source, not by this privileged namespace matrix. In
+tests in that captured source, not by this privileged namespace matrix. In
 particular, the matrix does not upgrade the tombstone into trusted-time or
 power-loss evidence.
 
-### Reboot lockdown cell
+### Snapshot-bound reboot lockdown cell
 
 Run
 [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
@@ -357,9 +410,10 @@ before networkd start. All 650 checksum entries verified.
 
 This cell proves early-userspace Linux L3 local OUTPUT lockdown only. It has no
 paired client/server tunnel and makes no production, initrd, L2/AF_PACKET,
-FORWARD, container-netns or censorship claim.
+FORWARD, container-netns or censorship claim. It predates later executable
+changes; the current handoff harness did not perform a real reboot.
 
-### Windows 11 ARM64 H2 no-TUN cell
+### Snapshot-bound Windows 11 ARM64 H2 no-TUN cell
 
 Run
 [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
@@ -374,26 +428,40 @@ command. All 891 checksum entries verified.
 
 This is a private-VM no-TUN portability/authentication cell. It does not prove
 Wintun, Windows route/firewall/DNS mutation safety, leak prevention or censor
-resistance.
+resistance, and later executable-source changes require a fresh Windows
+portability run.
 
 ### Host and VM observation limits
 
-Mac routes, DNS, static PF files and exact live sing-box identity matched at
-before/after endpoints. This is not a continuous mutation monitor. Loaded PF
-runtime was unavailable to the unprivileged collector and remains explicitly
-unobserved. OrbStack start/stop/guest operations used bound opaque IDs; because
-OrbStack 2.2.1 panicked on delete-by-ID in an observed lab run, deletion used
-the name only after a fresh name-to-ID equality check, followed by a late
-appearance window and ID/name absence proof. Unrelated same-host OrbStack
-operators remain outside the trust boundary.
+In the current handoff run, Mac routes, DNS, static PF files, utun list and exact
+live sing-box identity matched at before/after endpoints. This is not a
+continuous mutation monitor. Loaded PF runtime was unavailable to the
+unprivileged collector and remains explicitly unobserved. OrbStack
+start/stop/guest operations used bound opaque IDs; deletion by name occurred
+only after a fresh name-to-ID equality check, followed by a late-appearance
+window and ID/name absence proof. The dedicated source base was stopped after
+the run. Unrelated same-host OrbStack operators remain outside the trust
+boundary.
 
 The observer discovers exact-name `sing-box` candidates, records every
 candidate argv, selects exactly one protected managed argv and re-proves
 PID/start time/argv/executable/config in the same stable process generation.
 Substring-only discovery, ambiguity or restart invalidates the host snapshot.
+The reason this Linux VM path is safe while a native macOS VPN test is not is
+documented in the [host-isolated macOS lab design](mac-host-isolated-lab.md):
+Darwin application sandboxing does not create a separate network stack, so
+native NetworkExtension validation requires a separate macOS VM or sacrificial
+Mac.
 
 ## 8. What remains open
 
+- Re-run native Linux ARM64 portability, all-resource same-boot recovery, real
+  reboot and Windows no-TUN cells against the current executable source.
+- Exercise the installed units under real systemd PID 1 rather than only the
+  handoff harness supervisor.
+- Add resolver-configuration observation, explicit DHCP lease/lifetime
+  invalidation and suspend/resume; then implement equivalent native macOS and
+  Windows network-change sources.
 - Prove IPv6 route/firewall/DNS behavior instead of extrapolating from IPv4.
 - Run native Windows Wintun, macOS NetworkExtension/TUN and Android VpnService
   leak/recovery matrices.

@@ -35,7 +35,7 @@ substantially stronger performance evidence.
 | Host safety | Signed authority, WAL-before-mutation, exact ownership and fail-closed Linux recovery | Broad platform support; host lifecycle safety depends on core/client/configuration | TUN lifecycle depends on client integration | Mature WireGuard-style interface lifecycle, usually simpler than a proxy stack |
 | Loss-path behavior | Current production path is one reliable TCP carrier; nested TCP can amplify head-of-line blocking | Vision/direct-copy paths avoid carrying every inner TCP packet through another TCP stream | Strongest option here on lossy/high-BDP UDP paths | Low overhead; application TCP handles its own loss recovery |
 | Roaming | Reconnect and endpoint rotation; native mobility integration is open | Mature reconnect/routing ecosystem | QUIC and port-hopping support | Authenticated roaming is a core WireGuard strength |
-| Current product readiness | Linux IPv4 scoped VM evidence; Windows no-TUN only; macOS native client absent | Mature cross-platform ecosystem | Mature cross-platform ecosystem | Mature cross-platform ecosystem |
+| Current product readiness | Current executable-source Linux IPv4 full-TUN/default-route handoff evidence; older portability/crash/reboot/Windows cells are snapshot-bound; macOS native client absent | Mature cross-platform ecosystem | Mature cross-platform ecosystem | Mature cross-platform ecosystem |
 
 ## Where Shadowpipe is already stricter
 
@@ -77,6 +77,27 @@ not provide this exact monotonic signed endpoint/pin authority contract.
 The Linux client journals intent before mutating TUN, firewall, routes or DNS.
 Recovery acts only on exact resources whose ownership can be reconstructed from
 the journal and host observations. A matching name or ifindex is insufficient.
+
+### Conservative Linux network handoff
+
+Linux network notifications now feed a fixed two-byte invalidation set. A real
+default-route change does not directly rewrite routes or migrate sockets from
+the callback. Instead, the active generation verifies a durable lockdown,
+tears down invalidated main host state, exits nonzero, and relies on the paired
+service to start a fresh process that re-observes the underlay. Exact
+Shadowpipe-owned route events are suppressible only after a fresh live census;
+only a structurally exact `IFF_PROMISC`-only observer transition is excluded.
+
+The current isolated run
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
+has a tracked compact
+[`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md) and
+proved a real `c0 -> c1` default-route replacement, strict intermediate
+lockdown, generation-2 adoption through `c1`, and no observer-induced restart.
+It emulated `Restart=always`/`RestartSec=1s`; it did not run real systemd PID 1.
+Resolver/DHCP/suspend integration, in-process migration and native macOS/Windows
+mobility remain open. The full sealed bundle, including its large raw c1 pcap,
+remains local/ignored; the compact index publishes pcap hashes.
 
 ## Where current alternatives are stronger
 
@@ -141,9 +162,13 @@ it.
 
 ## Work required before a stronger claim
 
-1. Native macOS Network Extension and Windows Wintun/WFP clients.
+1. Native macOS Network Extension and Windows Wintun/WFP clients. The safe
+   macOS validation boundary is defined in
+   [`mac-host-isolated-lab.md`](mac-host-isolated-lab.md).
 2. Explicit IPv6 leak gates, then outer IPv6/NAT64, then full inner IPv6.
-3. Restart-safe network-change reconciliation.
+3. Complete network-change reconciliation beyond the conservative Linux process
+   replacement: resolver/DHCP/suspend events, real systemd PID-1 integration,
+   in-process state migration where justified, and native macOS/Windows sources.
 4. A reviewed ephemeral PQ handshake/combiner and PQ control-plane design.
 5. A production QUIC carrier evaluated against Hysteria2 on identical netem
    matrices.

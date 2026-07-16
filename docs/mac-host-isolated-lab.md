@@ -10,6 +10,9 @@ process capabilities; they do not create an independent Darwin routing table,
 DNS configuration, PF instance, TUN namespace, or Network Extension control
 plane.
 
+- <https://developer.apple.com/documentation/security/app-sandbox>
+- <https://developer.apple.com/forums/thread/661939>
+
 Therefore:
 
 - the working Mac may run builds, unit/property tests, packet-engine
@@ -53,6 +56,11 @@ it from the host and other OrbStack machines:
 
 - <https://docs.orbstack.dev/machines/isolated>
 - <https://docs.orbstack.dev/architecture>
+- <https://docs.orbstack.dev/machines/network>
+
+OrbStack external networking still follows the host VPN and DNS path. That is
+acceptable for the self-contained private-netns correctness lab below, but it
+is not independent Internet or anti-DPI evidence.
 
 Inside that VM:
 
@@ -69,12 +77,11 @@ Inside that VM:
 6. bound endpoints, bytes, rate and wall-clock duration;
 7. destroy or revert the disposable machine after the run.
 
-The current `arch` source machine is not an isolated OrbStack machine. Its
-clone-plus-netns harness protects the host routing plane, but it is not the
-strongest available filesystem/integration boundary. A dedicated isolated
-base should replace it before unattended privileged testing is treated as the
-normal gate. Until then it is a legacy integrated runner, not the final
-capability-isolated proof path.
+The legacy `arch` machine is not an accepted source for privileged runs.
+`shadowpipe-lab-base` plus a disposable isolated clone is the mandatory path.
+Provisioning the base is not evidence by itself: an integrated claim requires
+a sealed result with valid test, guest cleanup, clone cleanup, source transfer,
+private-material scan and host-safety statuses.
 
 OrbStack machines share one Linux kernel. This boundary is appropriate for
 testing trusted Shadowpipe code and fault injection, not for containing a
@@ -94,20 +101,54 @@ bounded stdout. Both directions require SHA-256 and byte-count agreement, and
 the host extractor rejects absolute paths, traversal, duplicate entries,
 links, devices and oversized archives.
 
+Current Linux evidence:
+
+- [`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
+  is a scoped PASS for pinned source
+  `81f188f772cc6b674fde748a361691f1bda19691`;
+- it proves a real `c0` to `c1` default-route handoff with the exact
+  `DefaultRouteChanged` cause, a strict intermediate lockdown, generation-2
+  activation through `c1`, a live promiscuous-observer regression,
+  directional IPv6 egress blocking, manager-gated shutdown, explicit release
+  and complete clone cleanup;
+- the working sing-box remained PID `74899`, start time
+  `Wed Jul 15 12:04:27 2026`, with the same argv;
+- this is Linux VM evidence only, not native macOS `NetworkExtension`,
+  Windows, production, field or censorship-resistance evidence.
+
 ## Native macOS boundary
 
-Use a separate Apple-silicon macOS VM in Parallels with Shared/NAT networking,
-never Bridged:
+Use a separate Apple-silicon macOS VM. `sandbox-exec` and App Sandbox are not
+network namespaces: they do not provide an independent routing table, DNS
+configuration or `utun` control plane.
+
+Parallels Shared/NAT is safe for the host but is not an independent network
+proof. Parallels documents that Shared networking passes guest connectivity
+through the host, including the host VPN. A Shadowpipe test there is nested
+inside sing-box and cannot prove that the macOS client works without it.
+
+The practical hermetic topology is:
+
+```text
+macOS client VM
+       |
+       +-- Host-Only/private L2 -- Linux Shadowpipe server/router VM
+                                  `-- Linux DNS/canary VM
+```
+
+For an Internet test that does not traverse host sing-box, disable the virtual
+Shared adapter and pass a dedicated USB Ethernet or Wi-Fi adapter directly to
+the macOS VM, connected to a separate router or mobile path. The strictest
+design is a small `Virtualization.framework` runner using private file-handle
+or custom-vmnet L2 attachments. A second physical Mac remains the cleanest
+field host.
 
 - <https://kb.parallels.com/en/4948>
-- <https://kb.parallels.com/en/128867>
-- <https://developer.apple.com/documentation/virtualization>
-- <https://developer.apple.com/documentation/virtualization/vznatnetworkdeviceattachment>
-
-Guest routes, DNS and `utun` interfaces then belong to the guest network stack.
-The host VPN is only the NAT underlay. This protects working connectivity, but
-it also means the VM cannot supply valid anti-DPI field evidence: its traffic
-is already nested inside the host sing-box path.
+- <https://docs.parallels.com/landing/pdfm-ug/parallels-desktop-for-mac-26-users-guide/advanced-topics/using-other-operating-systems-on-your-mac/running-macos-virtual-machines/connecting-usb-devices-directly-to-your-macos-virtual-machine>
+- <https://kb.parallels.com/en/122993>
+- <https://developer.apple.com/documentation/virtualization/virtualize-macos-on-a-mac>
+- <https://developer.apple.com/documentation/virtualization/vzfilehandlenetworkdeviceattachment>
+- <https://developer.apple.com/documentation/virtualization/vzvmnetnetworkdeviceattachment>
 
 The production macOS backend should be a signed
 `NEPacketTunnelProvider`, not a privileged standalone CLI:
@@ -155,13 +196,22 @@ The host orchestrator must:
 
 For a macOS VM, additionally require:
 
-- Shared/NAT networking and explicit rejection of Bridged mode;
+- Host-Only/private L2 for hermetic tests;
+- explicit rejection of Shared/NAT as evidence of independence from host
+  sing-box;
+- for external-network tests, a dedicated physical adapter passed directly to
+  the guest, never the working Mac's primary Wi-Fi path;
 - a revertible snapshot made before installing the test build;
 - a first smoke test proving the `utun` exists only inside the guest;
+- before/after equality of host sing-box PID/start/argv, `utun` census,
+  IPv4/IPv6 default routes, DNS and PF observations;
 - bounded memory so the Windows VM remains suspended while the macOS VM runs.
 
 ## Evidence boundary
 
-This laboratory can support local correctness, crash safety and L3 leak claims.
-It cannot support claims about Russian DPI, a physical access network, universal
-packet silence, or production battery/roaming behavior.
+The Linux laboratory supports scoped local correctness, crash safety and L3
+egress-leak claims. A separate macOS VM can support native
+`NEPacketTunnelProvider` lifecycle claims only after Xcode, signing and
+entitlement provisioning exist inside that guest. Neither setup alone supports
+claims about Russian DPI, a physical access network, universal packet silence,
+or production battery/roaming behavior.

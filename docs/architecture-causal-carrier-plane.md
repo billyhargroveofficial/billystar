@@ -1,6 +1,6 @@
 # Architecture: Causal Carrier Plane
 
-Статус: research architecture, не production claim. Центральная **гипотеза о новизне** — совместить выбор topology с причинно интерпретируемым доказательством того, почему carrier помог или не помог. Это не утверждение «first/new»: оно остаётся `E0`. Текущая [versioned related-work matrix](related-work-matrix-2026.md) задаёт первичные границы, но сама не закрывает novelty review: нужны воспроизводимый systematic search и независимая проверка.
+Статус: research architecture, не production claim. Центральная **гипотеза о новизне** — совместить выбор topology с причинно интерпретируемым доказательством того, почему carrier помог или не помог. Это не утверждение «first/new»: оно остаётся `E0`. Текущая [versioned related-work matrix](related-work-matrix-2026.md) задаёт первичные границы, но сама не закрывает novelty review: нужны воспроизводимый systematic search и независимая проверка. Current privileged Linux evidence ниже относится только к executable-source commit `81f188f772cc6b674fde748a361691f1bda19691`; последующие изменения документа являются documentation drift, а более ранние portability/recovery/reboot/Windows bundles остаются captured-source snapshots.
 
 ## 1. Design thesis
 
@@ -399,31 +399,57 @@ experiments/*                 draft protocols; frozen manifests/results later
 `--kill-switch` и `--dns`; invalid combination aborts до DNS/socket/TUN/host
 mutation. Runtime сначала включает kill-switch, затем carrier/SSH bypass,
 split-default routes и DNS guard. Помимо code/unit evidence, run
+[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
+запечатал current executable-source commit
+`81f188f772cc6b674fde748a361691f1bda19691`
+и дал scoped V/S, E1 synthetic Linux IPv4 proof. Реальный default route
+перешёл `c0 -> c1`; exact `DefaultRouteChanged` завершил generation 1 status 1
+под strict durable lockdown, после чего отдельная generation 2 стала `Active`
+с bypass на `c1`. PROMISC-only `RTM_NEWLINK` от реального promiscuous observer
+не изменил PID/start time и не создал новую generation. Directional
+client-egress IPv6 pcaps остались empty при positive `SP6` DROP counters.
+Manager-stop завершил live generation 2, не допустил generation 3 и оставил
+IPv4/IPv6 blocked до explicit release. TCP/UDP/ICMP/DNS, 64 MiB payload и
+carrier-cut recovery с upper bound не более `7 s` прошли; 745 checksum entries,
+host safety, clone cleanup, secret scan и bounded source/evidence channels
+валидны. Отдельный planted foreign persistent named TUN был отвергнут до
+host-state mutation и остался exact unchanged.
+
+Runner клонировал dedicated stopped isolated OrbStack base, проверил
+isolated/network-isolated config, отсутствие `/mnt/mac`, forwarded ports, SSH
+agent и работающего guest-to-host `mac` command channel. Pinned clean
+`git archive` вошёл через bounded stdin, validated sealed evidence вышел через
+bounded stdout; shared checkout не использовался. Native macOS isolation
+описана отдельно в
+[`mac-host-isolated-lab.md`](mac-host-isolated-lab.md): process sandbox не
+создаёт независимый Darwin network stack.
+
+Этот PASS не доказывает real systemd PID 1 supervision,
+resolver/DHCP/suspend-resume events, IPv6 tunnel, native Windows/macOS TUN,
+production/field operation или censorship resistance. Старый full-TUN
 [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
-дал scoped V/S, E1 synthetic OrbStack Linux IPv4 proof для TCP/UDP/ICMP/DNS,
-64 MiB payload, fail-closed carrier cut/recovery с recorded upper bound `8 s`,
-explicit lockdown release и 573/573 checksum entries. Отдельный planted foreign
-persistent named TUN с пустым alias был отвергнут до network mutation:
-`IFF_TUN_EXCL` вернул collision, interface/resolver остались exact unchanged,
-underlay/carrier packets и proto-186 routes были zero, WAL отсутствовал.
-Explicit named client TUN и server TUN теперь оба используют
-`IFF_TUN_EXCL`; только unnamed client path оставляет имя kernel allocation.
-Delivered marker без plaintext marker bytes в bounded carrier pcap —
-regression heuristic, не cryptographic proof. Phase-3 добавил
+остаётся captured-source snapshot. Delivered marker без plaintext marker bytes
+в bounded carrier pcap — regression heuristic, не cryptographic proof.
+
+Phase-3 добавил
 signed-authority-bounded live DNS refresh,
 `allow -> route -> publish` transactions, outage rehydration without underlay
-DNS и all-resource WAL recovery. Current-source same-boot matrix
+DNS и all-resource WAL recovery. Captured-source same-boot matrix
 [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md)
-sealed 29/29 scenarios and 1443/1443 checksum entries. Отдельный reboot-lockdown
+sealed 29/29 scenarios and 1443/1443 checksum entries в своём captured source;
+после executable network-change изменений это не current executable-source
+matrix. Отдельный reboot-lockdown
 run
 [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
 proved early-userspace local OUTPUT barrier before networkd and explicit
-release, 650/650 checksum entries. Native Linux ARM64 current-source run
+release, 650/650 checksum entries в своём captured snapshot. Native Linux ARM64
+captured-source run
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
 sealed 342/342 entries against the frozen-at-capture source manifest
 `fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`;
 subsequent documentation-only finalization did not change its 165 non-Markdown
-source files. Это unprivileged CPU/filesystem portability, не network proof.
+source files на момент той проверки; более поздние executable изменения делают
+bundle frozen snapshot. Это unprivileged CPU/filesystem portability, не network proof.
 Native Windows
 11 ARM64 no-TUN H2 run
 [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
@@ -433,8 +459,9 @@ sealed 891/891 entries, exact 1 MiB echo и negative auth controls для
 Same-boot `SIGKILL` не является power-loss
 proof, reboot cell не содержит paired tunnel, и все перечисленные bundles имеют
 `field_evidence=false`. До operational claim также нужны production/field
-replication, IPv6 и отдельные native Windows/macOS TUN matrices. Mac routing
-остаётся `NO_TOUCH`. Полный статус:
+replication, real systemd PID 1, resolver/DHCP/suspend matrices, IPv6 tunnel и
+отдельные native Windows/macOS TUN matrices. Mac routing остаётся `NO_TOUCH`.
+Полный статус:
 [Phase-3 safety](phase3-production-safety.md).
 
 `DialTarget` пока является только typed boundary, не разрешением на egress.
@@ -523,11 +550,14 @@ No experiment code may call macOS route/DNS/PF/service APIs. Compile-time target
   independently enrolled root/online-key chain. Exact sorted `service_id` set
   remains immutable after enrollment, candidate signer is `Active` only, and
   `86400 s` overlap is a continuity rule, not compromised-signer containment.
-- Linux IPv4 full-tunnel, same-boot schema-v3 crash recovery and early-userspace
-  reboot lockdown have separate completed synthetic privileged bundles for the
-  current source; Linux ARM64 and Windows ARM64 additionally have bounded
-  portability/no-TUN evidence. They do not combine into a production/field
-  claim: IPv6, power-loss/torn-write durability, paired-tunnel reboot recovery
-  and every other OS native TUN/rollback proof remain open.
+- Linux IPv4 full-tunnel and exact default-route process replacement have one
+  completed synthetic privileged bundle for current executable commit
+  `81f188f`.
+  Same-boot schema-v3 crash recovery, early-userspace reboot lockdown, Linux
+  ARM64 portability and Windows ARM64 no-TUN each have older captured-source
+  bundles. They do not combine into a production/field claim: real systemd PID
+  1, resolver/DHCP/suspend events, IPv6 tunnel, power-loss/torn-write durability,
+  paired-tunnel reboot recovery and every other OS native TUN/rollback proof
+  remain open.
 - Any failure restores guest state without touching the Mac or its sing-box.
 - No artefact contains secrets or production IP credentials.
