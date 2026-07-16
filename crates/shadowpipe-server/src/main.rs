@@ -353,6 +353,54 @@ struct Args {
     carrier_write_timeout_secs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerHost {
+    Linux,
+    NonLinux,
+}
+
+impl ServerHost {
+    const fn current() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::NonLinux
+        }
+    }
+}
+
+/// Production server networking is a Linux-only contract. A non-Linux build is
+/// retained solely for rootless workspace/e2e development: the operator must
+/// explicitly select the user-owned allowlist and probe-visible lab carriers,
+/// while every TUN, NAT, REALITY, and REALITY-management path remains closed.
+///
+/// Keep this check immediately after CLI parsing. It must run before any key or
+/// allowlist I/O, replay-store access, cover profiling, listener bind, or TUN
+/// operation so an unsupported host cannot partially enter production startup.
+fn validate_server_host(args: &Args, host: ServerHost) -> Result<()> {
+    if host == ServerHost::Linux {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        args.development_user_allowlist && args.allow_insecure_lab_carriers,
+        "production shadowpipe-server is supported only on Linux; non-Linux hosts require the explicit rootless no-TUN lab gate: --development-user-allowlist --allow-insecure-lab-carriers"
+    );
+    anyhow::ensure!(
+        !args.tunnel && !args.nat_hint,
+        "non-Linux shadowpipe-server lab mode forbids TUN and NAT setup"
+    );
+    anyhow::ensure!(
+        !args.reality
+            && !args.gen_reality_key
+            && !args.print_uri
+            && args.reality_short_id.is_empty()
+            && args.reality_replay_store.is_none(),
+        "non-Linux shadowpipe-server lab mode forbids REALITY and REALITY identity, URI, token, or replay-state operations"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RuntimeLimits {
     max_connections: usize,
@@ -779,6 +827,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    validate_server_host(&args, ServerHost::current())
+        .context("validate Linux-only production server boundary")?;
     let runtime = RuntimeLimits::from_args(&args).context("validate bounded server runtime")?;
     let admission = ConnectionAdmission::new(runtime.max_connections);
 
@@ -1893,6 +1943,103 @@ mod tests {
 
         let production = Args::try_parse_from(["shadowpipe-server", "--reality"]).unwrap();
         validate_daemon_carrier_security(&production).unwrap();
+    }
+
+    #[test]
+    fn server_host_boundary_allows_linux_production_and_only_explicit_non_linux_lab() {
+        let production =
+            Args::try_parse_from(["shadowpipe-server", "--reality", "--tunnel"]).unwrap();
+        validate_server_host(&production, ServerHost::Linux).unwrap();
+
+        let error = validate_server_host(&production, ServerHost::NonLinux).unwrap_err();
+        assert!(
+            error.to_string().contains("supported only on Linux"),
+            "unexpected error: {error:#}"
+        );
+
+        let implicit = Args::try_parse_from(["shadowpipe-server"]).unwrap();
+        assert!(validate_server_host(&implicit, ServerHost::NonLinux).is_err());
+
+        let development_only =
+            Args::try_parse_from(["shadowpipe-server", "--development-user-allowlist"]).unwrap();
+        assert!(validate_server_host(&development_only, ServerHost::NonLinux).is_err());
+
+        let explicit_lab = Args::try_parse_from([
+            "shadowpipe-server",
+            "--development-user-allowlist",
+            "--allow-insecure-lab-carriers",
+        ])
+        .unwrap();
+        validate_server_host(&explicit_lab, ServerHost::NonLinux).unwrap();
+
+        let explicit_lab_key_management = Args::try_parse_from([
+            "shadowpipe-server",
+            "--development-user-allowlist",
+            "--allow-insecure-lab-carriers",
+            "--gen-keys",
+        ])
+        .unwrap();
+        validate_server_host(&explicit_lab_key_management, ServerHost::NonLinux).unwrap();
+    }
+
+    #[test]
+    fn non_linux_lab_host_boundary_rejects_tun_nat_and_every_reality_path() {
+        let explicit_lab = Args::try_parse_from([
+            "shadowpipe-server",
+            "--development-user-allowlist",
+            "--allow-insecure-lab-carriers",
+        ])
+        .unwrap();
+
+        let mut tunnel = explicit_lab.clone();
+        tunnel.tunnel = true;
+        let error = validate_server_host(&tunnel, ServerHost::NonLinux).unwrap_err();
+        assert!(
+            error.to_string().contains("forbids TUN and NAT"),
+            "unexpected error: {error:#}"
+        );
+
+        let mut nat_hint = explicit_lab.clone();
+        nat_hint.nat_hint = true;
+        assert!(validate_server_host(&nat_hint, ServerHost::NonLinux).is_err());
+
+        let mut reality = explicit_lab.clone();
+        reality.reality = true;
+        let error = validate_server_host(&reality, ServerHost::NonLinux).unwrap_err();
+        assert!(
+            error.to_string().contains("forbids REALITY"),
+            "unexpected error: {error:#}"
+        );
+
+        let mut reality_key_management = explicit_lab.clone();
+        reality_key_management.gen_reality_key = true;
+        assert!(validate_server_host(&reality_key_management, ServerHost::NonLinux).is_err());
+
+        let mut reality_uri = explicit_lab.clone();
+        reality_uri.print_uri = true;
+        assert!(validate_server_host(&reality_uri, ServerHost::NonLinux).is_err());
+
+        let mut inline_reality_token = explicit_lab.clone();
+        inline_reality_token
+            .reality_short_id
+            .push("0011223344556677".to_owned());
+        assert!(validate_server_host(&inline_reality_token, ServerHost::NonLinux).is_err());
+
+        let mut replay_state = explicit_lab;
+        replay_state.reality_replay_store = Some(PathBuf::from("replay.bin"));
+        assert!(validate_server_host(&replay_state, ServerHost::NonLinux).is_err());
+    }
+
+    #[test]
+    fn current_server_host_class_matches_the_compilation_target() {
+        assert_eq!(
+            ServerHost::current(),
+            if cfg!(target_os = "linux") {
+                ServerHost::Linux
+            } else {
+                ServerHost::NonLinux
+            }
+        );
     }
 
     #[test]
