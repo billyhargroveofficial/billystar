@@ -28,6 +28,7 @@ const NLMSG_HEADER_BYTES: usize = 16;
 const RTATTR_HEADER_BYTES: usize = 4;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 const IFINFO_MESSAGE_BYTES: usize = 16;
+const IFINFO_CHANGE_OFFSET: usize = 12;
 const IFADDR_MESSAGE_BYTES: usize = 8;
 const ROUTE_MESSAGE_BYTES: usize = 12;
 const FIB_RULE_HEADER_BYTES: usize = 12;
@@ -52,6 +53,11 @@ const RTM_NEWRULE: u16 = 32;
 const RTM_DELRULE: u16 = 33;
 const LINUX_AF_INET: u8 = 2;
 const LINUX_AF_INET6: u8 = 10;
+// Public IFF_PROMISC bit from <linux/if.h>. AF_PACKET observers such as
+// tcpdump temporarily change only this flag when entering/leaving promiscuous
+// mode. Linux emits RTM_NEWLINK for that observer refcount transition even
+// though interface membership, carrier, addresses, and routing are unchanged.
+const LINUX_IFF_PROMISC: u32 = 0x0100;
 
 // Public multicast masks from <linux/rtnetlink.h>. Linux exposes IPv6 rule
 // notifications as RTNLGRP_IPV6_RULE (group 19) but does not define a legacy
@@ -465,6 +471,16 @@ fn read_i32_ne(bytes: &[u8]) -> i32 {
     i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn link_notification_is_promiscuity_only(message_type: u16, payload: &[u8]) -> bool {
+    // struct ifinfomsg stores ifi_change at bytes 12..16. Do not use the
+    // IFLA_PROMISCUITY attribute as a delta: it reports the current refcount.
+    // RTM_DELLINK is always significant, and zero, all-ones, or mixed change
+    // masks remain conservative invalidations.
+    message_type == RTM_NEWLINK
+        && read_u32_ne(&payload[IFINFO_CHANGE_OFFSET..IFINFO_CHANGE_OFFSET + size_of::<u32>()])
+            == LINUX_IFF_PROMISC
+}
+
 fn align4(length: usize) -> Option<usize> {
     length
         .checked_add(NLMSG_ALIGN_TO - 1)
@@ -596,12 +612,13 @@ fn route_table_id(message_type: u16, payload: &[u8]) -> Result<u32, NetlinkDecod
 /// Decode one Linux `NETLINK_ROUTE` multicast datagram into bounded triggers.
 ///
 /// This is pure and portable so malformed-input tests run on macOS and
-/// Windows. Link and address messages always trigger fresh observation. Every
-/// IPv4/IPv6 route change invalidates cached routing state: external `/0`
-/// changes are classified as default-route changes, external non-default
-/// prefixes as connectivity changes, and protocol-186 routes separately so a
-/// caller may suppress only an exactly revalidated owned mutation. Policy-rule
-/// messages have their own invalidation class.
+/// Windows. Link and address messages trigger fresh observation except for an
+/// exact `RTM_NEWLINK` `IFF_PROMISC`-only observer transition. Every IPv4/IPv6
+/// route change invalidates cached routing state: external `/0` changes are
+/// classified as default-route changes, external non-default prefixes as
+/// connectivity changes, and protocol-186 routes separately so a caller may
+/// suppress only an exactly revalidated owned mutation. Policy-rule messages
+/// have their own invalidation class.
 pub fn decode_rtnetlink_datagram(datagram: &[u8]) -> Result<NetworkChangeSet, NetlinkDecodeError> {
     if datagram.is_empty() {
         return Err(NetlinkDecodeError::EmptyDatagram);
@@ -657,7 +674,9 @@ pub fn decode_rtnetlink_datagram(datagram: &[u8]) -> Result<NetworkChangeSet, Ne
             NLMSG_OVERRUN => return Err(NetlinkDecodeError::KernelOverrun),
             RTM_NEWLINK | RTM_DELLINK => {
                 validate_attributes(message_type, payload, IFINFO_MESSAGE_BYTES)?;
-                changes.insert(NetworkChangeKind::InterfaceSetChanged);
+                if !link_notification_is_promiscuity_only(message_type, payload) {
+                    changes.insert(NetworkChangeKind::InterfaceSetChanged);
+                }
             }
             RTM_NEWADDR | RTM_DELADDR => {
                 validate_attributes(message_type, payload, IFADDR_MESSAGE_BYTES)?;
@@ -979,6 +998,12 @@ mod tests {
         payload
     }
 
+    fn link_payload(change: u32) -> [u8; IFINFO_MESSAGE_BYTES] {
+        let mut payload = [0u8; IFINFO_MESSAGE_BYTES];
+        payload[12..16].copy_from_slice(&change.to_ne_bytes());
+        payload
+    }
+
     #[test]
     fn change_set_is_fixed_and_iterates_in_canonical_order() {
         let changes: NetworkChangeSet = [
@@ -1081,6 +1106,54 @@ mod tests {
         assert!(changes.contains(NetworkChangeKind::InterfaceSetChanged));
         assert!(changes.contains(NetworkChangeKind::InterfaceAddressChanged));
         assert!(changes.contains(NetworkChangeKind::DefaultRouteChanged));
+    }
+
+    #[test]
+    fn decoder_ignores_exact_promiscuity_only_newlink_observer_transition() {
+        let datagram = netlink_message(RTM_NEWLINK, &link_payload(LINUX_IFF_PROMISC));
+
+        assert!(decode_rtnetlink_datagram(&datagram).unwrap().is_empty());
+    }
+
+    #[test]
+    fn promiscuity_only_notification_does_not_mask_a_default_route_change() {
+        let mut datagram = netlink_message(RTM_NEWLINK, &link_payload(LINUX_IFF_PROMISC));
+        datagram.extend(netlink_message(
+            RTM_NEWROUTE,
+            &route_payload(LINUX_AF_INET, 0),
+        ));
+
+        assert_eq!(
+            decode_rtnetlink_datagram(&datagram).unwrap(),
+            NetworkChangeKind::DefaultRouteChanged.into()
+        );
+    }
+
+    #[test]
+    fn decoder_keeps_mixed_or_non_newlink_promiscuity_changes_fail_closed() {
+        let mut datagram = netlink_message(RTM_NEWLINK, &link_payload(LINUX_IFF_PROMISC | 0x0001));
+        datagram.extend(netlink_message(
+            RTM_DELLINK,
+            &link_payload(LINUX_IFF_PROMISC),
+        ));
+
+        let changes = decode_rtnetlink_datagram(&datagram).unwrap();
+        assert_eq!(changes, NetworkChangeKind::InterfaceSetChanged.into());
+    }
+
+    #[test]
+    fn promiscuity_only_notification_still_requires_structurally_valid_attributes() {
+        let mut payload = link_payload(LINUX_IFF_PROMISC).to_vec();
+        payload.extend_from_slice(&3u16.to_ne_bytes());
+        payload.extend_from_slice(&1u16.to_ne_bytes());
+
+        assert!(matches!(
+            decode_rtnetlink_datagram(&netlink_message(RTM_NEWLINK, &payload)),
+            Err(NetlinkDecodeError::InvalidAttributeLength {
+                message_type: RTM_NEWLINK,
+                ..
+            })
+        ));
     }
 
     #[test]
