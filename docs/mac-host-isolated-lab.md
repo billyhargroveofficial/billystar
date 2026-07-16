@@ -63,8 +63,8 @@ Inside that VM:
    namespace;
 3. leave no lab listener, route, TUN or firewall object in the guest-root
    namespace;
-4. use a guest-local checkout at a pinned pushed commit, transferred only
-   through explicit OrbStack push/pull;
+4. use a guest-local checkout at a pinned pushed commit, transferred as a
+   bounded hash-verified stdin stream through the already bound opaque VM ID;
 5. keep build output, credentials and raw evidence guest-local;
 6. bound endpoints, bytes, rate and wall-clock duration;
 7. destroy or revert the disposable machine after the run.
@@ -79,6 +79,20 @@ capability-isolated proof path.
 OrbStack machines share one Linux kernel. This boundary is appropriate for
 testing trusted Shadowpipe code and fault injection, not for containing a
 hostile kernel exploit.
+
+The dedicated `shadowpipe-lab-base` now exists and is stopped. Its observed
+profile is `isolated=true`, `isolate_network=true`,
+`forward_ssh_agent=false`, with zero HTTP/HTTPS forwards, 6 GiB memory, four
+CPUs and a 32 GiB disk. The guest toolchain, TUN device, overlayfs, netns,
+nftables/iptables, tcpdump and Rust build were verified before it was stopped.
+
+In the installed OrbStack version, `orbctl push/pull` attempted to use the
+disabled read-only sharing layer of the isolated machine. The hardened runner
+therefore must not depend on those commands. Source enters through bounded
+stdin to a root-owned create-only guest file; sealed evidence returns through
+bounded stdout. Both directions require SHA-256 and byte-count agreement, and
+the host extractor rejects absolute paths, traversal, duplicate entries,
+links, devices and oversized archives.
 
 ## Native macOS boundary
 
