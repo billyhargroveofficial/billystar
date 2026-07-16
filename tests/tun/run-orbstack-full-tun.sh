@@ -429,6 +429,14 @@ raise SystemExit(status if status >= 0 else 128 - status)
 PY
 }
 
+file_size_bytes() {
+  local path="$1" size
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  size="$(LC_ALL=C wc -c <"${path}" | tr -d '[:space:]')" || return 1
+  [[ "${size}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${size}"
+}
+
 run_recorded_limited() {
   local seconds="$1" output="$2" stdout_limit="$3" stderr_limit="$4"
   shift 4
@@ -473,8 +481,8 @@ run_recorded_limited() {
   fi
   [[ -f "${output}" && ! -L "${output}" \
     && -f "${output}.stderr" && ! -L "${output}.stderr" ]] || status=125
-  stdout_size="$(stat -f '%z' "${output}" 2>/dev/null || printf '%s' 0)"
-  stderr_size="$(stat -f '%z' "${output}.stderr" 2>/dev/null || printf '%s' 0)"
+  stdout_size="$(file_size_bytes "${output}" 2>/dev/null || printf '%s' 0)"
+  stderr_size="$(file_size_bytes "${output}.stderr" 2>/dev/null || printf '%s' 0)"
   [[ "${stdout_size}" =~ ^[0-9]+$ && "${stderr_size}" =~ ^[0-9]+$ ]] \
     || status=125
   if (( stdout_size > stdout_limit || stderr_size > stderr_limit )); then
@@ -3531,7 +3539,7 @@ PY
       {
         printf 'guest_evidence_transfer=validated_stream\n'
         printf 'guest_evidence_archive_bytes=%s\n' \
-          "$(stat -f '%z' "${guest_evidence_archive}")"
+          "$(file_size_bytes "${guest_evidence_archive}")"
         printf 'guest_evidence_archive_sha256=%s\n' \
           "$(sha256sum "${guest_evidence_archive}" | awk '{print $1}')"
       } >"${host_artifacts}/guest-evidence-transfer.env"
@@ -6919,8 +6927,8 @@ PY
   status=$?
   set -e
   [[ "${status}" == 125 \
-    && "$(stat -f '%z' "${temporary}/recorded-stdout-cap")" == 33 \
-    && "$(stat -f '%z' "${temporary}/recorded-stdout-cap.stderr")" -le 32 ]] \
+    && "$(file_size_bytes "${temporary}/recorded-stdout-cap")" == 33 \
+    && "$(file_size_bytes "${temporary}/recorded-stdout-cap.stderr")" -le 32 ]] \
     || die 1 "self-test did not fail closed at the recorded stdout byte cap"
   set +e
   run_recorded_limited 5 "${temporary}/recorded-stderr-cap" 32 32 \
@@ -6928,8 +6936,8 @@ PY
   status=$?
   set -e
   [[ "${status}" == 125 \
-    && "$(stat -f '%z' "${temporary}/recorded-stderr-cap")" -le 32 \
-    && "$(stat -f '%z' "${temporary}/recorded-stderr-cap.stderr")" == 33 ]] \
+    && "$(file_size_bytes "${temporary}/recorded-stderr-cap")" -le 32 \
+    && "$(file_size_bytes "${temporary}/recorded-stderr-cap.stderr")" == 33 ]] \
     || die 1 "self-test did not fail closed at the recorded stderr byte cap"
   set +e
   # shellcheck disable=SC2016
