@@ -786,7 +786,7 @@ import sys
 
 repo, root, expected = sys.argv[1:]
 
-def one_line(name):
+def one_line(name, allow_tab=False):
     path = os.path.join(root, name)
     info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -795,7 +795,11 @@ def one_line(name):
         lines = stream.read().splitlines()
     if len(lines) != 1 or not lines[0]:
         raise SystemExit(f"Git proof is not one nonempty line: {name}")
-    if any(ord(character) < 0x20 or ord(character) == 0x7f for character in lines[0]):
+    if any(
+        (ord(character) < 0x20 and not (allow_tab and character == "\t"))
+        or ord(character) == 0x7f
+        for character in lines[0]
+    ):
         raise SystemExit(f"Git proof contains a control byte: {name}")
     return lines[0]
 
@@ -815,7 +819,7 @@ if origin != head:
     raise SystemExit("Git HEAD differs from local origin/main")
 if expected and head != expected:
     raise SystemExit("Git HEAD changed during the lab")
-live = one_line("origin-main-live.txt").split("\t")
+live = one_line("origin-main-live.txt", allow_tab=True).split("\t")
 if live != [head, "refs/heads/main"]:
     raise SystemExit("Git HEAD differs from live pushed origin/main")
 with open(os.path.join(root, "checkout.env"), "x", encoding="ascii", newline="\n") as stream:
