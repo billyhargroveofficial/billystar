@@ -115,6 +115,7 @@ Thresholds may be adjusted only before outcome inspection and must change the ma
 
 ## Evidence links
 
-- [`planeb-01-RESULT.md`](../../review/01/planeb-01-RESULT.md)
-- [`planeb-02-shadowpipe-tunnel-RESULT.md`](../../review/01/planeb-02-shadowpipe-tunnel-RESULT.md)
+- The historical `planeb-01-RESULT.md` and
+  `planeb-02-shadowpipe-tunnel-RESULT.md` files are not present in the public
+  repository and are not current evidence.
 - [`claims-ledger.md`](../../docs/claims-ledger.md)
