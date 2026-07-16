@@ -210,9 +210,24 @@ a real systemd PID 1 service manager, resolver or DHCP change handling,
 suspend/resume, an IPv6 tunnel, native macOS or Windows clients, production
 deployment, field operation or censorship resistance.
 
+Current executable-source native Linux ARM64 portability is recorded separately
+in
+[`20260716T180304Z-linux-arm64-current`](tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md),
+pinned to clean commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`. Its disposable isolated clone
+verified 342 checksum entries over a 193-file, 4,464,041-byte frozen snapshot,
+including 102,293 physical code lines and 80,315 Rust lines. The no-default
+matrix passed 718 tests and the all-features matrix passed 732, with zero
+failures and four ignored in each; both strict Clippy profiles and all five
+partitioned runner self-tests were valid. Cleanup, Windows-suspended state,
+host safety and evidence were valid, and no privileged network mutation
+occurred. This is unprivileged CPU/filesystem portability with
+`field_evidence=false`, not TUN, route, DNS, firewall, service, production or
+censorship evidence.
+
 The earlier full-TUN bundle
 [`20260716T123535Z-91294-70zWb7`](tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
-and the native Linux ARM64 portability snapshot
+and the historical native Linux ARM64 portability snapshot
 [`20260716T122834Z-linux-arm64-current`](tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
 verified 342/342 checksums and a 187-entry frozen-source manifest with SHA-256
 `fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
@@ -220,8 +235,9 @@ Windows ARM64 H2 no-TUN
 [`20260716T125113Z-36840-dd0c2571`](tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
 verified 891/891 checksums, two authenticated sessions plus one rejection and
 an exact 1 MiB echo without Windows route/DNS/firewall/adapter mutation. These
-are retained captured-source snapshots with `field_evidence=false`, not
-validation of the current executable-source baseline. They do not establish
+older bundles are retained captured-source snapshots with
+`field_evidence=false`. The fresh Linux ARM64 cell does not refresh their
+privileged networking, recovery, reboot or Windows claims. None establishes
 IPv6, Windows Wintun, native macOS TUN safety, fleet rollout, hostile-network
 behavior or a release claim.
 See

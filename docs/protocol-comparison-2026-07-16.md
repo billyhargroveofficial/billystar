@@ -35,7 +35,7 @@ substantially stronger performance evidence.
 | Host safety | Signed authority, WAL-before-mutation, exact ownership and fail-closed Linux recovery | Broad platform support; host lifecycle safety depends on core/client/configuration | TUN lifecycle depends on client integration | Mature WireGuard-style interface lifecycle, usually simpler than a proxy stack |
 | Loss-path behavior | Current production path is one reliable TCP carrier; nested TCP can amplify head-of-line blocking | Vision/direct-copy paths avoid carrying every inner TCP packet through another TCP stream | Strongest option here on lossy/high-BDP UDP paths | Low overhead; application TCP handles its own loss recovery |
 | Roaming | Reconnect and endpoint rotation; native mobility integration is open | Mature reconnect/routing ecosystem | QUIC and port-hopping support | Authenticated roaming is a core WireGuard strength |
-| Current product readiness | Current executable-source Linux IPv4 full-TUN/default-route handoff evidence; older portability/crash/reboot/Windows cells are snapshot-bound; macOS native client absent | Mature cross-platform ecosystem | Mature cross-platform ecosystem | Mature cross-platform ecosystem |
+| Current product readiness | Current executable-source Linux IPv4 full-TUN/default-route handoff at `81f188f` plus separate unprivileged native ARM64 portability at `726500f`; recovery/reboot/Windows remain snapshot-bound; macOS native client absent | Mature cross-platform ecosystem | Mature cross-platform ecosystem | Mature cross-platform ecosystem |
 
 ## Where Shadowpipe is already stricter
 
@@ -98,6 +98,14 @@ It emulated `Restart=always`/`RestartSec=1s`; it did not run real systemd PID 1.
 Resolver/DHCP/suspend integration, in-process migration and native macOS/Windows
 mobility remain open. The full sealed bundle, including its large raw c1 pcap,
 remains local/ignored; the compact index publishes pcap hashes.
+
+Native Linux ARM64 portability is current separately at clean commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`:
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
+passed 718/0/4 no-default and 732/0/4 all-features tests, both strict Clippy
+profiles and all five runner self-tests across a 193-file snapshot. This is
+unprivileged CPU/filesystem evidence only. It does not establish a privileged
+handoff at `726500f` or refresh recovery, reboot or Windows.
 
 ## Where current alternatives are stronger
 

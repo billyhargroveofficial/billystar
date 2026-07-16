@@ -311,22 +311,26 @@ explicit release across 650/650 checksum entries. It has no paired tunnel and no
 production/initrd/L2/FORWARD claim. Both results are `field_evidence=false`. See
 [`phase3-production-safety.md`](phase3-production-safety.md).
 
-Native Linux ARM64 captured-source portability run
+Native Linux ARM64 current executable-source portability run
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
+verified clean commit `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7` with
+342 checksum entries across a 193-file, 4,464,041-byte snapshot. It counted
+102,293 physical code lines including 80,315 Rust; no-default passed 718/0/4,
+all-features 732/0/4, both strict Clippy profiles and all five runner self-tests
+were valid. Clone cleanup, Windows-suspended state, host safety and evidence
+were valid. It made no privileged network mutation and has
+`field_evidence=false`. The older
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
-verified 342/342 entries for frozen source manifest
-`fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`,
-including both workspace test feature sets and strict Clippy. Later
-documentation-only finalization left the 165 non-Markdown source files
-unchanged relative to that capture at the time of the recorded recheck. Later
-executable network-change work means this is now a frozen snapshot rather than
-current executable-source evidence. It made no privileged network mutation.
+remains snapshot-bound history for its own 187-file capture.
 Windows 11 ARM64 run
 [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
 verified 891/891 entries for H2 no-TUN v3 auth, missing-pin/unenrolled negative
 controls and exact 1 MiB echo. Its 5,072,384-byte PE SHA-256 is
 `2734e79f98866910aa8e0386af4ff630191b0a72fd1945177f078cb69d500bad`.
-Neither run is current executable-source native Windows TUN, privileged Linux
-networking, censorship or production evidence.
+The fresh Linux portability run is current only for unprivileged ARM64
+CPU/filesystem behavior; Windows remains snapshot-bound. Neither is native
+Windows TUN, privileged Linux networking, censorship or production evidence,
+and neither refreshes same-boot recovery or reboot.
 
 Mac host-safety evidence is bounded before/after observation, not continuous
 monitoring. Loaded PF runtime remained unavailable without privilege and is not

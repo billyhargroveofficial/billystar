@@ -22,7 +22,7 @@ macOS/Windows system-VPN backends остаются открытыми gates.
 | **0** | PQ handshake, encrypted frames, padding, echo mode |
 | **1** | TUN/data-plane code для Mac/Linux/Windows, stream mux и IP tunnel; synthetic OrbStack Linux IPv4 OS-TUN/leak/cut/recovery proof — PASS, native Windows/macOS TUN и IPv6 matrices остаются отдельными gates |
 | **2** | **h2-chunk** camouflage, Linux-first fail-closed **auto-route**, persistent server keys и VPS deploy; synthetic Linux IPv4 runtime gate закрыт, production/field gate — нет |
-| **3** | Строгая подписанная endpoint-policy v2, bounded live DNS/endpoint transactions, durable REALITY replay admission и crash-safe Linux host-state WAL/recovery; current executable-source Linux full-TUN network-handoff cell — scoped PASS, более ранние portability/crash/reboot/Windows bundles — snapshot-bound |
+| **3** | Строгая подписанная endpoint-policy v2, bounded live DNS/endpoint transactions, durable REALITY replay admission и crash-safe Linux host-state WAL/recovery; current executable-source Linux full-TUN network-handoff и native ARM64 portability cells — scoped PASS, recovery/reboot/Windows bundles — snapshot-bound |
 
 ## Phase 3: production-safety mechanisms, не production claim
 
@@ -64,8 +64,7 @@ state:
 
 Точный protocol, failure ordering и границы доказательств описаны в
 [`docs/phase3-production-safety.md`](docs/phase3-production-safety.md).
-Current executable-source Linux evidence привязан к commit
-`81f188f772cc6b674fde748a361691f1bda19691`:
+Current executable-source Linux evidence состоит из двух раздельных cells:
 
 - isolated Linux full-TUN/default-route handoff:
   [`20260716T173837Z-18283-m8K2po`](tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md),
@@ -76,9 +75,18 @@ Current executable-source Linux evidence привязан к commit
   `DefaultRouteChanged`; generation 1 exited `1` behind strict durable lockdown
   with the main WAL absent, generation 2 became `Active` through `c1`, and the
   final manager-gated stop produced no generation 3.
+- native Linux ARM64 portability:
+  [`20260716T180304Z-linux-arm64-current`](tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md),
+  pinned to clean executable-source commit
+  `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`, `PASS`,
+  `overall_status=valid`, 342 checksum entries and a 193-file,
+  4,464,041-byte frozen source snapshot. It counted 102,293 physical code lines,
+  including 80,315 Rust lines; no-default passed 718 tests and all-features
+  passed 732, with zero failures and four ignored in each. Both strict Clippy
+  profiles and all five partitioned runner self-tests were valid.
 
 Пять более ранних sealed bundles остаются действительными только для своих
-точных frozen snapshots: Linux ARM64
+точных frozen snapshots: historical Linux ARM64
 [`20260716T122834Z-linux-arm64-current`](tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md),
 full-TUN [`20260716T123535Z-91294-70zWb7`](tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md),
 same-boot recovery
@@ -87,9 +95,10 @@ reboot lockdown
 [`20260716T124706Z-34564-reboot`](tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
 и Windows ARM64 no-TUN
 [`20260716T125113Z-36840-dd0c2571`](tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md).
-Executable source изменился после их capture, поэтому новый Linux handoff run не
-обновляет current-source status portability, all-resource host recovery, real
-reboot или Windows.
+Executable source изменился после их capture. Новый ARM64 run восстановил
+current executable-source portability отдельно от privileged handoff, но ни
+handoff cell, ни portability cell не обновляют all-resource host recovery,
+real reboot или Windows.
 
 Это implementation evidence, не production/field claim. Crash matrix моделирует
 same-boot process death через `SIGKILL`, а не power loss; reboot cell проверяет
@@ -471,10 +480,11 @@ invalid.
 
 Это узкий **synthetic Linux IPv4 tunnel + connected IPv6 OUTPUT-block/netns
 implementation proof**, не production/field/censor evidence. Runner эмулировал
-service restart/stop gate, а не реальный systemd PID 1. Он не доказывает
-portability текущего executable source, real reboot/host recovery, outer или
-inner IPv6, native Windows/macOS TUN, fleet rollout или continuous host
-non-mutation.
+service restart/stop gate, а не реальный systemd PID 1. Отдельный unprivileged
+ARM64 run на `726500f` доказывает current executable-source CPU/filesystem
+portability, но не обновляет этот privileged networking result. Не доказаны
+current-source real reboot/host recovery, outer или inner IPv6, native
+Windows/macOS TUN, fleet rollout или continuous host non-mutation.
 
 ## h2-chunk camouflage (legacy)
 
@@ -537,15 +547,17 @@ The current scoped security/evidence review is
 [`docs/security-audit-2026-07-16.md`](docs/security-audit-2026-07-16.md).
 The superseded pre-Phase-3 dependency/ML-KEM snapshot remains at
 [`docs/security-audit-2026-07-15.md`](docs/security-audit-2026-07-15.md).
-Current executable-source platform evidence is limited to the isolated Linux
-full-TUN handoff run
+Current executable-source platform evidence is limited to two separate Linux
+cells: the privileged full-TUN handoff run
 [`20260716T173837Z-18283-m8K2po`](tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
 with tracked compact
-[`PUBLISHED-EVIDENCE.md`](tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md).
-The earlier Linux ARM64, full-TUN, host-recovery, reboot and Windows no-TUN
-bundles are snapshot-bound after executable source drift. In particular, the
-Windows result does not exercise Wintun or mutate Windows routes, DNS, firewall,
-or adapters.
+[`PUBLISHED-EVIDENCE.md`](tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md)
+at `81f188f`, and the unprivileged native ARM64 portability run
+[`20260716T180304Z-linux-arm64-current`](tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
+at `726500f`. The old `122834` ARM64 result, earlier full-TUN, host-recovery,
+reboot and Windows no-TUN bundles remain snapshot-bound history. In particular,
+the Windows result does not exercise Wintun or mutate Windows routes, DNS,
+firewall, or adapters.
 The experiment manifests under
 [`experiments/`](experiments/) are design drafts, not field evidence or frozen
 preregistrations. The VM-only impairment harness is documented in

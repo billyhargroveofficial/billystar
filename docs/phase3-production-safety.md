@@ -10,7 +10,7 @@ audit, or evidence of resistance to a real censor.
 |---|---|---|
 | Signed policy, endpoint coordinator, host journal and recovery adapters | Implemented with adversarial unit/component tests | Cryptographic review, fleet-safe rollout, or a green release pipeline |
 | Current executable-source Linux full-TUN handoff | [`RESULT.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md) plus tracked compact [`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md), commit `81f188f772cc6b674fde748a361691f1bda19691`: scoped PASS, overall/test/cleanup/host-safety valid, 745/745 local sealed-manifest entries | Real systemd PID 1, production, real reboot, native macOS/Windows, outer/inner IPv6 or field behavior |
-| Native Linux ARM64 portability | Snapshot-bound [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md): scoped PASS, 342/342 checksums, 187/187 frozen-source manifest | Current executable-source portability, privileged networking, production or field behavior |
+| Current executable-source native Linux ARM64 portability | [`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md), clean commit `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`: scoped PASS, 342 checksum entries, 193 files, 4,464,041 bytes, 102,293 code lines including 80,315 Rust; tests 718/0/4 and 732/0/4; strict Clippy and all five runner self-tests valid | Privileged networking, production, field behavior, or a refresh of recovery/reboot/Windows |
 | Earlier Linux full-TUN runtime | Snapshot-bound [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md): scoped PASS, 573/573 checksum entries | Current network-handoff implementation, IPv6, native Windows/macOS TUN, production or field behavior |
 | Linux same-boot crash recovery | Snapshot-bound [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md): 29/29 scenarios, 1443/1443 checksum entries | Current executable-source host recovery, kernel reboot, torn writes or power-loss storage semantics |
 | Linux reboot lockdown | Snapshot-bound [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md): distinct boot IDs, restore 2,995 us before networkd, 650/650 checksum entries | Current executable-source reboot behavior, paired tunnel recovery, production/initrd/L2/FORWARD behavior |
@@ -20,14 +20,15 @@ audit, or evidence of resistance to a real censor.
 
 These are synthetic disposable-guest implementation results with
 `field_evidence=false`, not one combined production certification. Executable
-source changed after the five earlier captures, so they remain valid only for
-their exact frozen snapshots. The new current-source cell proves only the
-isolated Linux IPv4 full-TUN/default-route handoff and connected IPv6
-OUTPUT-block scope. It does not refresh native ARM64 portability, the
-all-resource same-boot crash matrix, real reboot behavior or Windows. Its
-supervisor emulates the installed `Restart=always`/`RestartSec=1s` contract; it
-is not real systemd PID 1. None of these synthetic results is field-censorship
-evidence.
+source changed after the older captures, so they remain valid only for their
+exact frozen snapshots. Current executable-source status is split: commit
+`81f188f` has the privileged Linux IPv4 full-TUN/default-route handoff and
+connected IPv6 OUTPUT-block cell, while clean commit `726500f` has the
+unprivileged native ARM64 CPU/filesystem portability cell. Neither refreshes the
+all-resource same-boot crash matrix, real reboot behavior or Windows. The
+handoff supervisor emulates the installed `Restart=always`/`RestartSec=1s`
+contract; it is not real systemd PID 1. None of these synthetic results is
+field-censorship evidence.
 
 ## 1. Trust and policy object
 
@@ -324,25 +325,31 @@ generation-specific SP6 chains counted 21 and 11 dropped packets.
 
 This is a synthetic IPv4 tunnel plus connected-netns IPv6 OUTPUT-block result.
 It does not establish outer or inner IPv6, inbound/L2/FORWARD behavior, a real
-reboot, current-source portability or all-resource crash recovery, native
-macOS/Windows VPNs, production operation, censorship resistance or field
-availability.
+reboot or all-resource crash recovery, native macOS/Windows VPNs, production
+operation, censorship resistance or field availability. Current-source native
+ARM64 portability is established only by the separate unprivileged cell below;
+it does not upgrade this privileged result to commit `726500f`.
 
-### Snapshot-bound native Linux ARM64 portability cell
+### Current executable-source native Linux ARM64 portability cell
 
 Run
-[`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
-built and tested the frozen current source natively in a disposable Linux ARM64
-clone. The no-default matrix passed 671 tests and the all-features matrix passed
-685, each with three ignored tests and zero failures; both strict Clippy gates,
-format, metadata, shell syntax and runner self-test partitions passed. All
-342 checksum entries verified. The frozen source manifest contained exactly
-187 entries and its SHA-256 was
-`fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
+built and tested clean executable-source commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7` natively in a disposable isolated
+Linux ARM64 clone. The no-default matrix passed 718 tests and the all-features
+matrix passed 732, each with four ignored tests and zero failures; both strict
+Clippy gates, format, metadata, shell syntax and all five partitioned runner
+self-tests passed. All 342 checksum entries verified. The frozen snapshot
+contained 193 files and 4,464,041 bytes, including 102,293 physical code lines
+and 80,315 Rust lines.
 
-This was unprivileged CPU/filesystem portability only: no route, DNS, firewall,
-TUN, netns, qdisc, sysctl or service mutation occurred. Later executable-source
-changes mean this result no longer proves current-source portability.
+This is unprivileged CPU/filesystem portability only: no route, DNS, firewall,
+TUN, netns, qdisc, sysctl or service mutation occurred. Clone cleanup,
+Windows-suspended state, host safety and evidence were valid;
+`field_evidence=false`. It does not refresh privileged networking, same-boot
+recovery, reboot or Windows. The older
+[`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
+remains snapshot-bound history for its own 187-file capture.
 
 ### Snapshot-bound earlier full-TUN Linux IPv4/netns cell
 
@@ -455,8 +462,9 @@ Mac.
 
 ## 8. What remains open
 
-- Re-run native Linux ARM64 portability, all-resource same-boot recovery, real
-  reboot and Windows no-TUN cells against the current executable source.
+- Re-run all-resource same-boot recovery, real reboot and Windows no-TUN cells
+  against the current executable source; native Linux ARM64 portability is
+  current only at `726500f`.
 - Exercise the installed units under real systemd PID 1 rather than only the
   handoff harness supervisor.
 - Add resolver-configuration observation, explicit DHCP lease/lifetime

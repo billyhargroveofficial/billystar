@@ -1,21 +1,27 @@
 # Scoped security and current-source validation audit — 2026-07-16
 
-Status: executable-source commit
-`81f188f772cc6b674fde748a361691f1bda19691` has one current-source privileged
-Linux full-TUN **PASS**, scoped to an isolated disposable OrbStack clone and
-private namespaces. Later edits to this audit are documentation drift, not
-executable drift. Earlier bundles in this document remain valid captured-source
-snapshots for their own frozen commits; they are not substitutes for the tested
-executable baseline. This is engineering evidence, not an independent
-cryptographic audit, production certification, formal proof, field-censorship
-result, or claim that Shadowpipe is unblockable or indistinguishable.
+Status: two separate executable-source Linux cells are current. Commit
+`81f188f772cc6b674fde748a361691f1bda19691` has the privileged full-TUN
+handoff **PASS**, scoped to an isolated disposable OrbStack clone and private
+namespaces. Clean commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7` has the unprivileged native ARM64
+CPU/filesystem portability **PASS**. Later edits to this audit are documentation
+drift, not evidence that either tested executable baseline changed. Earlier
+bundles remain valid captured-source snapshots for their own frozen commits;
+they are not substitutes for either current cell. This is engineering evidence,
+not an independent cryptographic audit, production certification, formal proof,
+field-censorship result, or claim that Shadowpipe is unblockable or
+indistinguishable.
 
 This document supersedes the implementation-status conclusions in the
 historical [2026-07-15 dependency and key-storage audit](security-audit-2026-07-15.md).
 Older result bundles remain useful diagnostics and scoped historical evidence,
 but only
 [`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
-supports a privileged current executable-source Linux full-TUN statement.
+supports a privileged current executable-source Linux full-TUN statement, while
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
+supports a separate unprivileged current executable-source ARM64 portability
+statement.
 
 ## Executive verdict
 
@@ -33,12 +39,14 @@ The current commit has credible scoped laboratory evidence for:
 - manager-gated final shutdown with no generation 3, continued IPv4/IPv6
   lockdown and explicit release;
 - ICMP/TCP/UDP/DNS, a verified 64 MiB transfer and carrier-cut recovery within
-  a seven-second upper bound.
+  a seven-second upper bound;
+- native Linux ARM64 compilation/test portability of clean commit `726500f`,
+  including both feature profiles, strict Clippy and all runner self-tests.
 
-Captured snapshots additionally record native Linux ARM64 portability, a
+Captured snapshots additionally retain the older `122834` ARM64 run, a
 same-boot eight-resource crash matrix, an early-userspace reboot lockdown cell,
-and Windows 11 ARM64 H2/no-TUN behavior. They are not validation of the current
-executable-source baseline.
+an earlier full-TUN run and Windows 11 ARM64 H2/no-TUN behavior. They are not
+validation of either current executable-source cell.
 
 It does **not** yet have evidence for:
 
@@ -67,6 +75,16 @@ returned a validated sealed archive through bounded stdout. It contains 745
 checksum entries and records valid host safety, clone cleanup, evidence sealing,
 source isolation and private-material scans.
 
+The current portability bundle captured clean commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7` into a 193-file,
+4,464,041-byte frozen snapshot and verified 342 checksum entries. It counted
+102,293 physical code lines, including 80,315 Rust lines. The no-default and
+all-features matrices passed 718 and 732 tests respectively, with zero failures
+and four ignored in each; both strict Clippy profiles and all five partitioned
+runner self-tests were valid. Clone cleanup, Windows-suspended state, host
+safety and evidence were valid. It made no privileged network mutation and has
+`field_evidence=false`.
+
 The older Linux ARM64 snapshot froze 187 files with manifest SHA-256
 `fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
 It and the other pre-`81f188f` bundles remain evidence for the exact source they
@@ -77,7 +95,8 @@ their individual captured results remain internally valid.
 | Evidence bundle | Source relation | Scope established | Explicit non-claim |
 |---|---|---|---|
 | [Linux full-TUN `20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md) | **Current executable source `81f188f`; PASS; 745 checksum entries** | Isolated disposable Linux/private-netns IPv4 TUN; REALITY/v3 auth; exact default-route handoff and process replacement; PROMISC regression; connected-IPv6 OUTPUT blocking; manager-stop/no-generation-3; ICMP/TCP/UDP/DNS/64 MiB/cut recovery; host/source/secret/cleanup safety | No real systemd PID 1, resolver/DHCP/suspend event, IPv6 tunnel, native macOS/Windows, production, field or censorship result |
-| [Linux ARM64 `20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md) | Captured snapshot; `PASS`; 342/342 checksum entries | Native ARM64 CPU/filesystem portability, format, metadata and frozen test/Clippy matrices | Not current executable source; no privileged route, DNS, firewall, TUN, namespace, service or field behavior |
+| [Linux ARM64 `20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md) | **Current executable source `726500f`; PASS; 342 checksum entries; 193 files** | Native ARM64 CPU/filesystem portability; tests 718/0/4 and 732/0/4; strict Clippy; format/metadata/shell; all five runner self-tests; cleanup/host safety | No privileged route, DNS, firewall, TUN, namespace, service, recovery, reboot, Windows, production or field behavior |
+| [Historical Linux ARM64 `20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md) | Captured snapshot; `PASS`; 342/342 checksum entries | Native ARM64 CPU/filesystem portability, format, metadata and frozen test/Clippy matrices for its old source | Not current executable source; no privileged route, DNS, firewall, TUN, namespace, service or field behavior |
 | [Earlier full-TUN `20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md) | Captured snapshot; `PASS`; 573/573 checksum entries | Earlier disposable Linux IPv4/private-netns TUN, carrier cut/reconnect, explicit lockdown release and foreign named-TUN collision | Not current executable source; no network-change process-replacement proof |
 | [Phase 3 `20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md) | Captured snapshot; `PASS`; 1,443/1,443 checksum entries | Same-boot `SIGKILL` cuts across schema-v3 eight-resource apply and recovery boundaries | Not current executable source; no real reboot, power-loss or current handoff proof |
 | [Reboot lockdown `20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md) | Captured snapshot; `PASS`; 650/650 checksum entries | Early-userspace local Linux L3 OUTPUT barrier across one guest reboot | Not current executable source; no paired tunnel or current handoff proof |
@@ -86,11 +105,10 @@ their individual captured results remain internally valid.
 The manifests are relative SHA-256 evidence inventories. They are not externally
 signed, independently timestamped or laboratory-attested.
 
-## Captured local and dependency gates
+## Current portability and captured dependency gates
 
-The pre-`81f188f` frozen snapshot passed the following local gate classes. These
-commands document captured regression evidence and must not be represented as a
-fresh matrix for the current executable source:
+The clean `726500f` native ARM64 snapshot passed the following current
+portability gate classes:
 
 ```text
 cargo fmt --all -- --check
@@ -98,21 +116,18 @@ cargo test --workspace --no-default-features --all-targets --locked
 cargo test --workspace --all-features --all-targets --locked
 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-./scripts/test-all.sh
-./scripts/test-local.sh
-./scripts/test-deploy-render.sh
 all non-result shell scripts: bash -n and ShellCheck 0.11.0
 all five VM/Windows runners: --self-test
-target/tools/cargo-audit/bin/cargo-audit audit -D warnings
 ```
 
-That frozen native Linux ARM64 snapshot records 671 passed tests in the
-no-default profile and 685 in the all-features profile, with 0 failed and 3
-ignored in each. A later local release-suite run after the security fixes
-registered 709 tests and passed. These counts describe different harness
-aggregations and must not be added together.
+That current snapshot records 718 passed tests in the no-default profile and
+732 in the all-features profile, with 0 failed and 4 ignored in each. The
+historical `122834` ARM64 snapshot recorded 671 and 685 passed tests, with
+0 failed and 3 ignored in each. A separate local release-suite run after the
+security fixes registered 709 tests and passed. These counts describe different
+source snapshots or harness aggregations and must not be added together.
 
-The captured dependency gate used cargo-audit 0.22.2, scanned 276 locked
+The separately captured dependency gate used cargo-audit 0.22.2, scanned 276 locked
 packages against a fetched RustSec database containing 1,160 advisories, and
 returned success under `-D warnings`. This is a known-advisory, yanked-package
 and unmaintained dependency check. It is not source review, provenance

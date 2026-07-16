@@ -1,12 +1,15 @@
 # VM-only lab runbook
 
-Статус: на 2026-07-16 current executable-source commit
-`81f188f772cc6b674fde748a361691f1bda19691` имеет один privileged synthetic
-Linux full-TUN PASS; последующие изменения этого runbook считаются
-documentation drift:
+Статус: на 2026-07-16 есть две раздельные current executable-source Linux
+cells. Privileged synthetic full-TUN handoff PASS привязан к commit
+`81f188f772cc6b674fde748a361691f1bda19691`; последующие изменения этого
+runbook считаются documentation drift:
 [`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md).
+Unprivileged native Linux ARM64 portability PASS привязан к clean commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`:
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md).
 Более ранние PASS bundles сохраняют значение только как captured-source
-snapshots своих frozen commits: native Linux ARM64 portability
+snapshots своих frozen commits: historical native Linux ARM64 portability
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md),
 предыдущий full-TUN IPv4/netns
 [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md),
@@ -145,19 +148,27 @@ Cross-guest Windows→OrbStack is a portability smoke only: first prove reachabi
 
 Exit gate: zero unexplained data corruption; a local correctness error must never be labeled censor action.
 
-#### Native Linux ARM64 captured-source cell — PASS for frozen snapshot
+#### Native Linux ARM64 current executable-source cell — PASS
 
 Run
-[`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
-в disposable Linux ARM64 clone прошёл no-default 671/0 и all-features 685/0
-test matrices, обе strict Clippy matrices, format/metadata/shell gates и
-partitioned runner self-tests. Все 342/342 checksum entries проверены. Frozen
-source manifest содержал 187/187 files и имел SHA-256
-`fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
+в disposable isolated Linux ARM64 clone проверил clean executable-source commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`. No-default matrix прошла
+718 tests, all-features — 732; обе дали zero failures и four ignored. Обе
+strict Clippy matrices, format/metadata/shell gates и все пять partitioned
+runner self-tests были valid. Все 342 checksum entries проверены. Frozen source
+snapshot содержал 193 files и 4,464,041 bytes: 102,293 physical code lines,
+включая 80,315 Rust lines.
 
 Scope — native ARM64 CPU/filesystem portability без route, DNS, firewall, TUN,
 netns, qdisc, sysctl или service mutation. Это не privileged network и не field
-evidence.
+evidence. Clone cleanup, Windows-suspended state, host safety and evidence were
+valid; `field_evidence=false`.
+
+Старый
+[`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
+остаётся валидной snapshot-bound историей своего 187-file capture, но новый run
+заменяет его как current executable-source portability cell.
 
 #### Current Linux IPv4 OS-TUN + network handoff cell — PASS
 

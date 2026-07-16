@@ -1,6 +1,6 @@
 # Architecture: Causal Carrier Plane
 
-Статус: research architecture, не production claim. Центральная **гипотеза о новизне** — совместить выбор topology с причинно интерпретируемым доказательством того, почему carrier помог или не помог. Это не утверждение «first/new»: оно остаётся `E0`. Текущая [versioned related-work matrix](related-work-matrix-2026.md) задаёт первичные границы, но сама не закрывает novelty review: нужны воспроизводимый systematic search и независимая проверка. Current privileged Linux evidence ниже относится только к executable-source commit `81f188f772cc6b674fde748a361691f1bda19691`; последующие изменения документа являются documentation drift, а более ранние portability/recovery/reboot/Windows bundles остаются captured-source snapshots.
+Статус: research architecture, не production claim. Центральная **гипотеза о новизне** — совместить выбор topology с причинно интерпретируемым доказательством того, почему carrier помог или не помог. Это не утверждение «first/new»: оно остаётся `E0`. Текущая [versioned related-work matrix](related-work-matrix-2026.md) задаёт первичные границы, но сама не закрывает novelty review: нужны воспроизводимый systematic search и независимая проверка. Current privileged Linux evidence ниже относится только к executable-source commit `81f188f772cc6b674fde748a361691f1bda19691`; отдельная unprivileged native ARM64 portability cell относится к clean commit `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`. Последующие изменения документа являются documentation drift, а recovery/reboot/Windows и старые portability/full-TUN bundles остаются captured-source snapshots.
 
 ## 1. Design thesis
 
@@ -443,13 +443,17 @@ run
 [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
 proved early-userspace local OUTPUT barrier before networkd and explicit
 release, 650/650 checksum entries в своём captured snapshot. Native Linux ARM64
-captured-source run
+current executable-source run
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
+sealed 342 checksum entries for clean commit
+`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`: 193 files / 4,464,041 bytes,
+102,293 physical code lines including 80,315 Rust, test matrices 718/0/4 and
+732/0/4, both strict Clippy profiles and all five runner self-tests valid.
+Clone cleanup, Windows-suspended state, host safety and evidence were valid;
+privileged network mutation was false and `field_evidence=false`. Старый
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
-sealed 342/342 entries against the frozen-at-capture source manifest
-`fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`;
-subsequent documentation-only finalization did not change its 165 non-Markdown
-source files на момент той проверки; более поздние executable изменения делают
-bundle frozen snapshot. Это unprivileged CPU/filesystem portability, не network proof.
+остаётся snapshot-bound history своего 187-file capture. Ни один ARM64
+portability run не является privileged network proof.
 Native Windows
 11 ARM64 no-TUN H2 run
 [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
@@ -553,11 +557,12 @@ No experiment code may call macOS route/DNS/PF/service APIs. Compile-time target
 - Linux IPv4 full-tunnel and exact default-route process replacement have one
   completed synthetic privileged bundle for current executable commit
   `81f188f`.
-  Same-boot schema-v3 crash recovery, early-userspace reboot lockdown, Linux
-  ARM64 portability and Windows ARM64 no-TUN each have older captured-source
-  bundles. They do not combine into a production/field claim: real systemd PID
-  1, resolver/DHCP/suspend events, IPv6 tunnel, power-loss/torn-write durability,
-  paired-tunnel reboot recovery and every other OS native TUN/rollback proof
-  remain open.
+  Native Linux ARM64 CPU/filesystem portability has a separate current
+  executable-source bundle at `726500f`. Same-boot schema-v3 crash recovery,
+  early-userspace reboot lockdown and Windows ARM64 no-TUN retain older
+  captured-source bundles. These cells do not combine into a production/field
+  claim: real systemd PID 1, resolver/DHCP/suspend events, IPv6 tunnel,
+  power-loss/torn-write durability, paired-tunnel reboot recovery and every
+  other OS native TUN/rollback proof remain open.
 - Any failure restores guest state without touching the Mac or its sing-box.
 - No artefact contains secrets or production IP credentials.

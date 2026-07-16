@@ -75,9 +75,20 @@ appeared.
 This closes only a synthetic isolated Linux IPv4 full-TUN/default-route handoff
 cell. The harness emulated `Restart=always`/`RestartSec=1s`; it did not run real
 systemd PID 1. Resolver/DHCP/suspend observation, native macOS/Windows sources,
-outer/inner IPv6 and in-process migration remain open. Five earlier Linux
-ARM64/full-TUN/host-recovery/reboot/Windows bundles are snapshot-bound after
-executable-source drift; this run does not refresh their current-source status.
+outer/inner IPv6 and in-process migration remain open.
+
+Current unprivileged native Linux ARM64 portability is recorded separately at
+clean commit `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7` in
+[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md):
+342 checksum entries, 193 files / 4,464,041 bytes, 102,293 physical code lines
+including 80,315 Rust, test matrices 718/0/4 and 732/0/4, strict Clippy and all
+five runner self-tests valid. It performed no privileged network mutation and
+has `field_evidence=false`.
+
+The old `122834` ARM64, earlier full-TUN, host-recovery, reboot and Windows
+bundles remain snapshot-bound after executable-source drift. The fresh
+portability run does not refresh their privileged networking, recovery, reboot
+or Windows status.
 The complete 170,055,680-byte sealed bundle, including the 168,317,113-byte raw
 c1 IPv4 pcap, remains local/ignored; the tracked compact index publishes pcap
 hashes separately.
@@ -232,7 +243,7 @@ egress/NAT/service hardening ведётся отдельно.
 
 | Client platform | Что уже доказано в Shadowpipe | Clean-room mechanisms to adopt/adapt | Production Alpha gate |
 |---|---|---|---|
-| Linux client | Current executable-source isolated IPv4 full-TUN/default-route process replacement; REALITY/v3; route/DNS/firewall transaction; connected IPv6 OUTPUT block. Earlier ARM64, all-resource crash and reboot results are snapshot-bound | Complete native netlink route/rule/address mutation and nftables adapters; systemd-resolved control; `SO_MARK`/interface binding; resolver/DHCP/suspend events; typed MTU/offload observation | Real systemd PID-1 replacement, fresh ARM64/crash/reboot cells, IPv4 paired reboot recovery, power-loss/torn-write matrix, distro/kernel/network-manager matrix and 72-hour soak |
+| Linux client | Current executable-source isolated IPv4 full-TUN/default-route process replacement at `81f188f`; REALITY/v3; route/DNS/firewall transaction; connected IPv6 OUTPUT block. Separate current native ARM64 CPU/filesystem portability at `726500f`. All-resource crash and reboot remain snapshot-bound | Complete native netlink route/rule/address mutation and nftables adapters; systemd-resolved control; `SO_MARK`/interface binding; resolver/DHCP/suspend events; typed MTU/offload observation | Real systemd PID-1 replacement, fresh current-source crash/reboot cells, IPv4 paired reboot recovery, power-loss/torn-write matrix, distro/kernel/network-manager matrix and 72-hour soak |
 | macOS | Rust/core portability only; no native system VPN or host mutation evidence | `NEPacketTunnelProvider`; `NEPacketTunnelNetworkSettings`; provider-owned packet flow; `NWPathMonitor`; sleep/wake/reassert; Keychain; signed/notarized app plus minimal helper if required | A separate macOS VM or sacrificial Mac, as defined by [`mac-host-isolated-lab.md`](mac-host-isolated-lab.md), proves routes, DNS, IPv6 block, path changes, sleep/wake, provider crash and uninstall without touching the resident Mac VPN |
 | Windows | Snapshot-bound native ARM64 no-TUN H2/v3 client, auth negative controls and exact transfer; route/DNS unchanged | Wintun; IP Helper route/address/DNS APIs; WFP kill-switch; fixed authenticated named pipe; service SID/ACL; Authenticode pairing; power and interface notifications | Fresh current-source portability plus native Wintun packet path, exact owned-state WAL, IPv4 leak matrix, IPv6 block, DNS leak prevention, suspend/resume, service crash/reboot and clean uninstall in disposable Windows VM |
 
@@ -462,8 +473,9 @@ Active. It does not close the broader matrix below.
   workflow intentionally avoids code reuse.
 - It does not close native macOS or Windows TUN gates.
 - It does not add IPv6 support merely by documenting the staged decision.
-- The new Linux handoff run does not refresh the snapshot-bound Linux ARM64,
-  all-resource crash, reboot or Windows no-TUN bundles.
+- The Linux handoff run and the separate fresh ARM64 portability run do not
+  combine into a newer privileged-networking result. The old `122834` ARM64,
+  all-resource crash, reboot and Windows no-TUN bundles remain snapshot-bound.
 - It does not prove the installed units under real systemd PID 1.
 - It does not authorize touching, restarting or replacing the live macOS
   sing-box.
