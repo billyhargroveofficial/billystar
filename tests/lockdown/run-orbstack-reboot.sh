@@ -1749,7 +1749,7 @@ def run(arguments):
     return result.stdout.decode("utf-8")
 
 raw = run([
-    "systemctl", "show", "--all", unit,
+    "/usr/bin/systemctl", "show", "--all", unit,
     *[f"--property={name}" for name in properties],
 ])
 values = {}
@@ -1772,7 +1772,7 @@ unknown_property_rejected = False
 typed_empty_evidence = {}
 if typed_empty:
     loaded = run([
-        "busctl", "--system", "call",
+        "/usr/bin/busctl", "--system", "call",
         "org.freedesktop.systemd1",
         "/org/freedesktop/systemd1",
         "org.freedesktop.systemd1.Manager",
@@ -1788,7 +1788,7 @@ if typed_empty:
 
     def get_property(interface, name):
         payload = json.loads(run([
-            "busctl", "--system", "--json=short", "get-property",
+            "/usr/bin/busctl", "--system", "--json=short", "get-property",
             "org.freedesktop.systemd1", object_path,
             interface, name,
         ]))
@@ -1832,7 +1832,7 @@ if typed_empty:
         values[name] = ""
     unknown = subprocess.run(
         [
-            "busctl", "--system", "--json=short", "get-property",
+            "/usr/bin/busctl", "--system", "--json=short", "get-property",
             "org.freedesktop.systemd1", object_path,
             "org.freedesktop.systemd1.Service",
             "ShadowpipeUnknownPropertyProbe",
@@ -1938,7 +1938,7 @@ typed_empty_signatures = {
 
 def typed_empty_proof():
     loaded = run([
-        "busctl", "--system", "call",
+        "/usr/bin/busctl", "--system", "call",
         "org.freedesktop.systemd1",
         "/org/freedesktop/systemd1",
         "org.freedesktop.systemd1.Manager",
@@ -1954,7 +1954,7 @@ def typed_empty_proof():
 
     def get_property(interface, name):
         payload = json.loads(run([
-            "busctl", "--system", "--json=short", "get-property",
+            "/usr/bin/busctl", "--system", "--json=short", "get-property",
             "org.freedesktop.systemd1", object_path, interface, name,
         ]))
         if (
@@ -1994,7 +1994,7 @@ def typed_empty_proof():
         first[name] = payload
     unknown = subprocess.run(
         [
-            "busctl", "--system", "--json=short", "get-property",
+            "/usr/bin/busctl", "--system", "--json=short", "get-property",
             "org.freedesktop.systemd1", object_path,
             "org.freedesktop.systemd1.Service",
             "ShadowpipeUnknownPropertyProbe",
@@ -2041,7 +2041,7 @@ dbus_proof = typed_empty_proof()
 
 def properties():
     output = run([
-        "systemctl", "show", "--all", unit,
+        "/usr/bin/systemctl", "show", "--all", unit,
         *[f"--property={name}" for name in property_names],
     ])
     values = {}
@@ -2061,7 +2061,9 @@ def properties():
     return values
 
 def credential_failure_ids():
-    output = run(["journalctl", "-b", "-u", unit, "--no-pager", "-o", "json"])
+    output = run([
+        "/usr/bin/journalctl", "-b", "-u", unit, "--no-pager", "-o", "json",
+    ])
     identifiers = []
     for line in output.splitlines():
         entry = json.loads(line)
@@ -4273,8 +4275,16 @@ if os.path.lexists("/mnt/mac"):
 if os.environ.get("SSH_AUTH_SOCK"):
     raise SystemExit("isolated guest unexpectedly received SSH_AUTH_SOCK")
 busctl = shutil.which("busctl")
-if busctl != "/usr/bin/busctl":
+if not busctl or os.path.realpath(busctl) != "/usr/bin/busctl":
     raise SystemExit("isolated guest lacks the expected systemd busctl")
+busctl_info = os.lstat("/usr/bin/busctl")
+if (
+    not os.path.isfile("/usr/bin/busctl")
+    or busctl_info.st_uid != 0
+    or busctl_info.st_gid != 0
+    or not (busctl_info.st_mode & 0o111)
+):
+    raise SystemExit("isolated guest busctl identity differs")
 mac_command = shutil.which("mac")
 known_mac_commands = (
     "/usr/bin/mac",
@@ -4318,7 +4328,8 @@ with open("/proc/self/mountinfo", "r", encoding="utf-8") as stream:
 print("guest_runtime_isolation=valid")
 print("mnt_mac=absent")
 print("ssh_auth_sock=absent")
-print("busctl=/usr/bin/busctl")
+print(f"busctl_path={busctl}")
+print("busctl_canonical=/usr/bin/busctl")
 print(f"mac_command_channel={mac_channel}")
 '
 }
@@ -5065,7 +5076,9 @@ before, remainder = source.split(start_marker, 1)
 _, after = remainder.split(end_marker, 1)
 audited = before + end_marker + after
 shell_collectors = audited.count("systemctl show --all")
-embedded_collectors = audited.count('"systemctl", "show", "--all"')
+embedded_collectors = audited.count(
+    '"/usr/bin/systemctl", "show", "--all"'
+)
 if shell_collectors != 0 or embedded_collectors != 2:
     raise SystemExit(
         "exact-census systemctl collectors do not all retain --all"
