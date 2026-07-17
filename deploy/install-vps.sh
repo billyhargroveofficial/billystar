@@ -65,7 +65,7 @@ ARTIFACTS_SWITCHED=0
 usage() {
   cat <<'EOF'
 Usage:
-  sudo ./deploy/install-vps.sh --binary /tmp/shadowpipe-server \
+  sudo ./deploy/install-vps.sh --binary /root/shadowpipe-server \
     --client-enrollment /root/client-enrollment.json \
     [--port 47843] [--egress eth0] [--cover www.microsoft.com:443] \
     [--advertise public.example:47843] [--short-id 16_lower_hex]
@@ -101,8 +101,52 @@ die() {
   exit 1
 }
 
+valid_ipv4_literal() {
+  local value="$1" octet
+  local -a octets=()
+  [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"$value"
+  (( ${#octets[@]} == 4 )) || return 1
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+valid_advertise() {
+  local value="$1" address port
+  if [[ "$value" =~ ^([A-Za-z0-9_.-]+):([0-9]{1,5})$ ]]; then
+    address="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  if [[ "$address" =~ ^[0-9.]+$ ]]; then
+    valid_ipv4_literal "$address" || return 1
+  fi
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
 path_present() {
   [[ -e "$1" || -L "$1" ]]
+}
+
+require_trusted_root_ancestors() {
+  local source="$1" current tuple owner mode
+  current="${source%/*}"
+  [[ -n "$current" ]] || current=/
+  while :; do
+    [[ -d "$current" && ! -L "$current" ]] \
+      || die "untrusted server binary ancestor: $current"
+    tuple="$(stat -c '%u:%a' -- "$current")"
+    IFS=: read -r owner mode <<<"$tuple"
+    [[ "$owner" == 0 ]] \
+      || die "server binary ancestor must be root-owned: $current"
+    (( (8#$mode & 8#22) == 0 )) \
+      || die "server binary ancestor must not be group/world writable: $current"
+    [[ "$current" == / ]] && break
+    current="${current%/*}"
+    [[ -n "$current" ]] || current=/
+  done
 }
 
 cleanup_owned_temps() {
@@ -110,8 +154,14 @@ cleanup_owned_temps() {
   for path in "$BIN_STAGE" "$BIN_BACKUP" "$UNIT_STAGE" "$UNIT_BACKUP" \
       "$SYSCTL_STAGE" "$ALLOWLIST_BACKUP" "$SHORT_ID_STAGE" \
       "$SHORT_ID_BACKUP"; do
-    [[ -n "$path" ]] && rm -f -- "$path"
+    if [[ -n "$path" ]]; then
+      rm -f -- "$path" || true
+    fi
   done
+  # An empty final slot makes the `[[ -n ]] && rm` list return 1.  This helper
+  # is also called directly under `set -e` after COMMITTED=1, so always report
+  # the cleanup operation itself as successful after best-effort iteration.
+  return 0
 }
 
 rollback_transaction() {
@@ -236,7 +286,8 @@ if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
 fi
 [[ "$EGRESS" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unsafe --egress value"
 [[ "$COVER" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unsafe --cover value"
-[[ -z "$ADVERTISE" || "$ADVERTISE" =~ ^[A-Za-z0-9_.\[\]:-]+$ ]] || die "unsafe --advertise value"
+[[ -z "$ADVERTISE" ]] || valid_advertise "$ADVERTISE" \
+  || die "unsafe --advertise value"
 [[ "$CLIENT_ALLOWLIST" =~ ^/[A-Za-z0-9_./-]+$ \
    && "$CLIENT_ALLOWLIST" != *'/../'* ]] \
   || die "--client-allowlist must be an absolute normalized path"
@@ -257,10 +308,30 @@ else
 fi
 [[ -f "$SOURCE_BINARY" && ! -L "$SOURCE_BINARY" && -x "$SOURCE_BINARY" ]] \
   || die "server binary must be an executable regular file, not a symlink: $SOURCE_BINARY"
+[[ "$SOURCE_BINARY" == /* \
+   && "$SOURCE_BINARY" != *'//'* \
+   && "$SOURCE_BINARY" != *'/./'* \
+   && "$SOURCE_BINARY" != */. \
+   && "$SOURCE_BINARY" != *'/../'* \
+   && "$SOURCE_BINARY" != */.. ]] \
+  || die "server binary path must be absolute and normalized"
+require_trusted_root_ancestors "$SOURCE_BINARY"
+require_trusted_root_ancestors "$BIN"
+SOURCE_BINARY_TUPLE="$(stat -c '%u:%a:%h' -- "$SOURCE_BINARY")"
+IFS=: read -r SOURCE_BINARY_UID SOURCE_BINARY_MODE SOURCE_BINARY_LINKS \
+  <<<"$SOURCE_BINARY_TUPLE"
+[[ "$SOURCE_BINARY_UID" == 0 && "$SOURCE_BINARY_LINKS" == 1 ]] \
+  || die "server binary must be root-owned and single-link"
+(( (8#$SOURCE_BINARY_MODE & 8#22) == 0 )) \
+  || die "server binary must not be group/world writable"
+BIN_STAGE="$(mktemp "$INSTALL_DIR/.shadowpipe-server.stage.XXXXXX")"
+install -o root -g root -m 0755 -- "$SOURCE_BINARY" "$BIN_STAGE"
+[[ "$(stat -c '%u:%g:%a:%h' -- "$BIN_STAGE")" == "0:0:755:1" ]] \
+  || die "trusted server binary staging failed"
 for flag in --client-allowlist --enroll-client --validate-client-allowlist \
   --allow-insecure-lab-carriers --reality-short-id-file \
   --reality-replay-store; do
-  timeout 5s "$SOURCE_BINARY" --help 2>&1 | grep -Fq -- "$flag" \
+  timeout 5s "$BIN_STAGE" --help 2>&1 | grep -Fq -- "$flag" \
     || die "server binary lacks mandatory v3 management flag $flag"
 done
 
@@ -407,9 +478,6 @@ chmod 0600 "$SHORT_ID_STAGE"
 [[ "$(stat -c '%u:%g:%a:%h' -- "$SHORT_ID_STAGE")" == "0:0:600:1" ]] \
   || die "failed to stage exact root-owned REALITY short-id file"
 
-BIN_STAGE="$(mktemp "$INSTALL_DIR/.shadowpipe-server.stage.XXXXXX")"
-install -o root -g root -m 0755 "$SOURCE_BINARY" "$BIN_STAGE"
-
 # The staged new binary performs every authorization mutation/check. The live
 # install path, unit, sysctls, iptables, and service are still untouched.
 if path_present "$CLIENT_ALLOWLIST"; then
@@ -440,15 +508,11 @@ path_present "$KEYS" || KEYS_CREATION_ATTEMPTED=1
 path_present "$RKEY" || RKEY_CREATION_ATTEMPTED=1
 "$BIN_STAGE" --gen-reality-key --reality-key "$RKEY"
 if [[ -z "$ADVERTISE" ]]; then
-  PUBIP="$(curl -fsS --max-time 8 ifconfig.me)" \
+  PUBIP="$(curl -4fsS --max-time 8 https://ifconfig.me/ip)" \
     || die "public endpoint discovery failed; pass --advertise explicitly"
-  [[ "$PUBIP" =~ ^[0-9A-Fa-f:.]+$ ]] \
-    || die "public endpoint discovery returned an unsafe address; pass --advertise explicitly"
-  if [[ "$PUBIP" == *:* ]]; then
-    ADVERTISE="[$PUBIP]:$PORT"
-  else
-    ADVERTISE="$PUBIP:$PORT"
-  fi
+  valid_ipv4_literal "$PUBIP" \
+    || die "public IPv4 discovery returned an unsafe address; pass --advertise explicitly"
+  ADVERTISE="$PUBIP:$PORT"
 fi
 
 UNIT_STAGE="$(mktemp "$(dirname "$UNIT")/.shadowpipe.service.stage.XXXXXX")"

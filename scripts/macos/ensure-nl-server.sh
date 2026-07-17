@@ -33,6 +33,31 @@ SCP=(scp -o ConnectTimeout=12 -o BatchMode=yes -o StrictHostKeyChecking=accept-n
 log() { echo "== ensure-nl-server: $*"; }
 die() { echo "ERROR: ensure-nl-server: $*" >&2; return 1; }
 
+valid_ipv4_literal() {
+  local value="$1" octet
+  local -a octets=()
+  [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"$value"
+  (( ${#octets[@]} == 4 )) || return 1
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+valid_advertise() {
+  local value="$1" address port
+  if [[ "$value" =~ ^([A-Za-z0-9_.-]+):([0-9]{1,5})$ ]]; then
+    address="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  if [[ "$address" =~ ^[0-9.]+$ ]]; then
+    valid_ipv4_literal "$address" || return 1
+  fi
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
 private_file_tuple() {
   local path="$1"
   if stat -f '%u:%Lp:%l' -- "$path" >/dev/null 2>&1; then
@@ -49,7 +74,9 @@ validate_inputs() {
   (( NL_PORT >= 1 && NL_PORT <= 65535 )) || die "invalid port"
   [[ "$NL_EGRESS" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unsafe egress interface"
   [[ "$COVER" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unsafe cover"
-  [[ "$ADVERTISE" =~ ^[A-Za-z0-9_.\[\]:-]+$ ]] || die "unsafe advertise address"
+  valid_advertise "$ADVERTISE" || die "unsafe advertise address"
+  [[ "${SHADOWPIPE_MAGIC:-}" =~ ^0x[0-9A-Fa-f]{8}$ ]] \
+    || die "set one explicit SHADOWPIPE_MAGIC, for example 0x53504731"
   [[ "$CLIENT_ALLOWLIST" =~ ^/[A-Za-z0-9_./-]+$ && "$CLIENT_ALLOWLIST" != *'/../'* ]] \
     || die "client allowlist path must be absolute and normalized"
 
@@ -57,6 +84,10 @@ validate_inputs() {
   # revalidates their allowlist. Fresh enrollment requires both matching local
   # artifacts, and nothing secret is ever printed.
   if [[ -n "$CLIENT_ENROLLMENT" ]]; then
+    for secret in "$CLIENT_CREDENTIAL" "$CLIENT_ENROLLMENT"; do
+      [[ "$secret" == /* && "$secret" != *'/../'* ]] \
+        || die "local secret path must be absolute and normalized: $secret"
+    done
     [[ -f "$CLIENT_CREDENTIAL" && ! -L "$CLIENT_CREDENTIAL" ]] \
       || die "local production client credential is missing or is a symlink: $CLIENT_CREDENTIAL"
     [[ -f "$CLIENT_ENROLLMENT" && ! -L "$CLIENT_ENROLLMENT" ]] \
@@ -75,19 +106,18 @@ validate_inputs() {
       .[0].key_id == .[1].key_id and
       .[0].ed25519_public_key == .[1].ed25519_public_key and
       .[0].psk == .[1].psk
-    ' "$CLIENT_CREDENTIAL" "$CLIENT_ENROLLMENT" >/dev/null \
+    ' -- "$CLIENT_CREDENTIAL" "$CLIENT_ENROLLMENT" >/dev/null \
       || die "credential and enrollment do not describe the same client"
   fi
 }
 
 ensure_linux_server_bin() {
   local bin="$ROOT/target/x86_64-unknown-linux-gnu/release/shadowpipe-server"
-  if [[ -x "$bin" ]] && ! find "$ROOT/crates/shadowpipe-server" "$ROOT/crates/shadowpipe-core" \
-      "$ROOT/crates/shadowpipe-reality" -name '*.rs' -newer "$bin" -print -quit 2>/dev/null | grep -q .; then
-    return 0
-  fi
+  # Let Cargo fingerprint every source, manifest, lockfile, build script and
+  # environment input. A hand-rolled mtime cache can silently reuse a binary
+  # built with a different wire magic or dependency graph.
   log "cross-building mandatory-v3 server for Linux"
-  export SHADOWPIPE_MAGIC="${SHADOWPIPE_MAGIC:-0xcafebabe}"
+  export SHADOWPIPE_MAGIC
   export PATH="/opt/homebrew/opt/x86_64-unknown-linux-gnu/bin:${PATH:-}"
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-x86_64-unknown-linux-gnu-gcc}"
   local sysroot="${SP_SYSROOT:-/opt/homebrew/opt/x86_64-unknown-linux-gnu/toolchain/x86_64-unknown-linux-gnu/sysroot}"
@@ -115,17 +145,32 @@ ensure_nl_server() (
   trap "run_as_user \"\${SSH[@]}\" \"rm -f -- '$server_stage' '$installer_stage' '$enrollment_stage'\" >/dev/null 2>&1 || true" EXIT
 
   log "uploading staged server and transactional installer"
+  run_as_user "${SSH[@]}" \
+    "set -e; \
+     test -d /root; test ! -L /root; test \"\$(stat -c '%u' -- /root)\" = 0; \
+     root_mode=\$(stat -c '%a' -- /root); \
+     test \$((8#\$root_mode & 8#22)) -eq 0; \
+     install -o root -g root -m 0600 /dev/null '$server_stage'; \
+     install -o root -g root -m 0600 /dev/null '$installer_stage'"
   run_as_user "${SCP[@]}" "$ROOT/target/x86_64-unknown-linux-gnu/release/shadowpipe-server" \
     "${NL_USER}@${NL_HOST}:$server_stage"
   run_as_user "${SCP[@]}" "$ROOT/deploy/install-vps.sh" \
     "${NL_USER}@${NL_HOST}:$installer_stage"
   run_as_user "${SSH[@]}" "chmod 0755 '$server_stage'; chmod 0700 '$installer_stage'"
+  run_as_user "${SSH[@]}" \
+    "set -e; \
+     test \"\$(stat -c '%u:%g:%a:%h' -- '$server_stage')\" = 0:0:755:1; \
+     test \"\$(stat -c '%u:%g:%a:%h' -- '$installer_stage')\" = 0:0:700:1"
 
   local enrollment_arg=""
   if [[ -n "$CLIENT_ENROLLMENT" ]]; then
+    run_as_user "${SSH[@]}" \
+      "set -e; install -o root -g root -m 0600 /dev/null '$enrollment_stage'"
     run_as_user "${SCP[@]}" "$CLIENT_ENROLLMENT" \
       "${NL_USER}@${NL_HOST}:$enrollment_stage"
     run_as_user "${SSH[@]}" "chmod 0600 '$enrollment_stage'"
+    run_as_user "${SSH[@]}" \
+      "test \"\$(stat -c '%u:%g:%a:%h' -- '$enrollment_stage')\" = 0:0:600:1"
     enrollment_arg="--client-enrollment '$enrollment_stage'"
   fi
 

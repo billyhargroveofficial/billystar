@@ -14,6 +14,31 @@ die() {
   exit 1
 }
 
+valid_ipv4_literal() {
+  local value="$1" octet
+  local -a octets=()
+  [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"$value"
+  (( ${#octets[@]} == 4 )) || return 1
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+valid_advertise() {
+  local value="$1" address port
+  if [[ "$value" =~ ^([A-Za-z0-9_.-]+):([0-9]{1,5})$ ]]; then
+    address="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  if [[ "$address" =~ ^[0-9.]+$ ]]; then
+    valid_ipv4_literal "$address" || return 1
+  fi
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
 NL_HOST="${NL_HOST:-example-nl}"
 RU_HOST="${RU_HOST:-example-ru}"
 NL_PORT="${NL_PORT:-47845}"
@@ -33,7 +58,8 @@ if [[ ! "$NL_PORT" =~ ^[0-9]+$ ]] || (( NL_PORT < 1 || NL_PORT > 65535 )); then
 fi
 [[ "$NL_EGRESS" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unsafe NL_EGRESS"
 [[ "$SP_COVER" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unsafe SP_COVER"
-[[ "$SP_ADVERTISE" =~ ^[A-Za-z0-9_.\[\]:-]+$ ]] || die "unsafe SP_ADVERTISE"
+valid_advertise "$SP_ADVERTISE" \
+  || die "unsafe SP_ADVERTISE"
 [[ "$CLIENT_ALLOWLIST_PATH" =~ ^/[A-Za-z0-9_./-]+$ \
    && "$CLIENT_ALLOWLIST_PATH" != *'/../'* ]] \
   || die "CLIENT_ALLOWLIST_PATH must be absolute and normalized"
@@ -66,6 +92,8 @@ private_file_tuple() {
 
 EXPECTED_UID="$(id -u)"
 for secret in "$CLIENT_CREDENTIAL_LOCAL" "$CLIENT_ENROLLMENT_LOCAL"; do
+  [[ "$secret" == /* && "$secret" != *'/../'* ]] \
+    || die "secret artifact path must be absolute and normalized: $secret"
   [[ -f "$secret" && ! -L "$secret" ]] \
     || die "secret artifact must be a regular file, not a symlink: $secret"
   tuple="$(private_file_tuple "$secret")"
@@ -80,10 +108,12 @@ jq -e -s '
   .[0].key_id == .[1].key_id and
   .[0].ed25519_public_key == .[1].ed25519_public_key and
   .[0].psk == .[1].psk
-' "$CLIENT_CREDENTIAL_LOCAL" "$CLIENT_ENROLLMENT_LOCAL" >/dev/null \
+' -- "$CLIENT_CREDENTIAL_LOCAL" "$CLIENT_ENROLLMENT_LOCAL" >/dev/null \
   || die "credential and enrollment are malformed or do not describe the same client"
 
-export SHADOWPIPE_MAGIC="${SHADOWPIPE_MAGIC:-0xcafebabe}"
+[[ "${SHADOWPIPE_MAGIC:-}" =~ ^0x[0-9A-Fa-f]{8}$ ]] \
+  || die "set one explicit SHADOWPIPE_MAGIC, for example 0x53504731"
+export SHADOWPIPE_MAGIC
 export PATH="/opt/homebrew/opt/x86_64-unknown-linux-gnu/bin:${PATH:-}"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-x86_64-unknown-linux-gnu-gcc}"
 SP_SYSROOT="${SP_SYSROOT:-/opt/homebrew/opt/x86_64-unknown-linux-gnu/toolchain/x86_64-unknown-linux-gnu/sysroot}"
@@ -120,6 +150,20 @@ cleanup_remote_stages() {
 trap cleanup_remote_stages EXIT
 
 echo "== upload root-private staged artifacts =="
+ssh "$NL_HOST" \
+  "set -e; \
+   test -d /root; test ! -L /root; test \"\$(stat -c '%u' -- /root)\" = 0; \
+   root_mode=\$(stat -c '%a' -- /root); test \$((8#\$root_mode & 8#22)) -eq 0; \
+   install -o root -g root -m 0600 /dev/null '$NL_SERVER_STAGE'; \
+   install -o root -g root -m 0600 /dev/null '$NL_INSTALLER_STAGE'; \
+   install -o root -g root -m 0600 /dev/null '$NL_ENROLLMENT_STAGE'"
+ssh "$RU_HOST" \
+  "set -e; \
+   test -d /root; test ! -L /root; test \"\$(stat -c '%u' -- /root)\" = 0; \
+   root_mode=\$(stat -c '%a' -- /root); test \$((8#\$root_mode & 8#22)) -eq 0; \
+   install -o root -g root -m 0600 /dev/null '$RU_CLIENT_STAGE'; \
+   install -o root -g root -m 0600 /dev/null '$RU_CREDENTIAL_STAGE'; \
+   install -o root -g root -m 0600 /dev/null '$RU_ENROLLMENT_STAGE'"
 scp "$SERVER_BIN" "$NL_HOST:$NL_SERVER_STAGE"
 scp deploy/install-vps.sh "$NL_HOST:$NL_INSTALLER_STAGE"
 scp "$CLIENT_ENROLLMENT_LOCAL" "$NL_HOST:$NL_ENROLLMENT_STAGE"
@@ -128,6 +172,16 @@ scp "$CLIENT_CREDENTIAL_LOCAL" "$RU_HOST:$RU_CREDENTIAL_STAGE"
 scp "$CLIENT_ENROLLMENT_LOCAL" "$RU_HOST:$RU_ENROLLMENT_STAGE"
 ssh "$NL_HOST" "chmod 0755 '$NL_SERVER_STAGE'; chmod 0700 '$NL_INSTALLER_STAGE'; chmod 0600 '$NL_ENROLLMENT_STAGE'"
 ssh "$RU_HOST" "chmod 0755 '$RU_CLIENT_STAGE'; chmod 0600 '$RU_CREDENTIAL_STAGE' '$RU_ENROLLMENT_STAGE'"
+ssh "$NL_HOST" \
+  "set -e; \
+   test \"\$(stat -c '%u:%g:%a:%h' -- '$NL_SERVER_STAGE')\" = 0:0:755:1; \
+   test \"\$(stat -c '%u:%g:%a:%h' -- '$NL_INSTALLER_STAGE')\" = 0:0:700:1; \
+   test \"\$(stat -c '%u:%g:%a:%h' -- '$NL_ENROLLMENT_STAGE')\" = 0:0:600:1"
+ssh "$RU_HOST" \
+  "set -e; \
+   test \"\$(stat -c '%u:%g:%a:%h' -- '$RU_CLIENT_STAGE')\" = 0:0:755:1; \
+   test \"\$(stat -c '%u:%g:%a:%h' -- '$RU_CREDENTIAL_STAGE')\" = 0:0:600:1; \
+   test \"\$(stat -c '%u:%g:%a:%h' -- '$RU_ENROLLMENT_STAGE')\" = 0:0:600:1"
 
 # Validate the complete private credential and its exported enrollment on the
 # client host before enrolling or changing any server listener/network state.
@@ -247,9 +301,19 @@ ssh "$RU_HOST" "
     --write-client-enrollment \"\$reexport\" >/dev/null
   cmp -s -- \"\$reexport\" '$RU_ENROLLMENT_STAGE'
   committed=1
-  rm -f -- \"\$client_backup\" \"\$credential_backup\" \"\$reexport\"
-  client_backup=''
-  credential_backup=''
+  if rm -f -- \"\$client_backup\"; then
+    client_backup=''
+  else
+    echo \"WARN: remove stale client binary backup manually: \$client_backup\" >&2
+  fi
+  if rm -f -- \"\$credential_backup\"; then
+    credential_backup=''
+  else
+    echo \"WARN: remove stale private credential backup manually: \$credential_backup\" >&2
+  fi
+  if ! rm -f -- \"\$reexport\"; then
+    echo \"WARN: remove stale private enrollment re-export manually: \$reexport\" >&2
+  fi
 "
 
 echo

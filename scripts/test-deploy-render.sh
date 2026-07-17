@@ -36,6 +36,81 @@ grep -q 'POSTROUTING.*MASQUERADE'              "$I" || fail "install-vps: NAT no
 grep -q 'Bootstrap:'                            "$I" || fail "install-vps: no root-only explicit bootstrap artifact"
 grep -q "journalctl.*shadowpipe://"            "$I" && fail "install-vps: still scrapes a secret URI from journald"
 grep -q 'nat-hint' "$I" && fail "install-vps: still only HINTS NAT (should apply it)"
+CLEANUP_SOURCE="$(awk '/^cleanup_owned_temps\(\)/,/^}/' "$I")"
+[[ "$CLEANUP_SOURCE" == *'return 0'* ]] \
+  || fail "install-vps: cleanup has no explicit successful return"
+# The child shell intentionally expands CLEANUP_SOURCE, not this parent.
+# shellcheck disable=SC2016
+if ! env CLEANUP_SOURCE="$CLEANUP_SOURCE" bash -c '
+  eval "$CLEANUP_SOURCE"
+  BIN_STAGE=x BIN_BACKUP=x UNIT_STAGE=x UNIT_BACKUP=x SYSCTL_STAGE=x
+  ALLOWLIST_BACKUP=x SHORT_ID_STAGE=x SHORT_ID_BACKUP=x
+  rm() { return 1; }
+  set -e
+  cleanup_owned_temps
+'; then
+  fail "install-vps: an rm failure can trip post-commit cleanup under set -e"
+fi
+grep -q 'server binary must be root-owned and single-link' "$I" \
+  || fail "install-vps: supplied root-executed binary lacks trusted metadata gate"
+# Literal installer source contracts, not parent-shell expansions.
+# shellcheck disable=SC2016
+grep -q 'require_trusted_root_ancestors "\$SOURCE_BINARY"' "$I" \
+  || fail "install-vps: supplied binary ancestor chain is not trusted"
+# shellcheck disable=SC2016
+grep -q 'timeout 5s "\$BIN_STAGE" --help' "$I" \
+  || fail "install-vps: supplied path is executed before trusted staging"
+grep -Fq 'https://ifconfig.me/ip' "$I" \
+  || fail "install-vps: public IPv4 auto-discovery is not authenticated HTTPS"
+
+# Execute the real installer validator and require byte-identical copies in
+# both wrappers. The current carrier plane is IPv4-only, so accepting a
+# bracketed IPv6 bootstrap would advertise an endpoint that cannot work.
+extract_advertise_validators() {
+  awk '
+    /^(valid_ipv4_literal|valid_advertise)\(\) \{/ { capture=1 }
+    capture { print }
+    capture && /^}$/ { capture=0 }
+  ' "$1"
+}
+VALIDATOR_SOURCE="$(extract_advertise_validators "$I")"
+[[ -n "$VALIDATOR_SOURCE" ]] || fail "install-vps: advertise validators missing"
+for f in scripts/deploy-linux.sh scripts/macos/ensure-nl-server.sh; do
+  [[ "$(extract_advertise_validators "$f")" == "$VALIDATOR_SOURCE" ]] \
+    || fail "$f: advertise validator drifted from install-vps"
+done
+eval "$VALIDATOR_SOURCE"
+for value in 91.201.114.192:24443 example.com:1 example.com:65535; do
+  valid_advertise "$value" \
+    || fail "portable advertise validator rejected $value"
+done
+for value in 'bad host:24443' 'host;touch:1' example.com example.com:0 \
+  example.com:65536 999.1.1.1:443 1.2.3:443 \
+  '[2001:db8::1]:24443' '[::1]:443'; do
+  if valid_advertise "$value"; then
+    fail "portable advertise validator accepted unsafe value $value"
+  fi
+done
+unset -f valid_advertise valid_ipv4_literal
+
+for f in scripts/deploy-linux.sh scripts/macos/ensure-nl-server.sh; do
+  # Literal source contract, not a parent-shell expansion.
+  # shellcheck disable=SC2016
+  grep -Fq '[[ "${SHADOWPIPE_MAGIC:-}" =~ ^0x[0-9A-Fa-f]{8}$ ]]' "$f" \
+    || fail "$f: explicit 32-bit wire magic is not required"
+  grep -q 'SHADOWPIPE_MAGIC:-0xcafebabe' "$f" \
+    && fail "$f: legacy implicit wire magic remains"
+done
+grep -q -- '-newer' scripts/macos/ensure-nl-server.sh \
+  && fail "ensure-nl-server: hand-rolled source mtime cache remains"
+grep -q 'cargo build.*shadowpipe-server' scripts/macos/ensure-nl-server.sh \
+  || fail "ensure-nl-server: Cargo fingerprint rebuild is missing"
+grep -q 'local secret path must be absolute and normalized' scripts/macos/ensure-nl-server.sh \
+  || fail "ensure-nl-server: option-like local secret paths are not rejected"
+grep -q "stat -c '%u:%g:%a:%h'.*enrollment_stage" scripts/macos/ensure-nl-server.sh \
+  || fail "ensure-nl-server: remote enrollment metadata is not verified"
+grep -q 'remove stale private credential backup manually' scripts/deploy-linux.sh \
+  || fail "deploy-linux: committed credential-backup cleanup failure is forgotten"
 
 # 3. deploy-linux.sh is no longer an opt-in legacy path: it requires a matched
 # credential/enrollment pair and sends the enrollment only to the server.
