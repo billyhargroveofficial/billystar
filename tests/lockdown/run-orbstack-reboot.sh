@@ -1619,6 +1619,284 @@ verify_guest_cargo_config_binding() {
   cmp -s -- "${expected}" "${observed}"
 }
 
+verify_systemd_dbus_typed_empty_sidecar() {
+  local sidecar="$1" kind="$2" unit="$3"
+  python3 -I -S - "${sidecar}" "${kind}" "${unit}" <<'PY'
+import json
+import re
+import sys
+
+path, kind, unit = sys.argv[1:]
+types = {
+    "ExecCondition": "a(sasbttttuii)",
+    "ExecStartPre": "a(sasbttttuii)",
+    "ExecStartPost": "a(sasbttttuii)",
+    "EnvironmentFiles": "a(sb)",
+}
+expected_by_kind = {
+    "restore": {
+        "ExecCondition", "ExecStartPre", "ExecStartPost", "EnvironmentFiles",
+    },
+    "client": {"ExecCondition", "ExecStartPre", "ExecStartPost"},
+    "none": set(),
+}
+if kind not in expected_by_kind:
+    raise SystemExit("unknown systemd typed-empty proof kind")
+with open(path, "r", encoding="utf-8") as stream:
+    proof = json.load(stream)
+if set(proof) != {
+    "schema_version", "unit", "object_path", "dbus_typed_empty",
+    "unit_id_bound", "fragment_path_bound", "need_daemon_reload",
+    "repeated_reads_identical", "unknown_property_rejected",
+} or proof["schema_version"] != 1 or proof["unit"] != unit:
+    raise SystemExit("systemd typed-empty proof schema differs")
+expected = expected_by_kind[kind]
+observed = proof["dbus_typed_empty"]
+if not isinstance(observed, dict) or set(observed) != expected:
+    raise SystemExit("systemd typed-empty property census differs")
+if any(
+    observed[name] != {"type": types[name], "data": []}
+    for name in expected
+):
+    raise SystemExit("systemd typed-empty D-Bus signature differs")
+object_path = proof["object_path"]
+if expected:
+    if (
+        not isinstance(object_path, str)
+        or re.fullmatch(
+            r"/org/freedesktop/systemd1/unit/[A-Za-z0-9_]+",
+            object_path,
+        )
+        is None
+    ):
+        raise SystemExit("systemd typed-empty object path differs")
+    if (
+        proof["unit_id_bound"] is not True
+        or proof["fragment_path_bound"] is not True
+        or proof["need_daemon_reload"] is not False
+        or proof["repeated_reads_identical"] is not True
+        or proof["unknown_property_rejected"] is not True
+    ):
+        raise SystemExit("systemd typed-empty D-Bus binding proof differs")
+elif object_path is not None:
+    raise SystemExit("unexpected systemd object path without D-Bus proofs")
+elif (
+    proof["unit_id_bound"] is not False
+    or proof["fragment_path_bound"] is not False
+    or proof["need_daemon_reload"] is not None
+    or proof["repeated_reads_identical"] is not False
+    or proof["unknown_property_rejected"] is not False
+):
+    raise SystemExit("unexpected D-Bus binding claim without typed properties")
+PY
+}
+
+capture_exact_systemd_properties() {
+  local clone_id="$1" unit="$2" kind="$3" output="$4"
+  shift 4
+  (( "$#" > 0 )) || return 1
+  run_recorded "${GUEST_COMMAND_TIMEOUT}" "${output}" \
+    orb -m "${clone_id}" -u root python3 -I -S -c '
+import json
+import re
+import subprocess
+import sys
+
+unit, kind, *properties = sys.argv[1:]
+if (
+    re.fullmatch(r"[A-Za-z0-9_.@-]+", unit) is None
+    or not properties
+    or len(properties) != len(set(properties))
+    or any(re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", name) is None for name in properties)
+):
+    raise SystemExit("unsafe exact systemd property request")
+typed_empty_by_kind = {
+    "restore": {
+        "ExecCondition": "a(sasbttttuii)",
+        "ExecStartPre": "a(sasbttttuii)",
+        "ExecStartPost": "a(sasbttttuii)",
+        "EnvironmentFiles": "a(sb)",
+    },
+    "client": {
+        "ExecCondition": "a(sasbttttuii)",
+        "ExecStartPre": "a(sasbttttuii)",
+        "ExecStartPost": "a(sasbttttuii)",
+    },
+    "none": {},
+}
+if kind not in typed_empty_by_kind:
+    raise SystemExit("unknown exact systemd property proof kind")
+typed_empty = typed_empty_by_kind[kind]
+if not set(typed_empty).issubset(properties):
+    raise SystemExit("typed-empty proof is outside the requested property set")
+environment = {
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "LC_ALL": "C",
+}
+
+def run(arguments):
+    result = subprocess.run(
+        arguments,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+        check=False,
+        env=environment,
+    )
+    if result.returncode != 0 or result.stderr:
+        raise SystemExit(f"exact systemd collector failed: {arguments[0]}")
+    return result.stdout.decode("utf-8")
+
+raw = run([
+    "systemctl", "show", "--all", unit,
+    *[f"--property={name}" for name in properties],
+])
+values = {}
+for line in raw.splitlines():
+    key, separator, value = line.partition("=")
+    if (
+        not separator
+        or key not in properties
+        or key in values
+    ):
+        raise SystemExit("systemctl exact property output is malformed")
+    values[key] = value
+
+object_path = None
+unit_id_bound = False
+fragment_path_bound = False
+need_daemon_reload = None
+repeated_reads_identical = False
+unknown_property_rejected = False
+typed_empty_evidence = {}
+if typed_empty:
+    loaded = run([
+        "busctl", "--system", "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "LoadUnit", "s", unit,
+    ]).strip()
+    match = re.fullmatch(
+        r"o \"(/org/freedesktop/systemd1/unit/[A-Za-z0-9_]+)\"",
+        loaded,
+    )
+    if match is None:
+        raise SystemExit("systemd LoadUnit object path is malformed")
+    object_path = match.group(1)
+
+    def get_property(interface, name):
+        payload = json.loads(run([
+            "busctl", "--system", "--json=short", "get-property",
+            "org.freedesktop.systemd1", object_path,
+            interface, name,
+        ]))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"type", "data"}
+        ):
+            raise SystemExit(f"systemd D-Bus property envelope differs: {name}")
+        return payload
+
+    def binding_snapshot():
+        identifier = get_property("org.freedesktop.systemd1.Unit", "Id")
+        fragment = get_property(
+            "org.freedesktop.systemd1.Unit",
+            "FragmentPath",
+        )
+        reload_state = get_property(
+            "org.freedesktop.systemd1.Unit",
+            "NeedDaemonReload",
+        )
+        if identifier != {"type": "s", "data": unit}:
+            raise SystemExit("systemd D-Bus unit identity differs")
+        if (
+            "FragmentPath" not in values
+            or fragment != {"type": "s", "data": values["FragmentPath"]}
+        ):
+            raise SystemExit("systemd D-Bus fragment binding differs")
+        if reload_state != {"type": "b", "data": False}:
+            raise SystemExit("systemd manager still requires daemon-reload")
+        return identifier, fragment, reload_state
+
+    binding_before = binding_snapshot()
+    first_round = {}
+    for name, signature in sorted(typed_empty.items()):
+        payload = get_property("org.freedesktop.systemd1.Service", name)
+        if payload != {"type": signature, "data": []}:
+            raise SystemExit(f"systemd D-Bus typed-empty proof differs: {name}")
+        first_round[name] = payload
+        if name in values and values[name]:
+            raise SystemExit(f"systemctl and D-Bus disagree for empty property: {name}")
+        values[name] = ""
+    unknown = subprocess.run(
+        [
+            "busctl", "--system", "--json=short", "get-property",
+            "org.freedesktop.systemd1", object_path,
+            "org.freedesktop.systemd1.Service",
+            "ShadowpipeUnknownPropertyProbe",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+        check=False,
+        env=environment,
+    )
+    expected_unknown_error = (
+        "Failed to get property ShadowpipeUnknownPropertyProbe on interface "
+        "org.freedesktop.systemd1.Service: Unknown interface "
+        "org.freedesktop.systemd1.Service or property "
+        "ShadowpipeUnknownPropertyProbe.\n"
+    ).encode("utf-8")
+    if (
+        unknown.returncode != 1
+        or unknown.stdout
+        or unknown.stderr != expected_unknown_error
+    ):
+        raise SystemExit("unknown systemd D-Bus property was not rejected")
+    second_round = {
+        name: get_property("org.freedesktop.systemd1.Service", name)
+        for name in sorted(typed_empty)
+    }
+    binding_after = binding_snapshot()
+    if first_round != second_round or binding_before != binding_after:
+        raise SystemExit("systemd D-Bus properties changed across repeated reads")
+    typed_empty_evidence = first_round
+    unit_id_bound = True
+    fragment_path_bound = True
+    need_daemon_reload = False
+    repeated_reads_identical = True
+    unknown_property_rejected = True
+if set(values) != set(properties):
+    raise SystemExit("exact systemd property census differs after D-Bus proof")
+for name in properties:
+    print(f"{name}={values[name]}")
+json.dump(
+    {
+        "schema_version": 1,
+        "unit": unit,
+        "object_path": object_path,
+        "dbus_typed_empty": typed_empty_evidence,
+        "unit_id_bound": unit_id_bound,
+        "fragment_path_bound": fragment_path_bound,
+        "need_daemon_reload": need_daemon_reload,
+        "repeated_reads_identical": repeated_reads_identical,
+        "unknown_property_rejected": unknown_property_rejected,
+    },
+    sys.stderr,
+    ensure_ascii=True,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+sys.stderr.write("\n")
+' "${unit}" "${kind}" "$@" \
+    || return 1
+  verify_systemd_dbus_typed_empty_sidecar \
+    "${output}.stderr" "${kind}" "${unit}"
+}
+
 capture_client_unit_loop() {
   local clone_id="$1" output="$2"
   run_recorded 45 "${output}" \
@@ -1634,8 +1912,8 @@ property_names = (
     "LoadState", "FragmentPath", "UnitFileState", "ActiveState", "SubState",
     "Result", "ExecMainCode", "ExecMainStatus", "NRestarts", "MainPID",
     "Restart", "RestartUSec", "InvocationID", "After", "Requires",
-    "ConditionResult", "DropInPaths", "ExecStart", "ExecStartPre",
-    "ExecStartPost", "EnvironmentFiles",
+    "ConditionResult", "DropInPaths", "ExecCondition", "ExecStart",
+    "ExecStartPre", "ExecStartPost", "EnvironmentFiles",
 )
 
 def run(arguments):
@@ -1652,6 +1930,115 @@ def run(arguments):
         raise SystemExit(f"systemd lifecycle observation failed: {arguments[0]}")
     return result.stdout.decode("utf-8")
 
+typed_empty_signatures = {
+    "ExecCondition": "a(sasbttttuii)",
+    "ExecStartPre": "a(sasbttttuii)",
+    "ExecStartPost": "a(sasbttttuii)",
+}
+
+def typed_empty_proof():
+    loaded = run([
+        "busctl", "--system", "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "LoadUnit", "s", unit,
+    ]).strip()
+    match = re.fullmatch(
+        r"o \"(/org/freedesktop/systemd1/unit/[A-Za-z0-9_]+)\"",
+        loaded,
+    )
+    if match is None:
+        raise SystemExit("client-loop LoadUnit object path is malformed")
+    object_path = match.group(1)
+
+    def get_property(interface, name):
+        payload = json.loads(run([
+            "busctl", "--system", "--json=short", "get-property",
+            "org.freedesktop.systemd1", object_path, interface, name,
+        ]))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"type", "data"}
+        ):
+            raise SystemExit(f"client-loop D-Bus envelope differs: {name}")
+        return payload
+
+    def binding_snapshot():
+        identifier = get_property("org.freedesktop.systemd1.Unit", "Id")
+        fragment = get_property(
+            "org.freedesktop.systemd1.Unit",
+            "FragmentPath",
+        )
+        reload_state = get_property(
+            "org.freedesktop.systemd1.Unit",
+            "NeedDaemonReload",
+        )
+        if identifier != {"type": "s", "data": unit}:
+            raise SystemExit("client-loop D-Bus unit identity differs")
+        if fragment != {
+            "type": "s",
+            "data": "/etc/systemd/system/shadowpipe-client-full-tunnel.service",
+        }:
+            raise SystemExit("client-loop D-Bus fragment differs")
+        if reload_state != {"type": "b", "data": False}:
+            raise SystemExit("client-loop manager still requires daemon-reload")
+        return identifier, fragment, reload_state
+
+    binding_before = binding_snapshot()
+    first = {}
+    for name, signature in sorted(typed_empty_signatures.items()):
+        payload = get_property("org.freedesktop.systemd1.Service", name)
+        if payload != {"type": signature, "data": []}:
+            raise SystemExit(f"client-loop typed-empty proof differs: {name}")
+        first[name] = payload
+    unknown = subprocess.run(
+        [
+            "busctl", "--system", "--json=short", "get-property",
+            "org.freedesktop.systemd1", object_path,
+            "org.freedesktop.systemd1.Service",
+            "ShadowpipeUnknownPropertyProbe",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+        env={
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LC_ALL": "C",
+        },
+    )
+    expected_unknown_error = (
+        "Failed to get property ShadowpipeUnknownPropertyProbe on interface "
+        "org.freedesktop.systemd1.Service: Unknown interface "
+        "org.freedesktop.systemd1.Service or property "
+        "ShadowpipeUnknownPropertyProbe.\n"
+    ).encode("utf-8")
+    if (
+        unknown.returncode != 1
+        or unknown.stdout
+        or unknown.stderr != expected_unknown_error
+    ):
+        raise SystemExit("client-loop unknown D-Bus property was not rejected")
+    second = {
+        name: get_property("org.freedesktop.systemd1.Service", name)
+        for name in sorted(typed_empty_signatures)
+    }
+    binding_after = binding_snapshot()
+    if first != second or binding_before != binding_after:
+        raise SystemExit("client-loop D-Bus proof changed across repeated reads")
+    return {
+        "properties": first,
+        "unit_id_bound": True,
+        "fragment_path_bound": True,
+        "need_daemon_reload": False,
+        "repeated_reads_identical": True,
+        "unknown_property_rejected": True,
+    }
+
+dbus_proof = typed_empty_proof()
+
 def properties():
     output = run([
         "systemctl", "show", "--all", unit,
@@ -1665,6 +2052,10 @@ def properties():
         if key in values:
             raise SystemExit("duplicate systemctl property")
         values[key] = value
+    for name in typed_empty_signatures:
+        if name in values and values[name]:
+            raise SystemExit(f"client-loop systemctl empty property differs: {name}")
+        values[name] = ""
     if set(values) != set(property_names):
         raise SystemExit("systemctl property census differs")
     return values
@@ -1719,6 +2110,7 @@ proof = {
     "invocation_ids": identifiers,
     "restart_samples": restart_samples,
     "properties": final,
+    "dbus_typed_empty_proof": dbus_proof,
 }
 print(json.dumps(proof, sort_keys=True, separators=(",", ":")))
 '
@@ -1726,14 +2118,13 @@ print(json.dumps(proof, sort_keys=True, separators=(",", ":")))
 
 capture_client_unit_status() {
   local clone_id="$1" output="$2"
-  run_recorded "${GUEST_COMMAND_TIMEOUT}" "${output}" \
-    orb -m "${clone_id}" -u root env LC_ALL=C systemctl show --all \
-    shadowpipe-client-full-tunnel.service \
-    -p LoadState -p FragmentPath -p UnitFileState -p ActiveState -p SubState \
-    -p Result -p ExecMainCode -p ExecMainStatus -p NRestarts -p MainPID \
-    -p Restart -p RestartUSec -p InvocationID -p After -p Requires \
-    -p ConditionResult -p DropInPaths -p ExecStart -p ExecStartPre \
-    -p ExecStartPost -p EnvironmentFiles
+  capture_exact_systemd_properties \
+    "${clone_id}" shadowpipe-client-full-tunnel.service client "${output}" \
+    LoadState FragmentPath UnitFileState ActiveState SubState \
+    Result ExecMainCode ExecMainStatus NRestarts MainPID \
+    Restart RestartUSec InvocationID After Requires \
+    ConditionResult DropInPaths ExecCondition ExecStart ExecStartPre \
+    ExecStartPost EnvironmentFiles
 }
 
 verify_client_unit_evidence() {
@@ -1754,8 +2145,8 @@ expected_properties = {
     "LoadState", "FragmentPath", "UnitFileState", "ActiveState", "SubState",
     "Result", "ExecMainCode", "ExecMainStatus", "NRestarts", "MainPID",
     "Restart", "RestartUSec", "InvocationID", "After", "Requires",
-    "ConditionResult", "DropInPaths", "ExecStart", "ExecStartPre",
-    "ExecStartPost", "EnvironmentFiles",
+    "ConditionResult", "DropInPaths", "ExecCondition", "ExecStart",
+    "ExecStartPre", "ExecStartPost", "EnvironmentFiles",
 }
 
 def properties(path):
@@ -1782,7 +2173,12 @@ def validate_common(values, label):
         raise SystemExit(f"{label} client unit does not expose Restart=always/1s")
     if values["ConditionResult"] != "yes":
         raise SystemExit(f"{label} client unit conditions did not pass")
-    if values["DropInPaths"] or values["ExecStartPre"] or values["ExecStartPost"]:
+    if (
+        values["DropInPaths"]
+        or values["ExecCondition"]
+        or values["ExecStartPre"]
+        or values["ExecStartPost"]
+    ):
         raise SystemExit(f"{label} client unit has an effective drop-in or hook")
     if values["EnvironmentFiles"] != "/etc/shadowpipe/client.env (ignore_errors=no)":
         raise SystemExit(f"{label} client unit environment-file binding differs")
@@ -1796,11 +2192,33 @@ with open(loop_path, "r", encoding="utf-8") as stream:
     loop = json.load(stream)
 if set(loop) != {
     "schema_version", "credential_failure_marker", "invocation_ids",
-    "restart_samples", "properties",
+    "restart_samples", "properties", "dbus_typed_empty_proof",
 } or loop["schema_version"] != 1:
     raise SystemExit("restart-loop proof schema differs")
 if loop["credential_failure_marker"] != "load mandatory root-owned client credential before startup":
     raise SystemExit("restart-loop credential failure marker differs")
+dbus_proof = loop["dbus_typed_empty_proof"]
+if (
+    not isinstance(dbus_proof, dict)
+    or set(dbus_proof)
+    != {
+        "properties", "unit_id_bound", "fragment_path_bound",
+        "need_daemon_reload", "repeated_reads_identical",
+        "unknown_property_rejected",
+    }
+    or dbus_proof["properties"]
+    != {
+        "ExecCondition": {"type": "a(sasbttttuii)", "data": []},
+        "ExecStartPre": {"type": "a(sasbttttuii)", "data": []},
+        "ExecStartPost": {"type": "a(sasbttttuii)", "data": []},
+    }
+    or dbus_proof["unit_id_bound"] is not True
+    or dbus_proof["fragment_path_bound"] is not True
+    or dbus_proof["need_daemon_reload"] is not False
+    or dbus_proof["repeated_reads_identical"] is not True
+    or dbus_proof["unknown_property_rejected"] is not True
+):
+    raise SystemExit("restart-loop D-Bus typed-empty proof differs")
 looping = loop["properties"]
 if set(looping) != expected_properties:
     raise SystemExit("restart-loop property set differs")
@@ -3854,6 +4272,9 @@ if os.path.lexists("/mnt/mac"):
     raise SystemExit("isolated guest unexpectedly exposes /mnt/mac")
 if os.environ.get("SSH_AUTH_SOCK"):
     raise SystemExit("isolated guest unexpectedly received SSH_AUTH_SOCK")
+busctl = shutil.which("busctl")
+if busctl != "/usr/bin/busctl":
+    raise SystemExit("isolated guest lacks the expected systemd busctl")
 mac_command = shutil.which("mac")
 known_mac_commands = (
     "/usr/bin/mac",
@@ -3897,6 +4318,7 @@ with open("/proc/self/mountinfo", "r", encoding="utf-8") as stream:
 print("guest_runtime_isolation=valid")
 print("mnt_mac=absent")
 print("ssh_auth_sock=absent")
+print("busctl=/usr/bin/busctl")
 print(f"mac_command_channel={mac_channel}")
 '
 }
@@ -4260,10 +4682,16 @@ PY
 
 capture_effective_unit_definition() {
   local clone_id="$1" unit="$2" output="$3"
-  run_recorded "${GUEST_COMMAND_TIMEOUT}" "${output}" \
-    orb -m "${clone_id}" -u root env LC_ALL=C systemctl show --all "${unit}" \
-    -p LoadState -p FragmentPath -p DropInPaths -p ExecCondition \
-    -p ExecStartPre -p ExecStart -p ExecStartPost -p EnvironmentFiles
+  local kind
+  case "${unit}" in
+    shadowpipe-lockdown-restore.service) kind=restore ;;
+    shadowpipe-client-full-tunnel.service) kind=client ;;
+    *) return 1 ;;
+  esac
+  capture_exact_systemd_properties \
+    "${clone_id}" "${unit}" "${kind}" "${output}" \
+    LoadState FragmentPath DropInPaths ExecCondition \
+    ExecStartPre ExecStart ExecStartPost EnvironmentFiles
 }
 
 verify_effective_unit_definition() {
@@ -4638,12 +5066,12 @@ _, after = remainder.split(end_marker, 1)
 audited = before + end_marker + after
 shell_collectors = audited.count("systemctl show --all")
 embedded_collectors = audited.count('"systemctl", "show", "--all"')
-if shell_collectors != 4 or embedded_collectors != 1:
+if shell_collectors != 0 or embedded_collectors != 2:
     raise SystemExit(
         "exact-census systemctl collectors do not all retain --all"
     )
-print("systemctl_show_all_shell_collectors=4")
-print("systemctl_show_all_embedded_collectors=1")
+print("systemctl_show_all_shell_collectors=0")
+print("systemctl_show_all_embedded_collectors=2")
 PY
 }
 
@@ -5439,22 +5867,21 @@ main() {
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/systemd-is-enabled-post.txt" \
     orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl is-enabled \
     shadowpipe-lockdown-restore.service
-  run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/systemd-restore-status.txt" \
-    orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl show --all \
-    shadowpipe-lockdown-restore.service \
-    -p LoadState -p UnitFileState -p ActiveState -p SubState -p Result \
-    -p ExecMainCode -p ExecMainStatus -p NRestarts \
-    -p ExecMainStartTimestampMonotonic -p ExecMainExitTimestampMonotonic \
-    -p ActiveEnterTimestampMonotonic -p InactiveExitTimestampMonotonic \
-    -p InvocationID -p Before -p FragmentPath -p DropInPaths \
-    -p ExecCondition -p ExecStartPre -p ExecStart -p ExecStartPost \
-    -p EnvironmentFiles
-  run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/systemd-networkd-status.txt" \
-    orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl show --all \
-    systemd-networkd.service \
-    -p LoadState -p ActiveState -p SubState \
-    -p ExecMainStartTimestampMonotonic -p InactiveExitTimestampMonotonic \
-    -p InvocationID -p NRestarts -p After -p Requires
+  capture_exact_systemd_properties \
+    "${clone_orb_id}" shadowpipe-lockdown-restore.service restore \
+    "${result_dir}/systemd-restore-status.txt" \
+    LoadState UnitFileState ActiveState SubState Result \
+    ExecMainCode ExecMainStatus NRestarts \
+    ExecMainStartTimestampMonotonic ExecMainExitTimestampMonotonic \
+    ActiveEnterTimestampMonotonic InactiveExitTimestampMonotonic \
+    InvocationID Before FragmentPath DropInPaths \
+    ExecCondition ExecStartPre ExecStart ExecStartPost EnvironmentFiles
+  capture_exact_systemd_properties \
+    "${clone_orb_id}" systemd-networkd.service none \
+    "${result_dir}/systemd-networkd-status.txt" \
+    LoadState ActiveState SubState \
+    ExecMainStartTimestampMonotonic InactiveExitTimestampMonotonic \
+    InvocationID NRestarts After Requires
   run_recorded "${GUEST_COMMAND_TIMEOUT}" "${result_dir}/systemd-networkd-dependencies.txt" \
     orb -m "${clone_orb_id}" -u root env LC_ALL=C systemctl list-dependencies \
     systemd-networkd.service --plain --no-pager
@@ -5823,9 +6250,9 @@ run_self_test() (
     "${temporary}/cleanup-context-contract.env"
   verify_systemctl_show_all_contract "${self_source}" \
     >"${temporary}/systemctl-show-all-contract.env"
-  grep -qx 'systemctl_show_all_shell_collectors=4' \
+  grep -qx 'systemctl_show_all_shell_collectors=0' \
     "${temporary}/systemctl-show-all-contract.env"
-  grep -qx 'systemctl_show_all_embedded_collectors=1' \
+  grep -qx 'systemctl_show_all_embedded_collectors=2' \
     "${temporary}/systemctl-show-all-contract.env"
 
   normalizer="$(cd -- "$(dirname -- "${self_source}")" && pwd -P)/normalize-built-artifact.py"
@@ -6630,6 +7057,87 @@ PY
     >"${temporary}/ordering.out" 2>"${temporary}/ordering.err"; then
     die 1 'self-test accepted networkd starting before restore completion'
   fi
+  python3 -I -S - "${temporary}" <<'PY'
+import json
+import os
+import sys
+
+root = sys.argv[1]
+signatures = {
+    "ExecCondition": "a(sasbttttuii)",
+    "ExecStartPre": "a(sasbttttuii)",
+    "ExecStartPost": "a(sasbttttuii)",
+    "EnvironmentFiles": "a(sb)",
+}
+for kind, unit, names in (
+    (
+        "restore",
+        "shadowpipe-lockdown-restore.service",
+        ("ExecCondition", "ExecStartPre", "ExecStartPost", "EnvironmentFiles"),
+    ),
+    (
+        "client",
+        "shadowpipe-client-full-tunnel.service",
+        ("ExecCondition", "ExecStartPre", "ExecStartPost"),
+    ),
+):
+    proof = {
+        "schema_version": 1,
+        "unit": unit,
+        "object_path": "/org/freedesktop/systemd1/unit/shadowpipe_fixture",
+        "dbus_typed_empty": {
+            name: {"type": signatures[name], "data": []}
+            for name in names
+        },
+        "unit_id_bound": True,
+        "fragment_path_bound": True,
+        "need_daemon_reload": False,
+        "repeated_reads_identical": True,
+        "unknown_property_rejected": True,
+    }
+    with open(
+        os.path.join(root, f"{kind}-typed-empty.json"),
+        "x",
+        encoding="ascii",
+    ) as stream:
+        json.dump(proof, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+none = {
+    "schema_version": 1,
+    "unit": "systemd-networkd.service",
+    "object_path": None,
+    "dbus_typed_empty": {},
+    "unit_id_bound": False,
+    "fragment_path_bound": False,
+    "need_daemon_reload": None,
+    "repeated_reads_identical": False,
+    "unknown_property_rejected": False,
+}
+with open(
+    os.path.join(root, "none-typed-empty.json"),
+    "x",
+    encoding="ascii",
+) as stream:
+    json.dump(none, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+  verify_systemd_dbus_typed_empty_sidecar \
+    "${temporary}/restore-typed-empty.json" restore \
+    shadowpipe-lockdown-restore.service
+  verify_systemd_dbus_typed_empty_sidecar \
+    "${temporary}/client-typed-empty.json" client \
+    shadowpipe-client-full-tunnel.service
+  verify_systemd_dbus_typed_empty_sidecar \
+    "${temporary}/none-typed-empty.json" none systemd-networkd.service
+  sed 's/a(sb)/as/' "${temporary}/restore-typed-empty.json" \
+    >"${temporary}/restore-typed-empty-wrong-signature.json"
+  if verify_systemd_dbus_typed_empty_sidecar \
+    "${temporary}/restore-typed-empty-wrong-signature.json" restore \
+    shadowpipe-lockdown-restore.service \
+    >"${temporary}/typed-empty-signature.out" \
+    2>"${temporary}/typed-empty-signature.err"; then
+    die 1 'self-test accepted a wrong systemd D-Bus signature'
+  fi
   printf '%s\n' \
     'LoadState=loaded' \
     'FragmentPath=/etc/systemd/system/shadowpipe-lockdown-restore.service' \
@@ -6688,6 +7196,7 @@ common = {
     "Requires": "shadowpipe-lockdown-restore.service",
     "ConditionResult": "yes",
     "DropInPaths": "",
+    "ExecCondition": "",
     "ExecStart": "{ path=/usr/local/bin/shadowpipe-client ; argv[]=/usr/local/bin/shadowpipe-client $SHADOWPIPE_CLIENT_ARGS ; }",
     "ExecStartPre": "",
     "ExecStartPost": "",
@@ -6700,6 +7209,18 @@ loop = {
     "invocation_ids": ["1" * 32, "2" * 32, "3" * 32],
     "restart_samples": [0, 1, 2],
     "properties": looping,
+    "dbus_typed_empty_proof": {
+        "properties": {
+            "ExecCondition": {"type": "a(sasbttttuii)", "data": []},
+            "ExecStartPre": {"type": "a(sasbttttuii)", "data": []},
+            "ExecStartPost": {"type": "a(sasbttttuii)", "data": []},
+        },
+        "unit_id_bound": True,
+        "fragment_path_bound": True,
+        "need_daemon_reload": False,
+        "repeated_reads_identical": True,
+        "unknown_property_rejected": True,
+    },
 }
 with open(os.path.join(root, "client-loop.json"), "x", encoding="ascii") as stream:
     json.dump(loop, stream, sort_keys=True, separators=(",", ":"))
