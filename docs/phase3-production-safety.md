@@ -1,6 +1,6 @@
 # Phase 3: signed endpoint authority and crash-safe Linux host state
 
-Snapshot: 2026-07-16. This document describes implemented mechanisms and their
+Snapshot: 2026-07-17. This document describes implemented mechanisms and their
 security invariants. It is not a production-readiness statement, an independent
 audit, or evidence of resistance to a real censor.
 
@@ -9,26 +9,25 @@ audit, or evidence of resistance to a real censor.
 | Layer | Current status | This does not establish |
 |---|---|---|
 | Signed policy, endpoint coordinator, host journal and recovery adapters | Implemented with adversarial unit/component tests | Cryptographic review, fleet-safe rollout, or a green release pipeline |
-| Current executable-source Linux full-TUN handoff | [`RESULT.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md) plus tracked compact [`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md), commit `81f188f772cc6b674fde748a361691f1bda19691`: scoped PASS, overall/test/cleanup/host-safety valid, 745/745 local sealed-manifest entries | Real systemd PID 1, production, real reboot, native macOS/Windows, outer/inner IPv6 or field behavior |
-| Current executable-source native Linux ARM64 portability | [`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md), clean commit `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`: scoped PASS, 342 checksum entries, 193 files, 4,464,041 bytes, 102,293 code lines including 80,315 Rust; tests 718/0/4 and 732/0/4; strict Clippy and all five runner self-tests valid | Privileged networking, production, field behavior, or a refresh of recovery/reboot/Windows |
+| Current product-source Linux all-resource recovery | [`20260716T225901Z-98821`](../tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md) plus compact [`PUBLISHED-EVIDENCE.md`](../tests/host-recovery/results/20260716T225901Z-98821/PUBLISHED-EVIDENCE.md), clean pushed `c9b60e7`: scoped PASS, 29/29 scenarios and 1,592 checksum entries; later `c9b60e7..d335682` changes are test-tooling-only | Kernel reboot, torn writes, power loss, production or field behavior |
+| Current product-source PID-1 userspace reboot and installed client lifecycle | [`20260717T001923Z-52605-reboot`](../tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md) plus compact [`PUBLISHED-EVIDENCE.md`](../tests/lockdown/results/20260717T001923Z-52605-reboot/PUBLISHED-EVIDENCE.md), clean pushed `e374075`: scoped PASS, 939 checksum entries | Successful tunnel, paired reboot recovery, dedicated-kernel/power-loss reboot, production or field behavior |
+| Source-bound Linux full-TUN handoff | [`RESULT.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md) plus tracked compact [`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md), commit `81f188f`: scoped PASS, 745 entries | Current-head successful tunnel, real systemd PID 1, native macOS/Windows, outer/inner IPv6 or field behavior |
+| Source-bound native Linux ARM64 portability | [`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md), clean commit `726500f`: scoped PASS, 342 entries; tests 718/0/4 and 732/0/4 | Current-head portability after `2ece275`, privileged networking, production or field behavior |
 | Earlier Linux full-TUN runtime | Snapshot-bound [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md): scoped PASS, 573/573 checksum entries | Current network-handoff implementation, IPv6, native Windows/macOS TUN, production or field behavior |
-| Linux same-boot crash recovery | Snapshot-bound [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md): 29/29 scenarios, 1443/1443 checksum entries | Current executable-source host recovery, kernel reboot, torn writes or power-loss storage semantics |
-| Linux reboot lockdown | Snapshot-bound [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md): distinct boot IDs, restore 2,995 us before networkd, 650/650 checksum entries | Current executable-source reboot behavior, paired tunnel recovery, production/initrd/L2/FORWARD behavior |
-| Windows 11 ARM64 no-TUN | Snapshot-bound [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md): scoped PASS, 891/891 checksums | Current executable-source Windows portability, Wintun, route/DNS/firewall mutation safety, production or field behavior |
+| Earlier Linux same-boot crash recovery | Snapshot-bound [`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md): 29/29 scenarios, 1443/1443 checksum entries | Anything beyond its frozen source; the newer current product-source cell is listed above |
+| Earlier Linux reboot lockdown | Snapshot-bound [`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md): distinct boot IDs, restore 2,995 us before networkd, 650/650 checksum entries | Anything beyond its frozen source; the newer PID-1 userspace cell is listed above |
+| Windows 11 ARM64 no-TUN | Snapshot-bound [`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md): scoped PASS, 891/891 checksums | Current-head Windows portability, Wintun, route/DNS/firewall mutation safety, production or field behavior |
 | Censorship resistance | Architecture and research hypotheses only | No current TSPU/GFW/operator result, unblockability, or indistinguishability |
 | Platforms | Linux-first host-state implementation | IPv6 completeness, Windows Wintun safety, macOS TUN/route safety, Android VpnService, or mobility behavior |
 
 These are synthetic disposable-guest implementation results with
-`field_evidence=false`, not one combined production certification. Executable
-source changed after the older captures, so they remain valid only for their
-exact frozen snapshots. Current executable-source status is split: commit
-`81f188f` has the privileged Linux IPv4 full-TUN/default-route handoff and
-connected IPv6 OUTPUT-block cell, while clean commit `726500f` has the
-unprivileged native ARM64 CPU/filesystem portability cell. Neither refreshes the
-all-resource same-boot crash matrix, real reboot behavior or Windows. The
-handoff supervisor emulates the installed `Restart=always`/`RestartSec=1s`
-contract; it is not real systemd PID 1. None of these synthetic results is
-field-censorship evidence.
+`field_evidence=false`, not one combined production certification. At
+`e374075`, current product-source lifecycle status is split between the
+`c9b60e7` recovery cell and the `e374075` PID-1 userspace reboot/client-lifecycle
+cell. Production Rust changed in `2ece275`, so the successful full-TUN result at
+`81f188f`, native ARM64 result at `726500f` and Windows result remain valid only
+for their exact frozen sources. No source-bound combination proves a successful
+current-head VPN. None is field-censorship evidence.
 
 ## 1. Trust and policy object
 
@@ -282,7 +281,7 @@ requirements.
 
 ## 7. Sealed implementation evidence
 
-### Current executable-source Linux full-TUN handoff cell
+### Source-bound Linux full-TUN handoff cell
 
 Run
 [`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
@@ -323,14 +322,13 @@ Carrier-cut recovery had a recorded upper bound of 7 seconds. Directional
 client-originated IPv6 pcaps on `c0` and `c1` were empty while the exact
 generation-specific SP6 chains counted 21 and 11 dropped packets.
 
-This is a synthetic IPv4 tunnel plus connected-netns IPv6 OUTPUT-block result.
-It does not establish outer or inner IPv6, inbound/L2/FORWARD behavior, a real
-reboot or all-resource crash recovery, native macOS/Windows VPNs, production
-operation, censorship resistance or field availability. Current-source native
-ARM64 portability is established only by the separate unprivileged cell below;
-it does not upgrade this privileged result to commit `726500f`.
+This is a source-bound synthetic IPv4 tunnel plus connected-netns IPv6
+OUTPUT-block result. It does not establish a successful current-head tunnel
+after `2ece275`, outer or inner IPv6, inbound/L2/FORWARD behavior, native
+macOS/Windows VPNs, production operation, censorship resistance or field
+availability. The newer lifecycle cells below do not replay this tunnel.
 
-### Current executable-source native Linux ARM64 portability cell
+### Source-bound native Linux ARM64 portability cell
 
 Run
 [`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
@@ -343,11 +341,12 @@ self-tests passed. All 342 checksum entries verified. The frozen snapshot
 contained 193 files and 4,464,041 bytes, including 102,293 physical code lines
 and 80,315 Rust lines.
 
-This is unprivileged CPU/filesystem portability only: no route, DNS, firewall,
+This is source-bound unprivileged CPU/filesystem portability only: no route, DNS, firewall,
 TUN, netns, qdisc, sysctl or service mutation occurred. Clone cleanup,
 Windows-suspended state, host safety and evidence were valid;
-`field_evidence=false`. It does not refresh privileged networking, same-boot
-recovery, reboot or Windows. The older
+`field_evidence=false`. Production Rust changed later in `2ece275`; it does not
+establish current-head portability or refresh privileged networking, recovery,
+reboot or Windows. The older
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
 remains snapshot-bound history for its own 187-file capture.
 
@@ -377,48 +376,60 @@ post-restart-lockdown captures were `0/0/0`; explicit release removed the
 lockdown WAL/table. All 573 checksum entries verified. This remains IPv4
 synthetic scope for its frozen source. The observed forward-on-fail response is
 a bounded synthetic cover oracle, not general active-probe
-indistinguishability. The current executable-source handoff result is the newer
-cell above.
+indistinguishability. The newer source-bound handoff result is the cell above.
 
-### Snapshot-bound same-boot schema-v3 crash/recovery matrix
+### Current product-source same-boot schema-v3 crash/recovery matrix
 
 Run
-[`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md)
-passed all 29 fresh net+mount+PID namespace scenarios. Cuts cover WAL Planned,
+[`20260716T225901Z-98821`](../tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md),
+with compact
+[`PUBLISHED-EVIDENCE.md`](../tests/host-recovery/results/20260716T225901Z-98821/PUBLISHED-EVIDENCE.md),
+used clean pushed source `c9b60e7` and passed all 29 fresh net+mount+PID
+namespace scenarios. The later `c9b60e7..d335682` diff changes only
+reboot/recovery test tooling, not product source. Cuts cover WAL Planned,
 every resource-family apply, DNS Staged, partial firewall acknowledgements,
 all-Applied/Preparing, Active, and both before mutation plus after convergence
 before WAL acknowledgement for each of eight recovery steps. Every `SIGKILL`
 cut retained a root-owned schema-v3 WAL with the exact eight-resource
 vocabulary and recovery-marker binding; conflict cases retained durable
 protection. The matrix result is 28 recovered scenarios plus one intentional
-foreign-resource conflict, finalization is complete, and all 1443 checksum
+foreign-resource conflict, finalization is complete, and all 1,592 checksum
 entries verified.
 
 This is same-boot process-crash evidence. It does not simulate a kernel reboot,
 torn filesystem writes or power loss, and its private tmpfs resolver is not a
-systemd-resolved integration test. Executable source later changed, so current
-all-resource host-recovery status remains open.
+systemd-resolved integration test.
 
 The `SPPOLEX1` expiry tombstone is covered by adversarial policy-state/component
-tests in that captured source, not by this privileged namespace matrix. In
+tests in the product source, not by this privileged namespace matrix. In
 particular, the matrix does not upgrade the tombstone into trusted-time or
 power-loss evidence.
 
-### Snapshot-bound reboot lockdown cell
+### Current product-source PID-1 userspace reboot and installed-client cell
 
 Run
-[`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
-recorded distinct pre/post boot IDs, strict WAL/PID-1 namespace binding and
-restore completion before networkd activation. The exact native nft inet/output
-barrier denied non-loopback IPv4 while allowing loopback; explicit release
-removed the WAL and only owned `sp_lock` table and restored gateway reachability.
-Monotonic unit timestamps put restore completion exactly 2,995 microseconds
-before networkd start. All 650 checksum entries verified.
+[`20260717T001923Z-52605-reboot`](../tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md),
+with compact
+[`PUBLISHED-EVIDENCE.md`](../tests/lockdown/results/20260717T001923Z-52605-reboot/PUBLISHED-EVIDENCE.md),
+used clean pushed source `e374075` and verified all 939 checksum entries.
+`systemd 261.1` ran as PID 1 before and after an OrbStack userspace machine
+restart. Boot ID plus PID/network/mount namespace identities changed; machine
+ID and the shared kernel remained stable. Restore completed before networkd.
+The exact native nft `inet`/`output` barrier denied non-loopback IPv4 while
+allowing loopback; explicit release removed the WAL and only owned `sp_lock`
+table and restored gateway reachability.
 
-This cell proves early-userspace Linux L3 local OUTPUT lockdown only. It has no
-paired client/server tunnel and makes no production, initrd, L2/AF_PACKET,
-FORWARD, container-netns or censorship claim. It predates later executable
-changes; the current handoff harness did not perform a real reboot.
+After release, the exact installed client unit and binary hashes matched their
+source. A mandatory credential refusal produced three distinct InvocationIDs
+and `NRestarts 0 -> 1 -> 2`; operator stop suppressed further restart for
+longer than `RestartSec`. Canonical routes, rules, nft state, resolver,
+interfaces, TUN census and WAL absence were identical before and after.
+
+This proves a real systemd PID-1 userspace boot transaction and an installed
+client pre-mutation lifecycle. OrbStack retained one shared kernel, and there
+was no successful paired tunnel, dedicated-kernel/power-loss reboot, initrd,
+continuous packet monitor, L2/AF_PACKET, FORWARD, container-netns, production
+or censorship claim.
 
 ### Snapshot-bound Windows 11 ARM64 H2 no-TUN cell
 
@@ -440,7 +451,7 @@ portability run.
 
 ### Host and VM observation limits
 
-In the current handoff run, Mac routes, DNS, static PF files, utun list and exact
+In the source-bound handoff run, Mac routes, DNS, static PF files, utun list and exact
 live sing-box identity matched at before/after endpoints. This is not a
 continuous mutation monitor. Loaded PF runtime was unavailable to the
 unprivileged collector and remains explicitly unobserved. OrbStack
@@ -462,18 +473,16 @@ Mac.
 
 ## 8. What remains open
 
-- Re-run all-resource same-boot recovery, real reboot and Windows no-TUN cells
-  against the current executable source; native Linux ARM64 portability is
-  current only at `726500f`.
-- Exercise the installed units under real systemd PID 1 rather than only the
-  handoff harness supervisor.
+- Refresh a successful paired Linux full-TUN session on current source under
+  the installed PID-1 units, including carrier cut and post-reboot recovery.
+- Refresh native Linux ARM64 and Windows portability after `2ece275`.
 - Add resolver-configuration observation, explicit DHCP lease/lifetime
   invalidation and suspend/resume; then implement equivalent native macOS and
   Windows network-change sources.
 - Prove IPv6 route/firewall/DNS behavior instead of extrapolating from IPv4.
 - Run native Windows Wintun, macOS NetworkExtension/TUN and Android VpnService
   leak/recovery matrices.
-- Exercise paired tunnel recovery across a real kernel reboot and separately
+- Exercise paired tunnel recovery across a dedicated-kernel reboot and separately
   test torn-write/power-loss durability on an explicitly disposable storage
   target.
 - Define authenticated fleet enrollment, root-identity distribution, release

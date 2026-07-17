@@ -214,10 +214,12 @@ release. ICMP/TCP/UDP/DNS, a verified 64 MiB transfer and carrier-cut recovery
 within a seven-second upper bound passed; 745 checksum entries, host safety,
 clone cleanup, source isolation and secret scans were valid.
 
-This is an IPv4 tunnel plus connected-IPv6 OUTPUT-block proof in a private
-Linux namespace. It does not exercise a real systemd PID 1 manager,
-resolver/DHCP changes, suspend/resume, an IPv6 tunnel, native Windows/macOS
-networking, production paths or censor behavior. The earlier full-TUN run
+This is a source-bound IPv4 tunnel plus connected-IPv6 OUTPUT-block proof in a
+private Linux namespace. It does not establish a successful current-head tunnel
+after `2ece275`, resolver/DHCP changes, suspend/resume, an IPv6 tunnel, native
+Windows/macOS networking, production paths or censor behavior. A newer
+separate lifecycle cell exercises real systemd PID 1 but does not replay this
+tunnel. The earlier full-TUN run
 [`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
 remains a valid captured-source snapshot, not current executable-source
 evidence. Delivered
@@ -295,30 +297,40 @@ client creation retains kernel name allocation. Route/firewall subprocesses
 have bounded time and output, process-group termination and guaranteed child
 reap; they remain trusted executables rather than a sandbox boundary.
 
-Captured-source run
-[`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md)
-sealed 29/29 fresh-namespace scenarios and 1443/1443 checksum entries. It covers
+Current product-source run
+[`20260716T225901Z-98821`](../tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md),
+with compact
+[`PUBLISHED-EVIDENCE.md`](../tests/host-recovery/results/20260716T225901Z-98821/PUBLISHED-EVIDENCE.md),
+sealed 29/29 fresh-namespace scenarios and 1,592 checksum entries at clean
+pushed `c9b60e7`; product source remains unchanged through code/tool audit head
+`d335682`. It covers
 schema-v3 eight-resource WAL cuts and recovery markers under same-boot
 `SIGKILL`, including durable conflict behavior. It does not cover kernel reboot,
-torn writes or power-loss storage semantics, and it is not validation of the
-current executable source.
+torn writes or power-loss storage semantics.
 
 A separate
-[`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
-cell changed boot IDs and proved an early-userspace native-nft local OUTPUT
-barrier before networkd, loopback allowance, non-loopback IPv4 denial and
-explicit release across 650/650 checksum entries. It has no paired tunnel and no
-production/initrd/L2/FORWARD claim. Both results are `field_evidence=false`. See
+[`20260717T001923Z-52605-reboot`](../tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md),
+with compact
+[`PUBLISHED-EVIDENCE.md`](../tests/lockdown/results/20260717T001923Z-52605-reboot/PUBLISHED-EVIDENCE.md),
+used clean pushed `e374075` and verified 939 entries. `systemd 261.1` ran as
+PID 1 before/after an OrbStack userspace restart with changed
+boot/PID/network/mount namespace identities and a shared kernel. It proved
+restore-before-networkd, the native-nft local OUTPUT barrier, explicit release,
+and installed-client pre-mutation restart/operator-stop semantics with
+unchanged network state. It has no successful paired tunnel,
+dedicated-kernel/power-loss reboot or production/initrd/L2/FORWARD claim. Both
+results are `field_evidence=false`. See
 [`phase3-production-safety.md`](phase3-production-safety.md).
 
-Native Linux ARM64 current executable-source portability run
+Native Linux ARM64 source-bound portability run
 [`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
 verified clean commit `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7` with
 342 checksum entries across a 193-file, 4,464,041-byte snapshot. It counted
 102,293 physical code lines including 80,315 Rust; no-default passed 718/0/4,
 all-features 732/0/4, both strict Clippy profiles and all five runner self-tests
 were valid. Clone cleanup, Windows-suspended state, host safety and evidence
-were valid. It made no privileged network mutation and has
+were valid. Production Rust changed later in `2ece275`, so this is not
+current-head portability. It made no privileged network mutation and has
 `field_evidence=false`. The older
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
 remains snapshot-bound history for its own 187-file capture.
@@ -327,10 +339,8 @@ Windows 11 ARM64 run
 verified 891/891 entries for H2 no-TUN v3 auth, missing-pin/unenrolled negative
 controls and exact 1 MiB echo. Its 5,072,384-byte PE SHA-256 is
 `2734e79f98866910aa8e0386af4ff630191b0a72fd1945177f078cb69d500bad`.
-The fresh Linux portability run is current only for unprivileged ARM64
-CPU/filesystem behavior; Windows remains snapshot-bound. Neither is native
-Windows TUN, privileged Linux networking, censorship or production evidence,
-and neither refreshes same-boot recovery or reboot.
+Windows and ARM64 remain source-bound. Neither is native Windows TUN,
+privileged Linux networking, censorship or production evidence.
 
 Mac host-safety evidence is bounded before/after observation, not continuous
 monitoring. Loaded PF runtime remained unavailable without privilege and is not

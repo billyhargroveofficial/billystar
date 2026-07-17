@@ -171,78 +171,48 @@ collision; unnamed client TUN creation remains kernel-allocated. Route/firewall
 helpers have bounded deadlines/output and are killed/reaped as process groups
 on timeout; they are still trusted executables, not sandboxed adversarial code.
 
-The privileged Phase-3 crash matrix is recorded as a scoped captured-source
-Linux **PASS** in
-[`20260716T124109Z-93828`](tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md):
-29/29 fresh-namespace scenarios (28 recovered plus one intentional conflict),
-complete evidence finalization and 1443/1443 checksum entries. It proves
-same-boot `SIGKILL` recovery boundaries for the schema-v3 eight-resource WAL;
-it does not test a kernel reboot, torn filesystem writes or power-loss storage
-semantics. A separate early-userspace
-[`reboot-lockdown`](tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
-cell changed boot IDs and proved the exact Linux L3 OUTPUT barrier restored
-2,995 microseconds before networkd start, loopback allowance, non-loopback
-denial and explicit release; 650/650 checksums verified. That cell has no paired
-client/server tunnel and is not a production claim. These two bundles remain
-valid for their frozen captured source only; neither is a proof for the current
-executable-source baseline.
+At code/tool audit head `d335682`, two current executable lifecycle cells are
+scoped Linux **PASS** results, not a combined VPN certification:
 
-For the executable-source baseline at commit
-`81f188f772cc6b674fde748a361691f1bda19691`, the current scoped full-TUN proof is
-[`20260716T173837Z-18283-m8K2po`](tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md).
-The isolated disposable Linux clone replaced its real default route from `c0`
-to `c1`; the client emitted the exact `DefaultRouteChanged` cause, generation 1
-exited with status 1 while a strict durable lockdown remained active, and a
-separate generation 2 reached `Active` with its carrier bypass bound to `c1`.
-A PROMISC-only `RTM_NEWLINK` notification was ignored: a real promiscuous
-observer ran while generation 2 retained the same PID and start time. Connected
-IPv6 canaries remained enabled but were not tunneled; directional client-egress
-IPv6 captures were empty and the generation-specific `SP6` DROP counters
-increased. Manager-gated shutdown stopped the live generation 2, produced no
-generation 3, retained fail-closed IPv4/IPv6 protection, and required explicit
-release. ICMP, TCP, UDP, DNS, a verified 64 MiB transfer and carrier-cut
-recovery within a seven-second upper bound passed. All 745 checksum entries,
-host-safety, clone cleanup, source/evidence isolation and secret scans were
-valid.
+- all-resource crash/recovery
+  [`20260716T225901Z-98821`](tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md),
+  with compact
+  [`PUBLISHED-EVIDENCE.md`](tests/host-recovery/results/20260716T225901Z-98821/PUBLISHED-EVIDENCE.md),
+  pinned clean pushed source `c9b60e7`, passed 29/29 fresh-namespace scenarios
+  and 1,592 checksum entries. The later `c9b60e7..d335682` diff changes only
+  reboot/recovery test tooling, not product source. It covers every schema-v3 eight-resource apply and
+  recovery cut under same-boot `SIGKILL`, including one expected durable
+  foreign-state `Conflict`.
+- PID-1 userspace reboot and installed-client lifecycle
+  [`20260717T001923Z-52605-reboot`](tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md),
+  with compact
+  [`PUBLISHED-EVIDENCE.md`](tests/lockdown/results/20260717T001923Z-52605-reboot/PUBLISHED-EVIDENCE.md),
+  pinned clean pushed source `e374075`, passed all 939 checksum entries.
+  `systemd 261.1` was live PID 1 before and after an OrbStack userspace machine
+  restart with distinct boot/PID/network/mount namespace identities but the
+  same shared kernel. Restore completed before networkd, the exact nft L3
+  OUTPUT barrier denied non-loopback IPv4 until explicit release, and the exact
+  installed client unit then produced three credential-refusal invocations,
+  `NRestarts 0 -> 1 -> 2`, operator-stop suppression beyond `RestartSec` and
+  identical pre/post network state.
 
-This result is synthetic Linux IPv4/private-netns evidence. It is not a test of
-a real systemd PID 1 service manager, resolver or DHCP change handling,
-suspend/resume, an IPv6 tunnel, native macOS or Windows clients, production
-deployment, field operation or censorship resistance.
+These results do not prove a successful current-source tunnel, paired
+client/server reboot recovery, a dedicated-kernel/hardware reboot, torn writes,
+power loss, initrd behavior, continuous zero-packet silence, native
+macOS/Windows networking, production, field operation or censorship
+resistance.
 
-Current executable-source native Linux ARM64 portability is recorded separately
-in
-[`20260716T180304Z-linux-arm64-current`](tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md),
-pinned to clean commit
-`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`. Its disposable isolated clone
-verified 342 checksum entries over a 193-file, 4,464,041-byte frozen snapshot,
-including 102,293 physical code lines and 80,315 Rust lines. The no-default
-matrix passed 718 tests and the all-features matrix passed 732, with zero
-failures and four ignored in each; both strict Clippy profiles and all five
-partitioned runner self-tests were valid. Cleanup, Windows-suspended state,
-host safety and evidence were valid, and no privileged network mutation
-occurred. This is unprivileged CPU/filesystem portability with
-`field_evidence=false`, not TUN, route, DNS, firewall, service, production or
-censorship evidence.
+The successful full-TUN/default-route result at `81f188f`, native Linux ARM64
+portability at `726500f`, Windows ARM64 H2 no-TUN, and earlier recovery/reboot
+bundles remain valid only for their exact captured sources. Production
+HTTP-stream/QUIC Rust changed in `2ece275`, so none is current-head evidence and
+they cannot be combined with the lifecycle cells into a current successful-VPN
+claim. The Windows result does not exercise Wintun or mutate Windows routes,
+DNS, firewall or adapters.
 
-The earlier full-TUN bundle
-[`20260716T123535Z-91294-70zWb7`](tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md)
-and the historical native Linux ARM64 portability snapshot
-[`20260716T122834Z-linux-arm64-current`](tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
-verified 342/342 checksums and a 187-entry frozen-source manifest with SHA-256
-`fd5ebffc5b820ec8ac037aa3e9fea154c62576d7a276fa923168e5f4b4a84b95`.
-Windows ARM64 H2 no-TUN
-[`20260716T125113Z-36840-dd0c2571`](tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md)
-verified 891/891 checksums, two authenticated sessions plus one rejection and
-an exact 1 MiB echo without Windows route/DNS/firewall/adapter mutation. These
-older bundles are retained captured-source snapshots with
-`field_evidence=false`. The fresh Linux ARM64 cell does not refresh their
-privileged networking, recovery, reboot or Windows claims. None establishes
-IPv6, Windows Wintun, native macOS TUN safety, fleet rollout, hostile-network
-behavior or a release claim.
 See
 [`docs/phase3-production-safety.md`](docs/phase3-production-safety.md) and the
-[2026-07-16 scoped audit](docs/security-audit-2026-07-16.md).
+[2026-07-17 lifecycle audit](docs/security-audit-2026-07-17.md).
 
 ## Lab safety
 

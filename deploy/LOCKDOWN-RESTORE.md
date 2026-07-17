@@ -218,9 +218,9 @@ from the console while leaving the lockdown in place. Do not use
 
 An operator `systemctl stop` is different from an unexpected process exit:
 systemd suppresses the configured restart, sends SIGTERM, and the client leaves
-the durable barrier active after main teardown. The current isolated evidence
-run placed a manager-stop gate before SIGTERM and proved no third generation
-appeared.
+the durable barrier active after main teardown. The source-bound successful
+full-TUN run placed a manager-stop gate before SIGTERM and proved no third
+generation appeared.
 
 Run
 [`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md),
@@ -233,9 +233,27 @@ main WAL absent, and generation 2 became `Active` through `c1` before releasing
 the intermediate barrier. A real promiscuous capture left its PID/start identity
 and restart count unchanged. This was an isolated harness that emulated the
 unit's restart/stop semantics; it did not run real systemd PID 1 and is not
-production, reboot, native macOS/Windows or field evidence. The complete
+current-head, production, reboot, native macOS/Windows or field evidence. The complete
 170,055,680-byte sealed bundle and its 168,317,113-byte raw c1 IPv4 pcap remain
 local/ignored; the compact index publishes pcap hashes separately.
+
+A separate current product-source run
+[`20260717T001923Z-52605-reboot`](../tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md),
+with compact
+[`PUBLISHED-EVIDENCE.md`](../tests/lockdown/results/20260717T001923Z-52605-reboot/PUBLISHED-EVIDENCE.md),
+installed the exact client unit and binary from clean pushed `e374075` under
+real `systemd 261.1` PID 1. After explicit lockdown release, a mandatory
+pre-mutation credential refusal produced three distinct InvocationIDs and
+`NRestarts 0 -> 1 -> 2`; `systemctl stop` then suppressed further restart for
+longer than `RestartSec`. Routes, rules, nft state, resolver, interfaces, TUN
+census and WAL absence were identical before and after. The same cell proved
+restore-before-networkd across an OrbStack userspace restart with distinct
+guest boot/PID/network/mount namespaces but the same shared kernel.
+
+This closes the installed-unit PID-1 pre-mutation lifecycle gate only. It is not
+a successful current-source tunnel, paired client/server reboot recovery,
+dedicated-kernel or power-loss reboot, continuous packet proof, production or
+field evidence.
 
 ## First activation, then enable the reboot gate
 

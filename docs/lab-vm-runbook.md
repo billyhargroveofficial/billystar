@@ -1,28 +1,26 @@
 # VM-only lab runbook
 
-Статус: на 2026-07-16 есть две раздельные current executable-source Linux
-cells. Privileged synthetic full-TUN handoff PASS привязан к commit
-`81f188f772cc6b674fde748a361691f1bda19691`; последующие изменения этого
-runbook считаются documentation drift:
-[`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md).
-Unprivileged native Linux ARM64 portability PASS привязан к clean commit
-`726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`:
-[`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md).
-Более ранние PASS bundles сохраняют значение только как captured-source
-snapshots своих frozen commits: historical native Linux ARM64 portability
-[`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md),
-предыдущий full-TUN IPv4/netns
-[`20260716T123535Z-91294-70zWb7`](../tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md),
-same-boot Phase-3 crash/recovery
-[`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md),
-early-userspace reboot lockdown
-[`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
-и Windows 11 ARM64 H2 no-TUN
-[`20260716T125113Z-36840-dd0c2571`](../tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md).
-Stage A всё ещё частична: real systemd PID 1, resolver/DHCP/suspend event
-matrices, IPv6 tunnel, Windows Wintun/leak, macOS native TUN/route и default
-`tls-chrome` build остаются отдельными gates; causal protocols 001–003 не
-запускались. Любое отклонение от invariant ниже останавливает эксперимент.
+Статус: на 2026-07-17 и code/tool audit head `d335682` две current
+product-source Linux lifecycle cells имеют
+scoped PASS. Same-boot all-resource recovery
+[`20260716T225901Z-98821`](../tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md)
+привязана к clean pushed `c9b60e7`; последующий diff до `d335682` меняет только
+reboot/recovery test tooling. Real-systemd-PID-1 userspace reboot и installed-client
+pre-mutation lifecycle
+[`20260717T001923Z-52605-reboot`](../tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md)
+привязаны к clean pushed `e374075`.
+
+Successful full-TUN handoff `81f188f`, native Linux ARM64 portability
+`726500f`, Windows 11 ARM64 no-TUN и более ранние recovery/reboot bundles
+остаются captured-source snapshots. Production Rust изменился в `2ece275`;
+нельзя комбинировать их с current lifecycle results в current successful-VPN
+claim.
+
+Stage A всё ещё частична: current-source successful paired tunnel,
+dedicated-kernel/power-loss reboot, resolver/DHCP/suspend event matrices, IPv6
+tunnel, Windows Wintun/leak, macOS native TUN/route и portability refresh
+остаются отдельными gates; causal protocols 001–003 не запускались. Любое
+отклонение от invariant ниже останавливает эксперимент.
 
 ## Absolute invariant
 
@@ -148,7 +146,7 @@ Cross-guest Windows→OrbStack is a portability smoke only: first prove reachabi
 
 Exit gate: zero unexplained data corruption; a local correctness error must never be labeled censor action.
 
-#### Native Linux ARM64 current executable-source cell — PASS
+#### Native Linux ARM64 source-bound cell — PASS
 
 Run
 [`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
@@ -167,10 +165,11 @@ valid; `field_evidence=false`.
 
 Старый
 [`20260716T122834Z-linux-arm64-current`](../tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md)
-остаётся валидной snapshot-bound историей своего 187-file capture, но новый run
-заменяет его как current executable-source portability cell.
+остаётся валидной snapshot-bound историей своего 187-file capture. Run
+`726500f` был более новым source-bound portability evidence, но production Rust
+изменился после него в `2ece275`.
 
-#### Current Linux IPv4 OS-TUN + network handoff cell — PASS
+#### Source-bound Linux IPv4 OS-TUN + network handoff cell — PASS
 
 Run
 [`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
@@ -228,14 +227,17 @@ trust boundary.
 не production/field/censor evidence и не proof для real systemd PID 1,
 resolver/DHCP/suspend events, IPv6 tunnel, Windows или macOS.
 
-#### Phase-3 captured-source crash/recovery cell — PASS, same-boot snapshot
+#### Current product-source Phase-3 crash/recovery cell — PASS
 
 Run
-[`20260716T124109Z-93828`](../tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md)
+[`20260716T225901Z-98821`](../tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md),
+with compact
+[`PUBLISHED-EVIDENCE.md`](../tests/host-recovery/results/20260716T225901Z-98821/PUBLISHED-EVIDENCE.md),
 прошёл 29/29 fresh net+mount+PID namespace scenarios: 28 recovered и один
-intentional foreign-resource Conflict. Все 1443/1443 checksum entries
-проверены, evidence finalization=`complete`. Каждый `SIGKILL` marker связан с
-exact cut/PID/log и mandatory root-owned schema-v3 WAL с восемью ресурсами.
+intentional foreign-resource Conflict. Все 1,592 checksum entries проверены.
+Pinned clean pushed source — `c9b60e7`; последующий `c9b60e7..d335682` diff
+изменяет только reboot/recovery test tooling, не product source. Каждый `SIGKILL` marker связан с exact
+cut/PID/log и mandatory root-owned schema-v3 WAL с восемью ресурсами.
 Matrix охватывает:
 
 - WAL Planned и apply каждого resource family;
@@ -251,20 +253,27 @@ torn filesystem write или power loss. Resolver target — private tmpfs, не
 systemd-resolved и не guest `/etc`. `field_evidence=false`; Mac host наблюдался
 только before/after, loaded PF runtime не наблюдался.
 
-#### Early-userspace captured-source reboot lockdown cell — PASS, barrier-only snapshot
+#### Current product-source PID-1 userspace reboot/client cell — PASS
 
 Run
-[`20260716T124706Z-34564-reboot`](../tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
-прошёл real guest reboot с различными boot IDs. Strict WAL boot/PID-1 namespace
-binding восстановил exact native nft inet/output barrier; monotonic timestamps
-зафиксировали restore completion на 2,995 microseconds раньше networkd start.
-Loopback работал, non-loopback IPv4 ping был denied. Explicit operator release
-удалил WAL и единственную owned `sp_lock` table, после чего gateway снова стал
-reachable. Все 650/650 checksum entries проверены.
+[`20260717T001923Z-52605-reboot`](../tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md),
+with compact
+[`PUBLISHED-EVIDENCE.md`](../tests/lockdown/results/20260717T001923Z-52605-reboot/PUBLISHED-EVIDENCE.md),
+прошёл OrbStack userspace machine restart с real `systemd 261.1` PID 1 и
+различными boot/PID/net/mount namespace identities при неизменном shared
+kernel. Strict WAL binding восстановил exact native nft `inet`/`output` barrier
+раньше networkd start. Loopback работал, non-loopback IPv4 ping был denied.
+Explicit release удалил WAL и единственную owned `sp_lock` table, после чего
+gateway снова стал reachable. Все 939 checksum entries проверены.
 
-Это отдельный early-userspace local L3 OUTPUT proof. В cell нет paired
-client/server tunnel; она не доказывает production, initrd, L2/AF_PACKET,
-FORWARD, container-netns или censorship behavior.
+После release точный installed client unit дал три distinct credential-refusal
+InvocationID и `NRestarts 0 -> 1 -> 2`; operator stop подавил дальнейший
+restart дольше `RestartSec`. Canonical network state до/после совпал.
+
+Это userspace PID-1 reboot + installed-client pre-mutation lifecycle proof. В
+cell нет successful paired tunnel, dedicated-kernel/hardware/power-loss reboot,
+continuous packet proof, production, initrd, L2/AF_PACKET, FORWARD,
+container-netns или censorship behavior.
 
 #### Windows 11 ARM64 H2 no-TUN captured-source cell — PASS
 

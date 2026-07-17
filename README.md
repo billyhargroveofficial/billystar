@@ -22,7 +22,7 @@ macOS/Windows system-VPN backends остаются открытыми gates.
 | **0** | PQ handshake, encrypted frames, padding, echo mode |
 | **1** | TUN/data-plane code для Mac/Linux/Windows, stream mux и IP tunnel; synthetic OrbStack Linux IPv4 OS-TUN/leak/cut/recovery proof — PASS, native Windows/macOS TUN и IPv6 matrices остаются отдельными gates |
 | **2** | **h2-chunk** camouflage, Linux-first fail-closed **auto-route**, persistent server keys и VPS deploy; synthetic Linux IPv4 runtime gate закрыт, production/field gate — нет |
-| **3** | Строгая подписанная endpoint-policy v2, bounded live DNS/endpoint transactions, durable REALITY replay admission и crash-safe Linux host-state WAL/recovery; current executable-source Linux full-TUN network-handoff и native ARM64 portability cells — scoped PASS, recovery/reboot/Windows bundles — snapshot-bound |
+| **3** | Строгая подписанная endpoint-policy v2, bounded live DNS/endpoint transactions, durable REALITY replay admission и crash-safe Linux host-state WAL/recovery; current product-source all-resource recovery и real-systemd-PID-1 userspace reboot/client-lifecycle cells — scoped PASS; successful full-TUN, portability и Windows results остаются source-bound snapshots |
 
 ## Phase 3: production-safety mechanisms, не production claim
 
@@ -64,49 +64,40 @@ state:
 
 Точный protocol, failure ordering и границы доказательств описаны в
 [`docs/phase3-production-safety.md`](docs/phase3-production-safety.md).
-Current executable-source Linux evidence состоит из двух раздельных cells:
+Current product-source Linux lifecycle evidence состоит из двух раздельных
+cells:
 
-- isolated Linux full-TUN/default-route handoff:
-  [`20260716T173837Z-18283-m8K2po`](tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md),
+- all-resource same-boot crash/recovery:
+  [`20260716T225901Z-98821`](tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md),
   with tracked compact
-  [`PUBLISHED-EVIDENCE.md`](tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md),
-  `PASS`, overall/test/cleanup/host-safety valid and 745/745 checksum entries.
-  A real `c0 -> c1` default-route replacement produced exact
-  `DefaultRouteChanged`; generation 1 exited `1` behind strict durable lockdown
-  with the main WAL absent, generation 2 became `Active` through `c1`, and the
-  final manager-gated stop produced no generation 3.
-- native Linux ARM64 portability:
-  [`20260716T180304Z-linux-arm64-current`](tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md),
-  pinned to clean executable-source commit
-  `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`, `PASS`,
-  `overall_status=valid`, 342 checksum entries and a 193-file,
-  4,464,041-byte frozen source snapshot. It counted 102,293 physical code lines,
-  including 80,315 Rust lines; no-default passed 718 tests and all-features
-  passed 732, with zero failures and four ignored in each. Both strict Clippy
-  profiles and all five partitioned runner self-tests were valid.
+  [`PUBLISHED-EVIDENCE.md`](tests/host-recovery/results/20260716T225901Z-98821/PUBLISHED-EVIDENCE.md),
+  pinned to clean pushed `c9b60e7`, `PASS`, 29/29 fresh-namespace scenarios and
+  1,592 checksum entries. Later `c9b60e7..d335682` changes are test-tooling
+  only: reboot runner/normalizer hardening through `e374075`, then recovery
+  version-capture cleanup at `d335682`; product source is unchanged.
+- real-systemd-PID-1 userspace reboot plus installed-client lifecycle:
+  [`20260717T001923Z-52605-reboot`](tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md),
+  with tracked compact
+  [`PUBLISHED-EVIDENCE.md`](tests/lockdown/results/20260717T001923Z-52605-reboot/PUBLISHED-EVIDENCE.md),
+  pinned to clean pushed `e374075`, `PASS`, 939 checksum entries. It proves
+  restore-before-networkd, the exact nft OUTPUT barrier before/after distinct
+  guest boot IDs, explicit release, and installed-unit
+  `Restart=always`/operator-stop behavior with unchanged network state.
 
-Пять более ранних sealed bundles остаются действительными только для своих
-точных frozen snapshots: historical Linux ARM64
-[`20260716T122834Z-linux-arm64-current`](tests/portability/results/20260716T122834Z-linux-arm64-current/RESULT.md),
-full-TUN [`20260716T123535Z-91294-70zWb7`](tests/tun/results/20260716T123535Z-91294-70zWb7/RESULT.md),
-same-boot recovery
-[`20260716T124109Z-93828`](tests/host-recovery/results/20260716T124109Z-93828/FINAL-RESULT.md),
-reboot lockdown
-[`20260716T124706Z-34564-reboot`](tests/lockdown/results/20260716T124706Z-34564-reboot/RESULT.md)
-и Windows ARM64 no-TUN
-[`20260716T125113Z-36840-dd0c2571`](tests/windows/results/20260716T125113Z-36840-dd0c2571/RESULT.md).
-Executable source изменился после их capture. Новый ARM64 run восстановил
-current executable-source portability отдельно от privileged handoff, но ни
-handoff cell, ни portability cell не обновляют all-resource host recovery,
-real reboot или Windows.
+Successful Linux full-TUN/default-route handoff at `81f188f`, native Linux
+ARM64 portability at `726500f`, Windows ARM64 no-TUN and older recovery/reboot
+runs remain valid only for their exact captured sources. Production Rust
+changed in `2ece275`, so they are not current-head evidence and cannot be
+combined with the lifecycle cells into a current successful VPN claim.
 
 Это implementation evidence, не production/field claim. Crash matrix моделирует
-same-boot process death через `SIGKILL`, а не power loss; reboot cell проверяет
-только ранний Linux L3 OUTPUT barrier и explicit release, без paired tunnel.
-Windows cell — no-TUN private-socket portability, не Wintun/leak proof. IPv6,
-native Windows/macOS TUN, field censorship evidence, independent cryptographic
-review и causal activation остаются открыты. Новый handoff runner эмулирует
-семантику `Restart=always`; он не запускает реальный systemd PID 1.
+same-boot process death через `SIGKILL`, а не power loss. Reboot cell запускает
+реальный `systemd` PID 1, но OrbStack сохраняет shared kernel; это userspace
+boot transaction, не dedicated-kernel/hardware reboot, и в ней нет successful
+paired tunnel. Windows cell — no-TUN private-socket portability, не Wintun/leak
+proof. IPv6, native Windows/macOS TUN, current-source successful full-TUN,
+field censorship evidence, independent cryptographic review и causal activation
+остаются открыты.
 Policy signatures use classical Ed25519: they authenticate endpoint authority
 and pin rotation, not post-quantum control-plane security or causal-evidence
 producer provenance.
@@ -455,7 +446,7 @@ streams, SETTINGS, QPACK and request semantics.
 TUN, точные carrier endpoints и loopback; DNS guard
 временно пинит `/etc/resolv.conf` на resolver внутри туннеля.
 
-**Synthetic runtime proof, 2026-07-16.** Current executable-source run
+**Synthetic runtime proof, 2026-07-16.** Source-bound run
 [`20260716T173837Z-18283-m8K2po`](tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
 из pinned commit `81f188f772cc6b674fde748a361691f1bda19691` выполнен
 внутри isolated disposable OrbStack clone и private Linux netns. Tracked compact
@@ -517,13 +508,15 @@ managed argv, затем повторно доказывает PID/start/argv/ex
 же стабильной process generation. Неоднозначность или restart делает snapshot
 invalid.
 
-Это узкий **synthetic Linux IPv4 tunnel + connected IPv6 OUTPUT-block/netns
-implementation proof**, не production/field/censor evidence. Runner эмулировал
-service restart/stop gate, а не реальный systemd PID 1. Отдельный unprivileged
-ARM64 run на `726500f` доказывает current executable-source CPU/filesystem
-portability, но не обновляет этот privileged networking result. Не доказаны
-current-source real reboot/host recovery, outer или inner IPv6, native
-Windows/macOS TUN, fleet rollout или continuous host non-mutation.
+Это узкий **source-bound synthetic Linux IPv4 tunnel + connected IPv6
+OUTPUT-block/netns implementation proof**, не production/field/censor
+evidence. Этот старый runner эмулировал service restart/stop gate. Более новые
+current-product-source cells отдельно закрывают same-boot all-resource recovery
+и userspace reboot/installed-client lifecycle под реальным `systemd` PID 1, но
+не повторяют successful paired tunnel. ARM64 run на `726500f` также остаётся
+source-bound. Не доказаны current-source successful full-TUN, outer или inner
+IPv6, native Windows/macOS TUN, fleet rollout или continuous host
+non-mutation.
 
 ## h2-chunk camouflage (legacy)
 
@@ -582,21 +575,18 @@ Start with [`docs/architecture-causal-carrier-plane.md`](docs/architecture-causa
 is in [`docs/related-work-matrix-2026.md`](docs/related-work-matrix-2026.md).
 The implemented Phase-3 safety invariants and evidence scopes are in
 [`docs/phase3-production-safety.md`](docs/phase3-production-safety.md).
-The current scoped security/evidence review is
-[`docs/security-audit-2026-07-16.md`](docs/security-audit-2026-07-16.md).
-The superseded pre-Phase-3 dependency/ML-KEM snapshot remains at
+The current scoped lifecycle security/evidence review is
+[`docs/security-audit-2026-07-17.md`](docs/security-audit-2026-07-17.md).
+The superseded broader 2026-07-16 review and pre-Phase-3 dependency/ML-KEM
+snapshot remain at
+[`docs/security-audit-2026-07-16.md`](docs/security-audit-2026-07-16.md) and
 [`docs/security-audit-2026-07-15.md`](docs/security-audit-2026-07-15.md).
-Current executable-source platform evidence is limited to two separate Linux
-cells: the privileged full-TUN handoff run
-[`20260716T173837Z-18283-m8K2po`](tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
-with tracked compact
-[`PUBLISHED-EVIDENCE.md`](tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md)
-at `81f188f`, and the unprivileged native ARM64 portability run
-[`20260716T180304Z-linux-arm64-current`](tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
-at `726500f`. The old `122834` ARM64 result, earlier full-TUN, host-recovery,
-reboot and Windows no-TUN bundles remain snapshot-bound history. In particular,
-the Windows result does not exercise Wintun or mutate Windows routes, DNS,
-firewall, or adapters.
+Current product-source lifecycle evidence is the `c9b60e7` all-resource
+recovery cell and the `e374075` real-PID-1 userspace reboot/installed-client
+cell linked above. Successful full-TUN at `81f188f`, native ARM64 portability at
+`726500f` and Windows no-TUN remain source-bound history after production Rust
+changed in `2ece275`. In particular, the Windows result does not exercise
+Wintun or mutate Windows routes, DNS, firewall, or adapters.
 The experiment manifests under
 [`experiments/`](experiments/) are design drafts, not field evidence or frozen
 preregistrations. The VM-only impairment harness is documented in
@@ -609,6 +599,10 @@ preregistrations. The VM-only impairment harness is documented in
 - DNS-chunk camouflage
 - Split-tunnel geosite RU
 - IPv6, Windows Wintun и native macOS TUN leak/recovery cells
+- Current-source paired Linux full-TUN under installed PID-1 units, including
+  carrier cut and post-reboot recovery
+- Dedicated-kernel reboot plus separate torn-write/power-loss storage matrix
+- Native Linux ARM64 and Windows portability refresh after `2ece275`
 - Resolver/DHCP invalidation, suspend/resume and cross-platform network-change
   integration
 - Power-loss/torn-write durability and production fleet reboot/rollback drills

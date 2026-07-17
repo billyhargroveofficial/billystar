@@ -1,5 +1,11 @@
 # Scoped security and current-source validation audit — 2026-07-16
 
+> Historical snapshot. Current lifecycle evidence and the post-`2ece275`
+> source-bound correction are in the
+> [2026-07-17 lifecycle audit](security-audit-2026-07-17.md). References below
+> to `81f188f` full-TUN or `726500f` ARM64 as “current” describe the evidence
+> cut on 2026-07-16 and are not current-head claims.
+
 Status: two separate executable-source Linux cells are current. Commit
 `81f188f772cc6b674fde748a361691f1bda19691` has the privileged full-TUN
 handoff **PASS**, scoped to an isolated disposable OrbStack clone and private

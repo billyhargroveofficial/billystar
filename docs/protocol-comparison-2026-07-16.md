@@ -1,6 +1,6 @@
 # Protocol comparison: Shadowpipe, VLESS, Hysteria2 and AmneziaWG 2.0
 
-Snapshot: 2026-07-16.
+Evidence status refreshed: 2026-07-17.
 
 Status: bounded engineering comparison, not a benchmark, cryptographic proof,
 security endorsement or censorship-resistance claim.
@@ -35,7 +35,7 @@ substantially stronger performance evidence.
 | Host safety | Signed authority, WAL-before-mutation, exact ownership and fail-closed Linux recovery | Broad platform support; host lifecycle safety depends on core/client/configuration | TUN lifecycle depends on client integration | Mature WireGuard-style interface lifecycle, usually simpler than a proxy stack |
 | Loss-path behavior | Current production path is one reliable TCP carrier; nested TCP can amplify head-of-line blocking | Vision/direct-copy paths avoid carrying every inner TCP packet through another TCP stream | Strongest option here on lossy/high-BDP UDP paths | Low overhead; application TCP handles its own loss recovery |
 | Roaming | Reconnect and endpoint rotation; native mobility integration is open | Mature reconnect/routing ecosystem | QUIC and port-hopping support | Authenticated roaming is a core WireGuard strength |
-| Current product readiness | Current executable-source Linux IPv4 full-TUN/default-route handoff at `81f188f` plus separate unprivileged native ARM64 portability at `726500f`; recovery/reboot/Windows remain snapshot-bound; macOS native client absent | Mature cross-platform ecosystem | Mature cross-platform ecosystem | Mature cross-platform ecosystem |
+| Current product readiness | Current product-source recovery and real-PID-1 userspace reboot/client-lifecycle cells pass; successful full-TUN `81f188f`, ARM64 `726500f` and Windows remain source-bound after `2ece275`; macOS native client absent | Mature cross-platform ecosystem | Mature cross-platform ecosystem | Mature cross-platform ecosystem |
 
 ## Where Shadowpipe is already stricter
 
@@ -88,24 +88,35 @@ service to start a fresh process that re-observes the underlay. Exact
 Shadowpipe-owned route events are suppressible only after a fresh live census;
 only a structurally exact `IFF_PROMISC`-only observer transition is excluded.
 
-The current isolated run
+The source-bound isolated run
 [`20260716T173837Z-18283-m8K2po`](../tests/tun/results/20260716T173837Z-18283-m8K2po/RESULT.md)
 has a tracked compact
 [`PUBLISHED-EVIDENCE.md`](../tests/tun/results/20260716T173837Z-18283-m8K2po/PUBLISHED-EVIDENCE.md) and
 proved a real `c0 -> c1` default-route replacement, strict intermediate
 lockdown, generation-2 adoption through `c1`, and no observer-induced restart.
 It emulated `Restart=always`/`RestartSec=1s`; it did not run real systemd PID 1.
+Production Rust changed later in `2ece275`, so this is not a current-head
+successful-tunnel result.
 Resolver/DHCP/suspend integration, in-process migration and native macOS/Windows
 mobility remain open. The full sealed bundle, including its large raw c1 pcap,
 remains local/ignored; the compact index publishes pcap hashes.
 
-Native Linux ARM64 portability is current separately at clean commit
+Native Linux ARM64 portability is source-bound separately at clean commit
 `726500f1ff43e2b4fdcf9082abf05aa5a2513ab7`:
 [`20260716T180304Z-linux-arm64-current`](../tests/portability/results/20260716T180304Z-linux-arm64-current/RESULT.md)
 passed 718/0/4 no-default and 732/0/4 all-features tests, both strict Clippy
 profiles and all five runner self-tests across a 193-file snapshot. This is
-unprivileged CPU/filesystem evidence only. It does not establish a privileged
-handoff at `726500f` or refresh recovery, reboot or Windows.
+unprivileged CPU/filesystem evidence only and predates `2ece275`.
+
+Current product-source lifecycle evidence is separate: same-boot all-resource
+recovery
+[`20260716T225901Z-98821`](../tests/host-recovery/results/20260716T225901Z-98821/FINAL-RESULT.md)
+passed 29/29 scenarios, while
+[`20260717T001923Z-52605-reboot`](../tests/lockdown/results/20260717T001923Z-52605-reboot/RESULT.md)
+ran the installed client and restore units under real `systemd 261.1` PID 1,
+proved restore-before-networkd across an OrbStack shared-kernel userspace
+restart, and verified restart/operator-stop semantics before network mutation.
+Neither cell establishes a successful current-source tunnel.
 
 ## Where current alternatives are stronger
 
@@ -174,15 +185,16 @@ it.
    macOS validation boundary is defined in
    [`mac-host-isolated-lab.md`](mac-host-isolated-lab.md).
 2. Explicit IPv6 leak gates, then outer IPv6/NAT64, then full inner IPv6.
-3. Complete network-change reconciliation beyond the conservative Linux process
-   replacement: resolver/DHCP/suspend events, real systemd PID-1 integration,
-   in-process state migration where justified, and native macOS/Windows sources.
+3. Refresh a successful paired Linux full-TUN session under the installed
+   PID-1 units, then complete resolver/DHCP/suspend events, in-process migration
+   where justified, and native macOS/Windows sources.
 4. A reviewed ephemeral PQ handshake/combiner and PQ control-plane design.
 5. A production QUIC carrier evaluated against Hysteria2 on identical netem
    matrices.
-6. Throughput, latency, CPU, memory and battery comparisons.
-7. Independent cryptographic and systems review.
-8. Preregistered field experiments with negative controls and bounded claims.
+6. Dedicated-kernel reboot plus separate torn-write/power-loss storage tests.
+7. Throughput, latency, CPU, memory and battery comparisons.
+8. Independent cryptographic and systems review.
+9. Preregistered field experiments with negative controls and bounded claims.
 
 Until those gates close, the accurate description is:
 

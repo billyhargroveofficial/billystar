@@ -1,0 +1,29 @@
+# Shadowpipe early-userspace L3 lockdown systemd-boot result
+
+- Verdict: **PASS**
+- Pinned source: clean pushed `main` commit `e3740752a84d981421e95a567cdf11c12c7e88d7` entered by bounded hash-verified stdin; guest-local build/install used no host worktree or target mount
+- Dependency provenance: a separate deterministic Cargo vendor archive was built offline from the pinned source; Cargo.lock package sources/checksums, every versioned crate directory, .cargo-checksum.json, and every vendored file hash were validated before and after transfer
+- Build isolation: Cargo ran `--frozen` from cwd `/` with a fresh private CARGO_HOME containing only generated config, highest-precedence CLI source replacement, an empty target, and a fresh network namespace without egress
+- Build-network limit: no continuous packet recorder was installed; the stronger build boundary is the fresh network namespace rather than an observational capture
+- Isolated source: stopped `shadowpipe-lab-base`; source and clone config required capability/network isolation, disabled SSH-agent forwarding, zero forwarded ports, and empty mounts/forwards
+- Disposable clone: `sphr-lock-20260717t001923z-52605` (opaque ID bound for start/restart/guest operations; delete-by-name required a fresh name-to-ID revalidation, followed by ID/name absence proof)
+- Userspace boot scope: systemd was proved as live PID 1 before and after an OrbStack machine restart; distinct guest boot IDs and strict WAL PID-1 namespace binding were observed
+- Kernel scope: OrbStack machines share one Linux kernel; this is not a dedicated-kernel, initrd, power-loss, or hardware reboot claim
+- Durable WAL: exact schema v1 Active generation 2 -> 4, fresh identity, handle matched exact nft listing
+- Enforcement observed: exact native nft inet/output barrier; loopback passed and non-loopback IPv4 ping was denied
+- Ordering observed: systemd >=254; unique InvocationIDs, zero restarts and monotonic activation timestamps prove restore completion before networkd start
+- Ordering limit: there is no continuous external packet capture across the userspace restart; the cell proves restore-before-systemd-networkd plus post-boot enforcement, not universal zero-packet boot silence
+- Recovery observed: explicit operator release removed WAL and the only sp_lock table; guest IPv4 gateway became reachable
+- Installed client-unit verdict: **PASS** (separate subcell after explicit release)
+- Installed client-unit lifecycle: exact source unit and binary hashes matched; systemd PID 1 exposed Requires/After=restore plus Restart=always/RestartSec=1s; at least three credential-refusal InvocationIDs and increasing NRestarts were observed
+- Client operator-stop proof: after systemctl stop, a greater-than-RestartSec interval produced no new invocation and left the unit inactive with no client process
+- Client pre-mutation proof: a root-owned mode-0600 empty-JSON credential fixture failed at the mandatory credential loader; canonical routes, rules, nft ruleset, DNS, interfaces, TUN census and WAL absence were identical before/after
+- Client-unit scope limit: this is a fail-closed pre-mutation lifecycle test, not a successful session, tunnel, lockdown-barrier, transient-socket packet capture, or leak proof
+- macOS safety observed: routes, DNS, exact sing-box PID/argv/config/executable and PF configuration files were unchanged
+- Host-safety timing: consistent before/after endpoint snapshots; no continuous host mutation monitor
+- Exclusion: the shared lifecycle lock serializes Shadowpipe runners; unrelated same-host operators remain outside the trust boundary and any name/ID/state drift fails closed
+- macOS PF runtime: exact unprivileged permission-denied tuple was unchanged; runtime rules remain explicitly unobserved
+- Build contract: a validated explicit SHADOWPIPE_MAGIC u32 was recorded and used for the binary build
+- Private-material scan scope: the experiment creates only a non-secret empty-JSON credential fixture and copies no live config bytes; the pre-existing Mac config is represented only by SHA-256
+- Scope: one disposable guest, early-userspace Linux L3 local OUTPUT, explicit release, and installed-client pre-mutation systemd lifecycle
+- No paired client/server tunnel, successful full-tunnel session, production, dedicated-kernel reboot, initrd, power loss, L2/AF_PACKET, FORWARD, container-netns, transient-socket capture, or censorship-field claim
