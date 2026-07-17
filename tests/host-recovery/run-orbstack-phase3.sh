@@ -4398,7 +4398,8 @@ guest_main() {
   {
     printf 'SHADOWPIPE_MAGIC=%s\n' "${magic}"
     uname -a
-    "${helper}" --version 2>&1 || true
+    printf 'phase3_helper_sha256='
+    sha256sum "${helper}" | awk '{print $1}'
     ip -Version
     iptables --version
     ip6tables --version
